@@ -631,6 +631,17 @@ def main():
                               'train_exploration_epsilon':args.train_exploration_epsilon if training else 0.,
                               'policy_updates':metrics['policy_updates']}),
                   flush=True)
+            counts=metrics['first_action_counts']
+            raw=metrics['mean_initial_policy_probability']
+            behavior=metrics['mean_initial_behavior_probability']
+            if raw['HALT'] is not None:
+                print(f"Answer exploration — {phase} epoch {epoch}: "
+                      f"first actions HALT={counts['choose:HALT']}, "
+                      f"NONHALT={counts['choose:NONHALT']}, reset={counts['reset']}; "
+                      f"mean raw P(HALT)={raw['HALT']:.3f}, "
+                      f"P(NONHALT)={raw['NONHALT']:.3f}; "
+                      f"sampling P(HALT)={behavior['HALT']:.3f}, "
+                      f"P(NONHALT)={behavior['NONHALT']:.3f}",flush=True)
             if not training:
                 print(evaluation_line(metrics),flush=True)
                 write_evaluation_csv(args.out)
