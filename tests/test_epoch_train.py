@@ -34,5 +34,36 @@ class EpochTests(unittest.TestCase):
         self.assertEqual(task_seed(7,'eval',1,'machine'),task_seed(7,'eval',10,'machine'))
         self.assertNotEqual(task_seed(7,'train',1,'machine'),task_seed(7,'train',2,'machine'))
 
+    def test_first_proof_stops_training_but_not_evaluation(self):
+        from unittest.mock import patch
+        import proofgame.epoch_train as et
+        from proofgame.population_sample import from_rank
+
+        class FakePolicy:
+            def load_state_dict(self, weights):
+                pass
+
+        machine=from_rank(8)
+        selected={'rank':8,'machine_id':'test-id','machine':machine.to_json()}
+        sample={'version':0,'state_dict':{}}
+        def fake_attempt(sampler, machine, rng, budget):
+            return {'proof':'mock'}, [{'action':'submit','probability':1.}], 'SOLVED'
+        with patch.object(et,'_worker_policy',FakePolicy()), \
+             patch.object(et.torch,'load',return_value=sample), \
+             patch.object(et,'FrozenSampler') as sampler, \
+             patch.object(et,'attempt',side_effect=fake_attempt) as run:
+            sampler.return_value.misses=0
+            sampler.return_value.hits=0
+            task=(selected,7,100,20,'unused',0,True)
+            training=et.run_machine(task)
+            self.assertEqual(training['attempts'],1)
+            self.assertEqual(len(training['successes']),1)
+            self.assertEqual(run.call_count,1)
+            run.reset_mock()
+            evaluation=et.run_machine((*task[:-1],False))
+            self.assertEqual(evaluation['attempts'],100)
+            self.assertEqual(len(evaluation['successes']),100)
+            self.assertEqual(run.call_count,100)
+
 
 if __name__=='__main__':unittest.main()
