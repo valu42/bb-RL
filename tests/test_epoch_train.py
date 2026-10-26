@@ -66,4 +66,75 @@ class EpochTests(unittest.TestCase):
             self.assertEqual(run.call_count,100)
 
 
+    def test_auto_new_run_ids_and_exact_resume_path(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from proofgame.epoch_train import choose_run_directory
+        with TemporaryDirectory() as tmp:
+            base=Path(tmp)/'experiment'
+            first=choose_run_directory(base)
+            second=choose_run_directory(base)
+            third=choose_run_directory(base)
+            self.assertEqual(first,base)
+            self.assertEqual(second,base.with_name('experiment_run_0001'))
+            self.assertEqual(third,base.with_name('experiment_run_0002'))
+            self.assertTrue(all(path.is_dir() for path in (first,second,third)))
+            self.assertEqual(choose_run_directory(base,resume=True),base)
+            with self.assertRaises(FileNotFoundError):
+                choose_run_directory(Path(tmp)/'missing',resume=True)
+
+    def test_nonfinite_optimizer_step_is_rejected_and_restored(self):
+        from unittest.mock import patch
+        import torch
+        from proofgame.epoch_train import learn_batch,policy_is_finite
+        from proofgame.environment import Game
+        from proofgame.model import Policy
+        from proofgame.population_sample import from_rank
+        torch.set_num_threads(1)
+        torch.manual_seed(7)
+        policy=Policy(width=32,layers=1).eval()
+        optimizer=torch.optim.AdamW(policy.parameters(),lr=3e-4,weight_decay=0.)
+        machine=from_rank(8)
+        game=Game(machine,budget=20)
+        trajectory=[]
+        for action in ['choose:HALT','rule:exI','put:s','put:z','commit','rule:refl','submit']:
+            obs=game.observation()
+            with torch.inference_mode():
+                probs=policy(obs)[0].softmax(-1)
+            idx=next(i for i,v in enumerate(obs['actions']) if v['id']==action)
+            trajectory.append({'action':action,'probability':float(probs[idx])})
+            game.step(action,observe=False)
+        self.assertEqual(game.status,'SOLVED')
+        result={'machine':machine.to_json(),'attempts':1,
+                'successes':[{'actions':trajectory,'certificate':game.certificate()}]}
+        original={name:t.detach().clone() for name,t in policy.state_dict().items()}
+        real_step=optimizer.step
+        def poison(*args,**kwargs):
+            real_step(*args,**kwargs)
+            with torch.no_grad():
+                next(policy.parameters()).fill_(float('nan'))
+        with patch.object(optimizer,'step',side_effect=poison):
+            update=learn_batch(policy,optimizer,[result],20)
+        self.assertFalse(update['updated'])
+        self.assertEqual(update['rejected_update'],'nonfinite_optimizer_result')
+        self.assertTrue(policy_is_finite(policy))
+        self.assertFalse(optimizer.state)
+        for name,value in policy.state_dict().items():
+            torch.testing.assert_close(value,original[name])
+
+
+    def test_invalid_policy_probabilities_fail_before_sampling(self):
+        import torch
+        from proofgame.model import Policy
+        from proofgame.network_search import FrozenSampler
+        from proofgame.environment import Game
+        from proofgame.population_sample import from_rank
+        policy=Policy(width=32,layers=1).eval()
+        with torch.no_grad():
+            next(policy.parameters()).fill_(float('nan'))
+        sampler=FrozenSampler(policy)
+        with self.assertRaisesRegex(RuntimeError,'non-finite policy logits'):
+            sampler.probabilities(Game(from_rank(8),budget=20).observation())
+
+
 if __name__=='__main__':unittest.main()
