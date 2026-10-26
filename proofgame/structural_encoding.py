@@ -173,6 +173,12 @@ class StructuralEncoder(nn.Module):
     """Global attention with additive, learned relation biases (zero initialized)."""
     def __init__(self, width, layers, heads, max_tokens):
         super().__init__()
+        # PyTorch's native eval/no-grad TransformerEncoder fastpath can
+        # disagree with the autograd path for per-head additive structural
+        # masks (including producing NaNs after a finite optimizer update).
+        # Keep sampling and REINFORCE replay on the same safe attention path.
+        # This setting is process-wide; AST workers each own their process.
+        torch.backends.mha.set_fastpath_enabled(False)
         self.max_tokens = max_tokens
         self.heads = heads
         self.embedding = nn.Embedding(VOCAB_SIZE, width, padding_idx=0)
