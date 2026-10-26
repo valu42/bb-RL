@@ -629,12 +629,15 @@ def main():
             start_index=state['next_index']
             if start_index<len(rows):
                 batch=rows[start_index:start_index+args.batch_size]
+                batch_number=start_index//args.batch_size+1
+                inspect_batch=(batch_number % 10 == 0)
                 if args.device=='mps':
                     tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
                             args.attempts,dataset['action_budget'],state['updates'],
                             training and args.stop_after_first_train_proof,
                             args.train_exploration_epsilon if training else 0.,
-                            training and args.balanced_initial_answers) for r in batch]
+                            training and args.balanced_initial_answers,
+                            inspect_batch) for r in batch]
                     results=pool.run(tasks)
                 else:
                     atomic_torch(weights_file,{'version':state['updates'],'config':policy.config,
@@ -643,7 +646,8 @@ def main():
                             args.attempts,dataset['action_budget'],str(weights_file),state['updates'],
                             training and args.stop_after_first_train_proof,
                             args.train_exploration_epsilon if training else 0.,
-                            training and args.balanced_initial_answers) for r in batch]
+                            training and args.balanced_initial_answers,
+                            inspect_batch) for r in batch]
                     results=pool.map(run_machine,tasks,chunksize=1)
                 update=learn_batch(policy,optimizer,results,dataset['action_budget'],
                                    gpu_gradient_batch_size=args.gpu_gradient_batch_size,
@@ -655,6 +659,17 @@ def main():
                     print(json.dumps({'event':'training_update_rejected','phase':phase,'epoch':epoch,
                                       'machine_index':start_index,'reason':update['rejected_update'],
                                       'rejected_updates':state['rejected_updates']}),flush=True)
+                if inspect_batch:
+                    from .trace_report import build_trace_report,write_trace_report
+                    trace_report=build_trace_report(results,phase,epoch,batch_number,
+                                                     results[0]['policy_version'])
+                    trace_path=write_trace_report(args.out,trace_report)
+                    print(json.dumps({'event':'policy_trace_saved',
+                                      'path':str(trace_path)}),flush=True)
+                # Diagnostic traces are written separately and never included
+                # in gradient replay or the standard per-batch checkpoint.
+                for result in results:
+                    result.pop('diagnostic_traces',None)
                 batch_file=folder/f'batch_{start_index:04d}.json'
                 atomic_json(batch_file,{'epoch':epoch,'phase':phase,'start_index':start_index,'machines':results,'update':update})
                 state['next_index']+=len(batch);save_state()
@@ -728,7 +743,7 @@ def main():
                 if args.device=='mps':
                     challenge_tasks=[
                         (row,task_seed(args.seed,'eval',0,row['machine_id']),
-                         args.attempts,dataset['action_budget'],state['updates'],True,0.,False)
+                         args.attempts,dataset['action_budget'],state['updates'],True,0.,False,False)
                         for row in challenge_rows
                     ]
                     challenge_results=pool.run(challenge_tasks)
@@ -739,7 +754,7 @@ def main():
                     challenge_tasks=[
                         (row,task_seed(args.seed,'eval',0,row['machine_id']),
                          args.attempts,dataset['action_budget'],
-                         str(weights_file),state['updates'],True,0.,False)
+                         str(weights_file),state['updates'],True,0.,False,False)
                         for row in challenge_rows
                     ]
                     challenge_results=pool.map(run_machine,challenge_tasks,chunksize=1)
