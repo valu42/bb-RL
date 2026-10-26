@@ -172,6 +172,9 @@ class StructuralEncoder(nn.Module):
         if size > self.max_tokens:
             raise ModelLimit(f'input needs {size} structural tokens; maximum is {self.max_tokens}')
         device = self.embedding.weight.device
+        # Coalesce dynamic sequence lengths to reduce MPS kernel compilation.
+        if device.type == 'mps':
+            size = min(self.max_tokens, ((size + 15) // 16) * 16)
         batch = len(trees)
         ids = torch.zeros((batch, size), dtype=torch.long, device=device)
         relations = torch.full((batch, size, size), OTHER, dtype=torch.long, device=device)
