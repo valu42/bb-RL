@@ -229,6 +229,15 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4):
     try:
         optimizer.step()
         healthy=policy_is_finite(policy) and optimizer_is_finite(optimizer)
+        if healthy:
+            # A finite weight vector can still yield invalid attention logits.
+            # Probe a couple of the actual successful states before committing.
+            with torch.inference_mode():
+                for encoded, _ in (observations[0], observations[-1]):
+                    logits,_=policy(json.loads(encoded))
+                    if not bool(torch.isfinite(logits).all()):
+                        healthy=False
+                        break
     except Exception:
         with torch.no_grad():
             for p,old in zip(policy.parameters(),old_weights):
