@@ -25,8 +25,8 @@ from .network_search import encode_json
 @lru_cache(maxsize=16384)
 def token_count(serialized, representation):
     if representation == 'ast':
-        from .structural_encoding import encode_tree
-        return len(encode_tree(json.loads(serialized))[0])
+        from .structural_encoding import cached_tree
+        return len(cached_tree(serialized)[0])
     return len(serialized.encode('utf-8')) + 1
 
 
@@ -103,6 +103,8 @@ class BatchedPolicyInference:
         self.cache_hits = 0
         self.network_batches = 0
         self.requests = 0
+        self.inference_seconds = 0.
+        self.batch_sizes = []
 
     def begin_version(self, version):
         if version != self.version:
@@ -112,6 +114,7 @@ class BatchedPolicyInference:
 
     @torch.inference_mode()
     def infer(self, request_strings):
+        started = time.monotonic()
         self.policy.eval()
         outputs = [None] * len(request_strings)
         pending = OrderedDict()
@@ -186,6 +189,7 @@ class BatchedPolicyInference:
                 longest = worst
                 position += 1
             self.network_batches += 1
+            self.batch_sizes.append(len(group))
             contexts = self.policy.encode([row[2] for row in group])
             queries = self.policy.query(contexts)
             probabilities = []
@@ -214,13 +218,17 @@ class BatchedPolicyInference:
         while len(self.actions) > self.action_cache_size:
             self.actions.popitem(last=False)
         assert all(item is not None for item in outputs)
+        self.inference_seconds += time.monotonic() - started
         return outputs
 
     def stats(self):
         return {'inference_requests': self.requests,
                 'observation_cache_hits': self.cache_hits,
                 'gpu_context_batches': self.network_batches,
-                'cached_action_embeddings': len(self.actions)}
+                'cached_action_embeddings': len(self.actions),
+                'mean_context_batch_size': (sum(self.batch_sizes)/len(self.batch_sizes)
+                                            if self.batch_sizes else 0.),
+                'inference_wall_seconds': round(self.inference_seconds,3)}
 
 
 class CentralRolloutPool:
