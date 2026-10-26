@@ -50,7 +50,18 @@ def expand(m, g, rule, data=None):
     def same(a,b): return normal(a,m) == normal(b,m)
     def no_data():
         if data is not None: raise Invalid("rule takes no annotation")
-    if rule == "exact":
+    if rule in ("closedStates", "exactCycle"):
+        # These are theorem-level NONHALT certificates, not general tactics.
+        # Never accept them for an arbitrary subgoal or under assumptions.
+        if target != root_goal("NONHALT") or variables or facts:
+            raise Invalid("NONHALT certificate rule only applies at the empty root context")
+        from .nonhalt_certificates import check_closed_states, check_exact_cycle
+        if rule == "closedStates":
+            check_closed_states(m, data)
+        else:
+            check_exact_cycle(m, data)
+        children = []
+    elif rule == "exact":
         if not same(index(data), target): raise Invalid("hypothesis does not match goal")
         children = []
     elif rule == "refl":
