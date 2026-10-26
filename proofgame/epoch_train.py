@@ -358,10 +358,11 @@ def count_proofs_by_answer(rows):
 
 
 def summarize_initial_choices(rows):
-    counts=Counter(); raw={'HALT':0.,'NONHALT':0.}
+    counts=Counter(); scheduled=Counter(); raw={'HALT':0.,'NONHALT':0.}
     behavior={'HALT':0.,'NONHALT':0.}; n=0
     for row in rows:
         counts.update(row.get('first_action_counts',{}))
+        scheduled.update(row.get('scheduled_initial_answer_counts',{}))
         n+=row.get('initial_choice_observations',0)
         for answer in ('HALT','NONHALT'):
             raw[answer]+=row.get('initial_policy_probability_sums',{}).get(answer,0.)
@@ -369,6 +370,8 @@ def summarize_initial_choices(rows):
     return {
         'first_action_counts':{action:counts.get(action,0)
                                for action in ('choose:HALT','choose:NONHALT','reset')},
+        'scheduled_initial_answer_counts':{
+            action:scheduled.get(action,0) for action in ('choose:HALT','choose:NONHALT')},
         'initial_choice_observations':n,
         'mean_initial_policy_probability':{
             answer:raw[answer]/n if n else None for answer in ('HALT','NONHALT')},
@@ -432,6 +435,8 @@ def main():
     parser.add_argument('--workers',type=int,default=8)
     parser.add_argument('--seed',type=int,default=7)
     parser.add_argument('--lr',type=float,default=3e-4)
+    parser.add_argument('--balanced-initial-answers',action='store_true',
+                        help='train with exactly half HALT and half NONHALT initial attempts per machine; requires even --attempts, disables first-proof early stop')
     parser.add_argument('--train-exploration-epsilon',type=float,default=0.2,
                         help='fraction of initial training decisions sampled uniformly between HALT/NONHALT (default 0.2); evaluation unchanged')
     parser.add_argument('--representation',choices=('bytes','ast'),default='bytes',
@@ -450,6 +455,14 @@ def main():
            args.gpu_inference_batch_size,args.gpu_max_attention_elements,
            args.gpu_gradient_batch_size)<1:
         parser.error('positive counts required')
+    if args.balanced_initial_answers:
+        if args.attempts % 2:
+            parser.error('--balanced-initial-answers requires an even --attempts')
+        if args.stop_after_first_train_proof:
+            parser.error('--balanced-initial-answers cannot be combined with --stop-after-first-train-proof (all attempts are required)')
+        if args.train_exploration_epsilon != 0.2:
+            parser.error('balanced initial answers replaces epsilon exploration; omit --train-exploration-epsilon')
+        args.train_exploration_epsilon=0.
     if not math.isfinite(args.train_exploration_epsilon) or not 0<=args.train_exploration_epsilon<1:
         parser.error('train-exploration-epsilon must be in [0,1)')
     if not math.isfinite(args.gpu_inference_wait_ms) or args.gpu_inference_wait_ms<0:
@@ -511,6 +524,7 @@ def main():
             'parameters':sum(p.numel() for p in policy.parameters()),'epochs_requested':args.epochs,
             'algorithm':'on-policy REINFORCE batches; zero baseline; mean gradient over all attempts',
             'train_exploration_epsilon':args.train_exploration_epsilon,
+            'balanced_initial_answers':args.balanced_initial_answers,
             'attempts_after_success':('training: stop after first verified proof; evaluation: full attempt budget'
                                        if args.stop_after_first_train_proof else 'continue to exact attempt budget'),
             'evaluation':('fixed unfiltered test set; fixed sampling seeds; no updates'
@@ -527,7 +541,9 @@ def main():
         old=json.loads((args.out/'config.json').read_text())
         changing_strategy = False
         for k in config:
-            if k!='epochs_requested' and config[k]!=old.get(k,0. if k=='train_exploration_epsilon' else None):
+            if k!='epochs_requested' and config[k]!=old.get(
+                    k,False if k=='balanced_initial_answers' else
+                    (0. if k=='train_exploration_epsilon' else None)):
                 if (k=='attempts_after_success' and args.stop_after_first_train_proof
                         and old[k]=='continue to exact attempt budget'):
                     changing_strategy = True
