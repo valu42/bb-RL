@@ -57,6 +57,27 @@ def acquire_run_lock(path):
     return handle
 
 
+def choose_run_directory(path, resume=False):
+    """Create a fresh unique run directory without overwriting earlier runs.
+
+    The exact path is used for --resume. Fresh runs first claim the requested
+    path, then try numbered siblings using atomic mkdir(exist_ok=False).
+    """
+    if resume:
+        if not path.is_dir():
+            raise FileNotFoundError('resume directory does not exist: ' + str(path))
+        return path
+    for number in range(100000):
+        candidate = path if number == 0 else path.with_name(
+            f'{path.name}_run_{number:04d}')
+        try:
+            candidate.mkdir(parents=True,exist_ok=False)
+            return candidate
+        except FileExistsError:
+            continue
+    raise RuntimeError('could not allocate a new output directory next to ' + str(path))
+
+
 def task_seed(seed, phase, epoch, machine_id):
     # Evaluation uses the same seeds each epoch; it is a fixed monitoring set.
     epoch = epoch if phase == 'train' else 0
@@ -255,8 +276,13 @@ def main():
         parser.error('invalid GPU batching wait')
     if args.device=='mps' and not torch.backends.mps.is_available():
         parser.error('MPS is not available in this PyTorch/macOS environment')
-    if args.out.exists() and not args.resume:parser.error('choose a new output directory or --resume')
-    args.out.mkdir(parents=True,exist_ok=True)
+    try:
+        args.out = choose_run_directory(args.out, resume=args.resume)
+    except (OSError, RuntimeError) as e:
+        parser.error(str(e))
+    print(json.dumps({'event':'run_directory',
+                      'path':str(args.out),
+                      'resuming':args.resume}),flush=True)
     try:lock = acquire_run_lock(args.out/'run.lock')
     except RuntimeError as e:parser.error(str(e))
     dataset_bytes = args.dataset.read_bytes(); dataset = json.loads(dataset_bytes)
