@@ -61,6 +61,10 @@ class BalancedAttemptsTests(unittest.TestCase):
                 def fake_attempt(sampler,machine,rng,budget,**kwargs):
                     answer=kwargs['forced_initial_answer']
                     attempts.append(answer)
+                    kwargs['on_initial_choice']('choose:'+answer,
+                                                {'HALT':0.5,'NONHALT':0.5},
+                                                {'HALT':float(answer=='HALT'),
+                                                 'NONHALT':float(answer=='NONHALT')})
                     if answer==winner:
                         return {'answer':winner},[{'action':'choose:'+winner,
                                                   'probability':1.}], 'SOLVED'
