@@ -65,7 +65,8 @@ class TraceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path=write_trace_report(tmp,report)
             self.assertEqual(path.read_text(),readable)
-            self.assertEqual(json.loads(path.with_suffix('.json').read_text()),report)
+            self.assertEqual(json.loads(path.with_suffix('.json').read_text()),
+                             json.loads(json.dumps(report)))
 
     def test_nonhalt_certificate_editor_is_visible(self):
         from proofgame.logic import Machine
