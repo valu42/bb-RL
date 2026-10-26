@@ -22,6 +22,7 @@ import time
 import torch
 
 from .environment import Game
+from .exploration import behavior_log_probs
 from .kernel import check
 from .logic import Machine
 from .model import Policy
@@ -119,12 +120,25 @@ def init_worker(model_config):
     _worker_policy = Policy(**model_config).eval()
 
 
-def execute_machine(selected, seed, attempts, budget, version, stop_on_success, sampler):
+def execute_machine(selected, seed, attempts, budget, version, stop_on_success, sampler,
+                    exploration_epsilon=0.):
     """Execute a machine with either a CPU policy or the central GPU sampler."""
     machine = Machine(selected['machine']['rows']); rng = random.Random(seed)
     successes = []; statuses = Counter(); actions = 0; start = time.monotonic()
+    first_actions=Counter(); policy_sums={'HALT':0.,'NONHALT':0.}
+    behavior_sums={'HALT':0.,'NONHALT':0.}; initial_observations=0
+    def record_initial(action, raw, mixed):
+        nonlocal initial_observations
+        first_actions[action]+=1
+        if raw:
+            initial_observations+=1
+            for answer in ('HALT','NONHALT'):
+                policy_sums[answer]+=raw[answer]
+                behavior_sums[answer]+=mixed[answer]
     for i in range(attempts):
-        cert, trace, status = attempt(sampler, machine, rng, budget)
+        cert, trace, status = attempt(sampler, machine, rng, budget,
+                                      exploration_epsilon=exploration_epsilon,
+                                      on_initial_choice=record_initial)
         actions += len(trace); statuses[status] += 1
         if cert:
             successes.append({'attempt':i+1, 'actions':trace, 'certificate':cert})
@@ -133,19 +147,24 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
     return {**selected, 'action_seed':seed, 'policy_version':version,
             'attempts':sum(statuses.values()), 'actions':actions, 'statuses':dict(statuses),
             'successes':successes, 'seconds':time.monotonic()-start,
-            'network_evaluations':sampler.misses, 'cache_hits':sampler.hits}
+            'network_evaluations':sampler.misses, 'cache_hits':sampler.hits,
+            'first_action_counts':dict(first_actions),
+            'initial_choice_observations':initial_observations,
+            'initial_policy_probability_sums':policy_sums,
+            'initial_behavior_probability_sums':behavior_sums}
 
 
 def run_machine(task):
-    selected, seed, attempts, budget, weights_file, version, stop_on_success = task
+    selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon = task
     saved = torch.load(weights_file, map_location='cpu', weights_only=True)
     if saved['version'] != version: raise RuntimeError('rollout policy version changed')
     _worker_policy.load_state_dict(saved['state_dict'])
     sampler = FrozenSampler(_worker_policy, capacity=10000)
-    return execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler)
+    return execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler,epsilon)
 
 
-def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4):
+def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
+                exploration_epsilon=0.):
     """Zero-reward episodes contribute zero; identical state gradients combine.
 
     Every success is on-policy under the same frozen batch weights. Grouping
@@ -187,7 +206,7 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4):
             logits_batch = [policy(obs)[0] for obs in parsed]
         losses = []
         for observation, logits, (_, (counts, expected)) in zip(parsed,logits_batch,chunk):
-            logps = logits.log_softmax(-1)
+            logps = behavior_log_probs(logits,observation,exploration_epsilon)
             inference_probs = None
             for index, probability in expected.items():
                 grad_probability = float(logps[index].detach().exp())
@@ -198,7 +217,9 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4):
                     # same frozen policy, never allow a changed policy version.
                     if inference_probs is None:
                         with torch.inference_mode():
-                            inference_probs = policy(observation)[0].softmax(-1).tolist()
+                            inference_logits=policy(observation)[0]
+                            inference_probs=behavior_log_probs(
+                                inference_logits,observation,exploration_epsilon).exp().tolist()
                     inference_probability = inference_probs[index]
                     if not math.isclose(inference_probability, probability,
                                         rel_tol=3e-3 if is_mps else 2e-4,
