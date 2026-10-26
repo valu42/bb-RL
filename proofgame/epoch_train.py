@@ -231,6 +231,7 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4):
         weights_ok=policy_is_finite(policy)
         optimizer_ok=optimizer_is_finite(optimizer)
         logits_ok=True
+        grad_mode_logits_ok=None
         healthy=weights_ok and optimizer_ok
         if healthy:
             # A finite weight vector can still yield invalid attention logits.
@@ -242,6 +243,10 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4):
                         logits_ok=False
                         healthy=False
                         break
+            if not logits_ok:
+                with torch.enable_grad():
+                    check_logits,_=policy(json.loads(encoded))
+                    grad_mode_logits_ok=bool(torch.isfinite(check_logits).all())
     except Exception:
         with torch.no_grad():
             for p,old in zip(policy.parameters(),old_weights):
@@ -261,7 +266,8 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4):
                 'rejected_update':'nonfinite_optimizer_result',
                 'numerical_health':{'weights_finite':weights_ok,
                                     'optimizer_finite':optimizer_ok,
-                                    'probe_logits_finite':logits_ok}}
+                                    'probe_logits_finite':logits_ok,
+                                    'probe_grad_mode_logits_finite':grad_mode_logits_ok}}
     return {'updated':True, 'proofs':proof_count, 'unique_gradient_observations':len(groups),
             'loss':total_loss, 'gradient_norm':float(norm),
             'inference_gradient_probability_differences':numerical_fallbacks}
