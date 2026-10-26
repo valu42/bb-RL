@@ -153,8 +153,6 @@ class BatchedPolicyInference:
             for text, key_tensor, bias_tensor in zip(texts, keys, biases):
                 self.actions[text] = (key_tensor, bias_tensor)
                 self.actions.move_to_end(text)
-                if len(self.actions) > self.action_cache_size:
-                    self.actions.popitem(last=False)
 
         # Similar lengths are grouped to avoid MPS quadratic padding waste.
         records.sort(key=lambda record: record[4])
@@ -196,6 +194,10 @@ class BatchedPolicyInference:
                     self.states.popitem(last=False)
                 for i in row[1]:
                     outputs[i] = ('ok', result)
+        # Prune only after this inference group has consumed its embeddings:
+        # evicting during filling could remove actions still needed by a row.
+        while len(self.actions) > self.action_cache_size:
+            self.actions.popitem(last=False)
         assert all(item is not None for item in outputs)
         return outputs
 
