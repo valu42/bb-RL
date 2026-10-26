@@ -78,6 +78,9 @@ class Game:
         self.max_nodes=max_nodes; self.max_depth=max_depth
         self.answer=None; self.proof=None; self.focus=(); self.draft=None
         self.candidate=None
+        # These flags describe the *current* proof/candidate, not action history.
+        # They are visible in observations and determine the legal action menu.
+        self.submit_failed=False
         self.status="ACTIVE"; self.error=None; self.reward=0
         self._cached_goals=None
 
@@ -148,16 +151,27 @@ class Game:
                 states=candidate["states"]
                 choices=[("cert:remove:" if q in states else "cert:add:")+q
                          for q in self.machine.states if q!="qH"]
-                return [*choices,"cert:verify","cert:cancel","reset"]
+                # Only structural readiness is checked here. The checker,
+                # not the action menu, decides if a proposed set is closed.
+                verify = ["cert:verify"] if states and not candidate["verify_failed"] else []
+                return [*choices,*verify,"cert:cancel","reset"]
             if candidate["kind"]=="exactCycle":
-                return ([*(f"cert:start:{n}" for n in range(33)),
-                         *(f"cert:period:{n}" for n in range(1,33)),
-                         "cert:verify","cert:cancel","reset"])
+                # Avoid actions that simply rewrite the same number. Do not
+                # precheck whether the proposed recurrence is mathematically true.
+                start = [f"cert:start:{n}" for n in range(33) if n != candidate["start"]]
+                period = [f"cert:period:{n}" for n in range(1,33)
+                          if n != candidate["period"]]
+                ready = candidate["start"] is not None and candidate["period"] is not None
+                verify = ["cert:verify"] if ready and not candidate["verify_failed"] else []
+                return [*start,*period,*verify,"cert:cancel","reset"]
             raise Invalid("unknown certificate draft")
         if self.draft:
             return [*self.expression_menu(),*([] if first_hole(self.draft["expr"]) else ["commit"]),"cancel","reset"]
         goals=self.goals()
-        return [*self.rule_menu(),*(f"focus:{i}" for i in range(len(goals))),"submit","reset"]
+        # An incomplete proof cannot pass the kernel: only expose submit
+        # when there are no open goals. This is syntactic, not a truth oracle.
+        submit = ["submit"] if not goals and not self.submit_failed else []
+        return [*self.rule_menu(),*(f"focus:{i}" for i in range(len(goals))),*submit,"reset"]
 
     def observation(self):
         goals=self.goals()
@@ -165,7 +179,7 @@ class Game:
              "actions_left":self.left,"limits":{"nodes":self.max_nodes,"depth":self.max_depth},
              "focus":self.focus,"goals":[{"path":p,**g.text()} for p,g in goals],
              "proof":self.proof,"draft":None,"candidate":self.candidate,
-             "last_error":self.error}
+             "submit_failed":self.submit_failed,"last_error":self.error}
         if self.draft:
             h=first_hole(self.draft["expr"])
             obs["draft"]={"rule":self.draft["rule"],"data":self.draft["data"],
@@ -190,6 +204,7 @@ class Game:
             children=list(p['children']);children[path[0]]=insert(children[path[0]],path[1:])
             return {'rule':p['rule'],'data':p['data'],'children':children}
         self.proof=insert(self.proof,self.focus)
+        self.submit_failed=False
         self.draft=None
         self._cached_goals=None
         goals=self.goals(); self.focus=goals[0][0] if goals else ()
@@ -214,18 +229,20 @@ class Game:
     def step(self,action,observe=True):
         if self.status!="ACTIVE": raise Invalid("episode is terminal")
         self.left-=1; self.error=None; self.reward=0
-        old=(self.answer,self.proof,self.focus,self.draft,self.candidate)
+        old=(self.answer,self.proof,self.focus,self.draft,self.candidate,
+             self.submit_failed)
         try:
             if action not in self.available_actions(): raise Invalid("action is not in current menu")
             if action=="reset":
                 self.answer=None; self.proof=None; self.focus=(); self.draft=None
-                self.candidate=None; self._cached_goals=None
+                self.candidate=None; self.submit_failed=False; self._cached_goals=None
             elif action.startswith("choose:"):
                 self.answer=action.split(":")[1]; self._cached_goals=None
             elif action=="rule:closedStates":
-                self.candidate={"kind":"closedStates","states":[]}
+                self.candidate={"kind":"closedStates","states":[],"verify_failed":False}
             elif action=="rule:exactCycle":
-                self.candidate={"kind":"exactCycle","start":None,"period":None}
+                self.candidate={"kind":"exactCycle","start":None,"period":None,
+                                "verify_failed":False}
             elif self.candidate is not None:
                 candidate=self.candidate
                 if action=="cert:cancel":
@@ -244,10 +261,12 @@ class Game:
                     selected=set(candidate["states"])
                     if op=="add": selected.add(q)
                     else: selected.remove(q)
-                    self.candidate={**candidate,"states":sorted(selected)}
+                    self.candidate={**candidate,"states":sorted(selected),
+                                    "verify_failed":False}
                 else:
                     _,field,number=action.split(":")
-                    self.candidate={**candidate,field:int(number)}
+                    self.candidate={**candidate,field:int(number),
+                                    "verify_failed":False}
             elif action.startswith("focus:"): self.focus=self.goals()[int(action.split(":")[1])][0]
             elif action=="cancel": self.draft=None
             elif action=="submit":
@@ -265,8 +284,15 @@ class Game:
                 else: self._commit(rule,data)
             self._limits()
         except (Invalid,RecursionError) as e:
-            self.answer,self.proof,self.focus,self.draft,self.candidate=old
+            (self.answer,self.proof,self.focus,self.draft,self.candidate,
+             self.submit_failed)=old
             self._cached_goals=None
+            # A failed check is a fact about this exact candidate/proof.
+            # Keep the flag in the observable Markov state until it changes.
+            if action=="cert:verify" and self.candidate is not None:
+                self.candidate={**self.candidate,"verify_failed":True}
+            if action=="submit":
+                self.submit_failed=True
             self.error=str(e); self.status="ACTIVE"; self.reward=0
         if self.left==0 and self.status!="SOLVED": self.status="EXHAUSTED"
         return self.observation() if observe else None,self.reward,self.status!="ACTIVE"
