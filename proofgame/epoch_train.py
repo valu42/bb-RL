@@ -209,6 +209,17 @@ def main():
                     parser.error('invalid unfiltered two-state machine/rank')
             ids.append(row['machine_id'])
     if len(set(ids))!=len(ids):parser.error('duplicate/overlapping machines')
+    if dataset_format==UNFILTERED_FORMAT:
+        from .unfiltered_dataset import build_dataset
+        seed=dataset.get('sampling_seed')
+        if (type(seed) is not int or dataset.get('population')!=POPULATION
+                or dataset.get('sampling')!='uniform_without_replacement_over_all_labelled_two_state_machines'):
+            parser.error('invalid unfiltered sampling metadata')
+        expected=build_dataset(len(dataset['train']),len(dataset['test']),
+                               dataset['action_budget'],seed)
+        for split in ('train','test'):
+            if [row['rank'] for row in dataset[split]] != [row['rank'] for row in expected[split]]:
+                parser.error('unfiltered dataset ranks do not match the claimed seed')
     torch.set_num_threads(1);torch.manual_seed(args.seed)
     policy=Policy(width=32,layers=1).eval()
     optimizer=torch.optim.AdamW(policy.parameters(),lr=args.lr,weight_decay=0.)
