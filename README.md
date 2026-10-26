@@ -8,6 +8,40 @@ The proof environment works. The Transformer and training loop run. **This is
 not yet evidence that the model learns to prove machines.** Included example
 proofs are human-written verification fixtures; the trainer never loads them.
 
+
+## Clone, install, and track evaluation
+
+```bash
+git clone https://github.com/valu42/bb-RL.git
+cd bb-RL
+poetry install --extras train --no-root
+poetry run python -m proofgame.epoch_train --dataset runs/epoch_dataset_1000_100/dataset.json --out runs/my_10_epoch_run --epochs 10 --attempts 100 --batch-size 8 --workers 8
+```
+
+Use Poetry 2.x. Once cloned, use `git pull --ff-only` to get updates, then rerun
+`poetry install --extras train --no-root` if dependencies changed.
+
+A fresh run evaluates the untrained model **before epoch 1**, then again after
+every training epoch. Evaluation never updates weights. Each evaluation prints:
+
+```text
+Baseline (before training): machines solved 4/100 (4.00%); successful attempts 4/10000 (0.04%)
+```
+
+This is an example of the output format. **Machines solved (%)** is the fraction
+of held-out machines with at least one checked proof within the full attempt
+budget. **Successful attempts (%)** counts individual successful attempts, so it
+also measures consistency. Repeated successes count once in the first metric
+and individually in the second. Neither metric includes the separate diagnostic
+challenge machines below.
+
+`evaluations.csv` in the run directory records baseline (epoch 0) and every
+completed evaluation. It is updated immediately after each evaluation and rebuilt
+without duplicate rows on resume. Per-epoch JSON files and `epoch_summary` log
+records also include `machines_solved_pct` and `attempt_success_pct` on a 0–100
+scale; existing fraction fields retain their 0–1 scale. A resumed run does not
+repeat an already completed baseline.
+
 ## Separate two-state diagnostic evaluations after every epoch
 
 The epoch runner automatically tests two fixed challenge machines at **baseline
@@ -651,3 +685,4 @@ Useful background: [MINIMO](https://arxiv.org/abs/2407.00695),
 [TransformerEncoderLayer](https://docs.pytorch.org/docs/stable/generated/torch.nn.TransformerEncoderLayer.html)
 and [policy-gradient distributions](https://docs.pytorch.org/docs/stable/distributions.html).
 This prototype does not reproduce MINIMO's training algorithm or its results.
+

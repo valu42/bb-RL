@@ -4,6 +4,35 @@ import unittest
 
 @unittest.skipUnless(importlib.util.find_spec('torch'),'optional PyTorch dependency is not installed')
 class EpochTests(unittest.TestCase):
+    def test_evaluation_percentages_and_resume_safe_csv(self):
+        import csv
+        import json
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from proofgame.epoch_train import summarize, evaluation_line, write_evaluation_csv
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            batch = root/'batch.json'
+            batch.write_text(json.dumps({'machines':[
+                {'attempts':100,'successes':[{'certificate':{'answer':'HALT'},'attempt':1},{'certificate':{'answer':'HALT'},'attempt':2}], 'actions':1990,'statuses':{'SOLVED':2}},
+                {'attempts':100,'successes':[], 'actions':2000,'statuses':{'EXHAUSTED':100}},
+            ]}))
+            metrics = summarize([batch])
+            self.assertEqual(metrics['machines_solved_pct'],50.)
+            self.assertEqual(metrics['attempt_success_pct'],1.)
+            metrics.update(epoch=0,policy_updates=0)
+            self.assertIn('Baseline (before training)',evaluation_line(metrics))
+            self.assertIn('1/2 (50.00%)',evaluation_line(metrics))
+            self.assertIn('2/200 (1.00%)',evaluation_line(metrics))
+            (root/'epoch_00_evaluation.json').write_text(json.dumps(metrics))
+            write_evaluation_csv(root)
+            write_evaluation_csv(root)
+            with (root/'evaluations.csv').open() as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(len(rows),1)
+            self.assertEqual(float(rows[0]['machines_solved_pct']),50.)
+            self.assertEqual(summarize([])['attempt_success_pct'],0.)
+
     def test_grouped_duplicate_gradients_equal_single_trajectory(self):
         import torch
         from proofgame.epoch_train import learn_batch,task_seed
@@ -138,3 +167,4 @@ class EpochTests(unittest.TestCase):
 
 
 if __name__=='__main__':unittest.main()
+

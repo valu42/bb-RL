@@ -8,6 +8,7 @@ in the dataset. Checkpoints commit after every rollout batch.
 """
 import argparse
 import copy
+import csv
 from collections import Counter
 import hashlib
 import json
@@ -317,8 +318,10 @@ def summarize_rows(rows):
     proved = sum(bool(r['successes']) for r in rows)
     return {'machines':len(rows), 'machines_proved':proved,
             'machine_coverage':proved/len(rows) if rows else 0.,
+            'machines_solved_pct':100*proved/len(rows) if rows else 0.,
             'attempts':attempts, 'successful_attempts':successes,
             'attempt_success_rate':successes/attempts if attempts else 0.,
+            'attempt_success_pct':100*successes/attempts if attempts else 0.,
             'actions':sum(r['actions'] for r in rows),
             'statuses':dict(sum((Counter(r['statuses']) for r in rows),Counter())),
             **count_proofs_by_answer(rows)}
@@ -327,6 +330,32 @@ def summarize_rows(rows):
 def summarize(files):
     rows = [r for file in files for r in json.loads(file.read_text())['machines']]
     return summarize_rows(rows)
+
+def evaluation_line(metrics):
+    label = 'Baseline (before training)' if metrics['epoch'] == 0 else f"Epoch {metrics['epoch']} evaluation"
+    return (f"{label}: machines solved {metrics['machines_proved']}/{metrics['machines']} "
+            f"({100*metrics['machine_coverage']:.2f}%); successful attempts "
+            f"{metrics['successful_attempts']}/{metrics['attempts']} "
+            f"({100*metrics['attempt_success_rate']:.2f}%)")
+
+
+def write_evaluation_csv(out):
+    """Rebuild from committed summaries so resuming never duplicates rows."""
+    fields = ['epoch', 'machines_proved', 'machines', 'machines_solved_pct',
+              'successful_attempts', 'attempts', 'attempt_success_pct', 'policy_updates']
+    temp = out/'evaluations.csv.tmp'
+    summaries = sorted(out.glob('epoch_*_evaluation.json'),
+                       key=lambda path: int(path.name.split('_')[1]))
+    with temp.open('w', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for path in summaries:
+            metrics = json.loads(path.read_text())
+            metrics['machines_solved_pct'] = 100*metrics['machine_coverage']
+            metrics['attempt_success_pct'] = 100*metrics['attempt_success_rate']
+            writer.writerow({field: metrics[field] for field in fields})
+    temp.replace(out/'evaluations.csv')
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -457,6 +486,7 @@ def main():
         atomic_torch(args.out/'initial_model.pt',{'config':policy.config,'state_dict':policy.state_dict(),'seed':args.seed})
         atomic_json(args.out/'dataset.json',dataset)
     atomic_json(args.out/'config.json',config)
+    write_evaluation_csv(args.out)
     segment_start=time.monotonic();previous_seconds=state['active_seconds']
 
     def save_state():
@@ -538,9 +568,15 @@ def main():
                               'machines_proved_by_answer':metrics['machines_proved_by_answer'],
                               'successful_attempts_by_answer':metrics['successful_attempts_by_answer'],
                               'machine_coverage':metrics['machine_coverage'],
+                              'machines_solved_pct':metrics['machines_solved_pct'],
+                              'attempts':metrics['attempts'],
+                              'successful_attempts':metrics['successful_attempts'],
+                              'attempt_success_pct':metrics['attempt_success_pct'],
                               'policy_updates':metrics['policy_updates']}),
                   flush=True)
             if not training:
+                print(evaluation_line(metrics),flush=True)
+                write_evaluation_csv(args.out)
                 # Separate fixed diagnostic machines. No gradients, no extra
                 # training data, and no effect on held-out machine coverage.
                 from .special_benchmarks import (
@@ -590,3 +626,4 @@ def main():
 
 
 if __name__=='__main__':main()
+

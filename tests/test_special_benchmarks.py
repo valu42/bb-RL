@@ -106,12 +106,21 @@ class SpecialBenchmarkTests(unittest.TestCase):
                              f"{finished.stdout}\n{finished.stderr}")
             self.assertIn('Special benchmarks — baseline (epoch 0)',finished.stdout)
             self.assertIn('Special benchmarks — after epoch 1',finished.stdout)
+            self.assertIn('Epoch 1 evaluation: machines solved',finished.stdout)
+            self.assertLess(finished.stdout.index('Baseline (before training):'),
+                            finished.stdout.index('"phase": "train"'))
+            import csv
+            with (output/'evaluations.csv').open() as stream:
+                evaluation_rows=list(csv.DictReader(stream))
+            self.assertEqual([row['epoch'] for row in evaluation_rows],['0','1'])
             for epoch in (0,1):
                 special=json.loads((output/f'special_benchmarks_epoch_{epoch:02d}.json').read_text())
                 self.assertEqual(len(special['benchmarks']),2)
                 normal=json.loads((output/f'epoch_{epoch:02d}_evaluation.json').read_text())
                 self.assertEqual(normal['machines'],1,
                                  'two extra diagnostics must not inflate held-out metric')
+                self.assertEqual(normal['machines_solved_pct'],100*normal['machine_coverage'])
+                self.assertEqual(normal['attempt_success_pct'],100*normal['attempt_success_rate'])
             finished_report=json.loads((output/'report.json').read_text())
             self.assertTrue(finished_report['complete'])
             self.assertEqual(len(finished_report['special_benchmarks']),2)
@@ -119,3 +128,4 @@ class SpecialBenchmarkTests(unittest.TestCase):
 
 if __name__=='__main__':
     unittest.main()
+
