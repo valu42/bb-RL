@@ -175,6 +175,8 @@ def main():
     parser.add_argument('--workers',type=int,default=8)
     parser.add_argument('--seed',type=int,default=7)
     parser.add_argument('--lr',type=float,default=3e-4)
+    parser.add_argument('--representation',choices=('bytes','ast'),default='bytes',
+                        help='byte-level JSON or AST-aware tokens and learnable structural attention')
     parser.add_argument('--resume',action='store_true')
     parser.add_argument('--stop-after-first-train-proof',action='store_true',
                         help='stop each training machine after one verified proof; keep evaluation at the full attempt budget')
@@ -221,7 +223,7 @@ def main():
             if [row['rank'] for row in dataset[split]] != [row['rank'] for row in expected[split]]:
                 parser.error('unfiltered dataset ranks do not match the claimed seed')
     torch.set_num_threads(1);torch.manual_seed(args.seed)
-    policy=Policy(width=32,layers=1).eval()
+    policy=Policy(width=32,layers=1,representation=args.representation).eval()
     optimizer=torch.optim.AdamW(policy.parameters(),lr=args.lr,weight_decay=0.)
     config={'dataset_sha256':hashlib.sha256(dataset_bytes).hexdigest(),
             'train_machines':len(dataset['train']),'test_machines':len(dataset['test']),
