@@ -1,0 +1,212 @@
+{
+  "format": "proofgame-interesting-machines-1",
+  "conventions": "Rows in order q0/b0,q0/b1,q1/b0,q1/b1,...; each row [next_state,write_bit,direction]. Initial state q0, head position 0, blank b0 tape.",
+  "caveat": "Simulation and mathematical invariants do not automatically produce a formal proof certificate accepted by bb-RL. HALT examples can be independently checked by the proof kernel if a time witness is constructed.",
+  "machines": [
+    {
+      "id": "parity-trap-2",
+      "states": 2,
+      "expected": "NONHALT",
+      "halt_steps": null,
+      "kind": "2-step periodic orbit (parity)",
+      "argument": "Step 1 reaches (q1,head=1,tape={0:1}); step 2 reaches (q0,head=0,tape={0:1}). Thereafter these two complete configurations alternate. The sole halting transition q1/b1 is never used.",
+      "citation": null,
+      "machine": {
+        "rows": [
+          [
+            "q1",
+            "b1",
+            "R"
+          ],
+          [
+            "q1",
+            "b1",
+            "R"
+          ],
+          [
+            "q0",
+            "b0",
+            "L"
+          ],
+          [
+            "qH",
+            "b1",
+            "R"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "growing-frontier-3",
+      "states": 3,
+      "expected": "NONHALT",
+      "halt_steps": null,
+      "kind": "3-phase inductive invariant with unbounded tape growth",
+      "argument": "For each n>=0, after step 3n+1 the state is q1 at n+1 with tape 1 on 0..n; after step 3n+2 it is q2 at n with tape 1 on 0..n+1; after step 3n+3 it is q0 at n+1 with tape 1 on 0..n+1. Hence q1 always reads 0 and q2 always reads 1, and the q1/1 and q2/0 halting transitions are unreachable.",
+      "citation": null,
+      "machine": {
+        "rows": [
+          [
+            "q1",
+            "b1",
+            "R"
+          ],
+          [
+            "q1",
+            "b1",
+            "R"
+          ],
+          [
+            "q2",
+            "b1",
+            "L"
+          ],
+          [
+            "qH",
+            "b0",
+            "L"
+          ],
+          [
+            "qH",
+            "b0",
+            "L"
+          ],
+          [
+            "q0",
+            "b1",
+            "R"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "busy-beaver-2-6",
+      "states": 2,
+      "expected": "HALT",
+      "halt_steps": 6,
+      "kind": "2-state busy beaver; short halting control",
+      "argument": "Reaches qH for the first time on transition 6.",
+      "citation": "https://wiki.bbchallenge.org/wiki/Introduction_to_the_Busy_Beaver_Function",
+      "machine": {
+        "rows": [
+          [
+            "q1",
+            "b1",
+            "R"
+          ],
+          [
+            "q1",
+            "b1",
+            "L"
+          ],
+          [
+            "q0",
+            "b1",
+            "L"
+          ],
+          [
+            "qH",
+            "b1",
+            "R"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "busy-beaver-3-21",
+      "states": 3,
+      "expected": "HALT",
+      "halt_steps": 21,
+      "kind": "3-state longest-running halter",
+      "argument": "Reaches qH for the first time on transition 21.",
+      "citation": "https://turbotm.de/~heiner/BB/simTM32_bbS.html",
+      "machine": {
+        "rows": [
+          [
+            "q1",
+            "b1",
+            "R"
+          ],
+          [
+            "qH",
+            "b1",
+            "R"
+          ],
+          [
+            "q1",
+            "b1",
+            "L"
+          ],
+          [
+            "q2",
+            "b0",
+            "R"
+          ],
+          [
+            "q2",
+            "b1",
+            "L"
+          ],
+          [
+            "q0",
+            "b1",
+            "L"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "busy-beaver-4-107",
+      "states": 4,
+      "expected": "HALT",
+      "halt_steps": 107,
+      "kind": "4-state longest-running halter; >100 machine transitions",
+      "argument": "Reaches qH for the first time on transition 107. A unary time witness needs 113 proof-game actions, exceeding a 100-action proof budget. An arithmetic witness such as 10*10+7 is much shorter but must still pass the proof checker.",
+      "citation": "https://wiki.bbchallenge.org/wiki/BB%284%29",
+      "machine": {
+        "rows": [
+          [
+            "q1",
+            "b1",
+            "R"
+          ],
+          [
+            "q1",
+            "b1",
+            "L"
+          ],
+          [
+            "q0",
+            "b1",
+            "L"
+          ],
+          [
+            "q2",
+            "b0",
+            "L"
+          ],
+          [
+            "qH",
+            "b1",
+            "R"
+          ],
+          [
+            "q3",
+            "b1",
+            "L"
+          ],
+          [
+            "q3",
+            "b1",
+            "R"
+          ],
+          [
+            "q0",
+            "b0",
+            "R"
+          ]
+        ]
+      }
+    }
+  ]
+}

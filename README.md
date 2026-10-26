@@ -8,6 +8,48 @@ The proof environment works. The Transformer and training loop run. **This is
 not yet evidence that the model learns to prove machines.** Included example
 proofs are human-written verification fixtures; the trainer never loads them.
 
+## Separate two-state diagnostic evaluations after every epoch
+
+The epoch runner automatically tests two fixed challenge machines at **baseline
+(epoch 0)** and after **every subsequent evaluation epoch**, on both CPU and
+MPS:
+
+1. **Parity trap (2-state)** — the correct conclusion is NONHALT, requiring
+   reasoning about an alternating two-phase invariant.
+2. **2-state Busy Beaver** — the correct conclusion is HALT (6 Turing-machine
+   transitions), with a 12-action direct halting proof.
+
+These tasks **never generate training gradients**, are **not inserted into**
+the training or test dataset, and **do not inflate the main machine-coverage
+metric**. Each diagnostic uses the current policy checkpoint and the configured
+`--attempts` and dataset action budget (100 attempts × 100 proof-game
+actions in the current unfiltered experiment). The action-sampling seeds are
+fixed across epochs, and diagnostic search stops as soon as a proof is found.
+The labels are for reporting only, not supplied to the model.
+
+After the regular evaluation summary, the terminal prints human-readable
+results such as:
+
+```text
+Special benchmarks — after epoch 3
+Parity trap (2-state, NONHALT): NOT PROVED (no verified NONHALT proof in 100 attempts, up to 100 proof-game actions each)
+Busy Beaver (2-state, HALT in 6 steps): PROVED HALT (first verified proof on attempt 9/100; 12 proof-game actions)
+These are separate checks and do not change the held-out test score.
+```
+
+The above is **illustrative**, not a measured model result. A "NOT PROVED"
+result means the model did not sample an accepted proof within this budget;
+it does **not** mean the machine is unprovable.
+
+Each epoch creates `special_benchmarks_epoch_00.json`,
+`special_benchmarks_epoch_00.txt`, and corresponding files for later epochs.
+`special_benchmarks_history.txt` keeps one readable timeline.
+The final `report.json` also includes `special_benchmarks` per epoch.
+
+Changes to a checked-out Python file do not affect a process that is already
+running. Pull the new version and start a fresh run, or resume from a saved
+checkpoint for subsequent evaluations to include these diagnostics.
+
 ## Apple Silicon GPU training (MPS, experimental)
 
 The epoch trainer now supports `--device mps` on an Apple Silicon Mac with an
