@@ -2,7 +2,8 @@
 import math
 import unittest
 from proofgame.environment import Game
-from tests.test_nonhalt_proof_feasibility import MACHINE
+from proofgame.logic import Machine
+MACHINE=Machine((('q0','b1','R'),('q0','b1','R'),('qH','b0','R'),('qH','b1','R')))
 
 ACTIONS=[
  'choose:NONHALT','rule:cut',
