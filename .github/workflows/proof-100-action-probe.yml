@@ -2,6 +2,8 @@ name: One-off 100-action proof coverage probe
 on:
   push:
     branches: [experiment/proof-100-action-coverage]
+  pull_request:
+    branches: [main]
 jobs:
   probe:
     runs-on: ubuntu-latest
