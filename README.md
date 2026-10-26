@@ -50,6 +50,30 @@ Changes to a checked-out Python file do not affect a process that is already
 running. Pull the new version and start a fresh run, or resume from a saved
 checkpoint for subsequent evaluations to include these diagnostics.
 
+## Automatic fresh-run IDs and MPS throughput
+
+Running the **same** `python -m proofgame.epoch_train ... --out runs/my_run`
+command repeatedly now **creates a new experiment** instead of refusing to
+overwrite an existing directory. The first run uses `runs/my_run`; subsequent
+runs use `runs/my_run_run_0001`, `runs/my_run_run_0002`, and so on.
+The actual output path is printed as an `event: run_directory` JSON line.
+All older checkpoints and reports remain untouched. **Each fresh run still
+starts with randomly initialized weights and epoch 0.** To continue an
+existing run, pass `--resume` with the **exact** printed run directory; no
+automatic suffix is used when resuming.
+
+The AST encoder now caches parsed syntax trees and builds attention relations
+using batched CPU tensor indexing rather than individual scalar writes. MPS
+progress includes `mean_context_batch_size` and `inference_wall_seconds`
+so you can see whether the GPU is receiving real batches. This is an
+incremental preprocessing optimization, **not a guaranteed MPS speedup**.
+With a tiny width-32, one-layer Transformer, dispatching many small GPU
+operations, synchronizing probabilities back to CPU, and waiting on worker
+queues can still be slower than direct CPU inference. Compare wall-clock
+time and proof actions per second before committing to a long run. To
+benchmark the CPU path, keep `--representation ast` and use `--device cpu`
+with the same dataset and attempts in a separate fresh run.
+
 ## Apple Silicon GPU training (MPS, experimental)
 
 The epoch trainer now supports `--device mps` on an Apple Silicon Mac with an
