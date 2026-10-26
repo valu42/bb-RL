@@ -420,6 +420,36 @@ def main():
                               'machine_coverage':metrics['machine_coverage'],
                               'policy_updates':metrics['policy_updates']}),
                   flush=True)
+            if not training:
+                # Separate fixed diagnostic machines. No gradients, no extra
+                # training data, and no effect on held-out machine coverage.
+                from .special_benchmarks import (
+                    benchmark_rows, make_benchmark_report, write_benchmark_report
+                )
+                challenge_rows = benchmark_rows()
+                if args.device=='mps':
+                    challenge_tasks=[
+                        (row,task_seed(args.seed,'eval',0,row['machine_id']),
+                         args.attempts,dataset['action_budget'],state['updates'],True)
+                        for row in challenge_rows
+                    ]
+                    challenge_results=pool.run(challenge_tasks)
+                else:
+                    atomic_torch(weights_file,{'version':state['updates'],
+                                               'config':policy.config,
+                                               'state_dict':policy.state_dict()})
+                    challenge_tasks=[
+                        (row,task_seed(args.seed,'eval',0,row['machine_id']),
+                         args.attempts,dataset['action_budget'],
+                         str(weights_file),state['updates'],True)
+                        for row in challenge_rows
+                    ]
+                    challenge_results=pool.map(run_machine,challenge_tasks,chunksize=1)
+                benchmark_report=make_benchmark_report(
+                    epoch,challenge_results,args.attempts,dataset['action_budget'],
+                    trained_ids=(row['machine_id'] for row in dataset['train'])
+                )
+                write_benchmark_report(args.out,benchmark_report)
             if training:
                 state.update(phase='eval',next_index=0)
             elif phase=='baseline':
@@ -432,7 +462,10 @@ def main():
     report={'complete':True,'epochs_completed':state['completed_epochs'],'policy_updates':state['updates'],
             'active_seconds':state['active_seconds'],
             'evaluations':[json.loads((args.out/f'epoch_{i:02d}_evaluation.json').read_text()) for i in range(state['completed_epochs']+1)],
-            'training':[json.loads((args.out/f'epoch_{i:02d}_training.json').read_text()) for i in range(1,state['completed_epochs']+1)]}
+            'training':[json.loads((args.out/f'epoch_{i:02d}_training.json').read_text()) for i in range(1,state['completed_epochs']+1)],
+            'special_benchmarks':[json.loads((args.out/f'special_benchmarks_epoch_{i:02d}.json').read_text())
+                                  for i in range(state['completed_epochs']+1)
+                                  if (args.out/f'special_benchmarks_epoch_{i:02d}.json').exists()]}
     atomic_json(args.out/'report.json',report);print(json.dumps(report,indent=2),flush=True)
 
 
