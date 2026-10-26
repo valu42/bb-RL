@@ -89,7 +89,7 @@ class EpochTests(unittest.TestCase):
             self.assertEqual(len(training['successes']),1)
             self.assertEqual(run.call_count,1)
             run.reset_mock()
-            evaluation=et.run_machine((*task[:-1],False))
+            evaluation=et.run_machine((*task[:-2],False,0.))
             self.assertEqual(evaluation['attempts'],100)
             self.assertEqual(len(evaluation['successes']),100)
             self.assertEqual(run.call_count,100)
