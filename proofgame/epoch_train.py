@@ -333,6 +333,26 @@ def count_proofs_by_answer(rows):
     }
 
 
+def summarize_initial_choices(rows):
+    counts=Counter(); raw={'HALT':0.,'NONHALT':0.}
+    behavior={'HALT':0.,'NONHALT':0.}; n=0
+    for row in rows:
+        counts.update(row.get('first_action_counts',{}))
+        n+=row.get('initial_choice_observations',0)
+        for answer in ('HALT','NONHALT'):
+            raw[answer]+=row.get('initial_policy_probability_sums',{}).get(answer,0.)
+            behavior[answer]+=row.get('initial_behavior_probability_sums',{}).get(answer,0.)
+    return {
+        'first_action_counts':{action:counts.get(action,0)
+                               for action in ('choose:HALT','choose:NONHALT','reset')},
+        'initial_choice_observations':n,
+        'mean_initial_policy_probability':{
+            answer:raw[answer]/n if n else None for answer in ('HALT','NONHALT')},
+        'mean_initial_behavior_probability':{
+            answer:behavior[answer]/n if n else None for answer in ('HALT','NONHALT')}
+    }
+
+
 def summarize_rows(rows):
     successes = sum(len(r['successes']) for r in rows)
     attempts = sum(r['attempts'] for r in rows)
@@ -345,7 +365,7 @@ def summarize_rows(rows):
             'attempt_success_pct':100*successes/attempts if attempts else 0.,
             'actions':sum(r['actions'] for r in rows),
             'statuses':dict(sum((Counter(r['statuses']) for r in rows),Counter())),
-            **count_proofs_by_answer(rows)}
+            **count_proofs_by_answer(rows), **summarize_initial_choices(rows)}
 
 
 def summarize(files):
@@ -388,6 +408,8 @@ def main():
     parser.add_argument('--workers',type=int,default=8)
     parser.add_argument('--seed',type=int,default=7)
     parser.add_argument('--lr',type=float,default=3e-4)
+    parser.add_argument('--train-exploration-epsilon',type=float,default=0.2,
+                        help='fraction of initial training decisions sampled uniformly between HALT/NONHALT (default 0.2); evaluation unchanged')
     parser.add_argument('--representation',choices=('bytes','ast'),default='bytes',
                         help='byte-level JSON or AST-aware tokens and learnable structural attention')
     parser.add_argument('--device',choices=('cpu','mps'),default='cpu',
@@ -404,6 +426,8 @@ def main():
            args.gpu_inference_batch_size,args.gpu_max_attention_elements,
            args.gpu_gradient_batch_size)<1:
         parser.error('positive counts required')
+    if not math.isfinite(args.train_exploration_epsilon) or not 0<=args.train_exploration_epsilon<1:
+        parser.error('train-exploration-epsilon must be in [0,1)')
     if not math.isfinite(args.gpu_inference_wait_ms) or args.gpu_inference_wait_ms<0:
         parser.error('invalid GPU batching wait')
     if args.device=='mps' and not torch.backends.mps.is_available():
@@ -462,6 +486,7 @@ def main():
             'batch_size':args.batch_size,'seed':args.seed,'lr':args.lr,'model':policy.config,
             'parameters':sum(p.numel() for p in policy.parameters()),'epochs_requested':args.epochs,
             'algorithm':'on-policy REINFORCE batches; zero baseline; mean gradient over all attempts',
+            'train_exploration_epsilon':args.train_exploration_epsilon,
             'attempts_after_success':('training: stop after first verified proof; evaluation: full attempt budget'
                                        if args.stop_after_first_train_proof else 'continue to exact attempt budget'),
             'evaluation':('fixed unfiltered test set; fixed sampling seeds; no updates'
@@ -478,7 +503,7 @@ def main():
         old=json.loads((args.out/'config.json').read_text())
         changing_strategy = False
         for k in config:
-            if k!='epochs_requested' and config[k]!=old[k]:
+            if k!='epochs_requested' and config[k]!=old.get(k,0. if k=='train_exploration_epsilon' else None):
                 if (k=='attempts_after_success' and args.stop_after_first_train_proof
                         and old[k]=='continue to exact attempt budget'):
                     changing_strategy = True
