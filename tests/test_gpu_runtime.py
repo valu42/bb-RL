@@ -78,9 +78,9 @@ class CentralGPUInferenceTests(unittest.TestCase):
         policy=Policy(width=32,layers=1).eval()
         machine=from_rank(8)
         row={'rank':8,'machine_id':key(machine),'machine':machine.to_json()}
-        tasks=[(row,12345,2,9,0,True,0.),(row,54321,2,9,0,True,0.2)]
+        tasks=[(row,12345,2,9,0,True,0.,False),(row,54321,2,9,0,True,0.2,False)]
         expected=[execute_machine(r,seed,attempts,budget,version,stop,FrozenSampler(policy),epsilon)
-                  for r,seed,attempts,budget,version,stop,epsilon in tasks]
+                  for r,seed,attempts,budget,version,stop,epsilon,balanced in tasks]
         with CentralRolloutPool(policy,workers=2,inference_batch_size=2,wait_ms=1.) as pool:
             actual=pool.run(tasks)
         for left,right in zip(actual,expected):
