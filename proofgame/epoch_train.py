@@ -175,8 +175,40 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4):
             'inference_gradient_probability_differences':numerical_fallbacks}
 
 
-def summarize(files):
-    rows = [r for file in files for r in json.loads(file.read_text())['machines']]
+def count_proofs_by_answer(rows):
+    """Report certificate-backed outcomes, not inferred ground-truth labels."""
+    answers = ('HALT', 'NONHALT')
+    machines = {answer: 0 for answer in answers}
+    proofs = {answer: 0 for answer in answers}
+    first_attempts = {answer: [] for answer in answers}
+    for row in rows:
+        labels = set()
+        for success in row['successes']:
+            cert = success['certificate']
+            answer = cert['answer']
+            if answer not in proofs:
+                raise ValueError('unexpected verified proof answer: ' + str(answer))
+            proofs[answer] += 1
+            labels.add(answer)
+        for answer in labels:
+            machines[answer] += 1
+        if len(labels)>1:
+            raise ValueError('a machine has contradictory accepted proofs')
+        if row['successes']:
+            first_answer = row['successes'][0]['certificate']['answer']
+            first_attempts[first_answer].append(row['successes'][0]['attempt'])
+    return {
+        'machines_proved_by_answer': machines,
+        'successful_attempts_by_answer': proofs,
+        'machines_unproved': len(rows) - sum(machines.values()),
+        'first_proof_attempt_mean_by_answer': {
+            answer: sum(first_attempts[answer])/len(first_attempts[answer])
+            if first_attempts[answer] else None for answer in answers
+        }
+    }
+
+
+def summarize_rows(rows):
     successes = sum(len(r['successes']) for r in rows)
     attempts = sum(r['attempts'] for r in rows)
     proved = sum(bool(r['successes']) for r in rows)
@@ -185,8 +217,13 @@ def summarize(files):
             'attempts':attempts, 'successful_attempts':successes,
             'attempt_success_rate':successes/attempts if attempts else 0.,
             'actions':sum(r['actions'] for r in rows),
-            'statuses':dict(sum((Counter(r['statuses']) for r in rows),Counter()))}
+            'statuses':dict(sum((Counter(r['statuses']) for r in rows),Counter())),
+            **count_proofs_by_answer(rows)}
 
+
+def summarize(files):
+    rows = [r for file in files for r in json.loads(file.read_text())['machines']]
+    return summarize_rows(rows)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -359,10 +396,14 @@ def main():
                 batch_file=folder/f'batch_{start_index:04d}.json'
                 atomic_json(batch_file,{'epoch':epoch,'phase':phase,'start_index':start_index,'machines':results,'update':update})
                 state['next_index']+=len(batch);save_state()
+                batch_outcomes=count_proofs_by_answer(results)
                 progress={'phase':phase,'epoch':epoch,'target_epochs':args.epochs,'machines_done':state['next_index'],
                           'machines_total':len(rows),'policy_updates':state['updates'],
                           'last_batch_solved':sum(bool(r['successes']) for r in results),
-                          'last_batch_proofs':sum(len(r['successes']) for r in results),'active_seconds':state['active_seconds']}
+                          'last_batch_proofs':sum(len(r['successes']) for r in results),
+                          'last_batch_machines_proved_by_answer':batch_outcomes['machines_proved_by_answer'],
+                          'last_batch_successful_attempts_by_answer':batch_outcomes['successful_attempts_by_answer'],
+                          'active_seconds':state['active_seconds']}
                 if args.device=='mps':
                     progress['gpu_inference']=pool.inference.stats()
                 atomic_json(args.out/'progress.json',progress);print(json.dumps(progress),flush=True)
@@ -370,6 +411,15 @@ def main():
             metrics=summarize(sorted(folder.glob('batch_*.json')))
             metrics.update(epoch=epoch,phase=phase,policy_updates=state['updates'],active_seconds=state['active_seconds'])
             atomic_json(args.out/f'epoch_{epoch:02d}_{"training" if training else "evaluation"}.json',metrics)
+            print(json.dumps({'event':'epoch_summary','phase':phase,'epoch':epoch,
+                              'machines':metrics['machines'],
+                              'machines_proved':metrics['machines_proved'],
+                              'machines_unproved':metrics['machines_unproved'],
+                              'machines_proved_by_answer':metrics['machines_proved_by_answer'],
+                              'successful_attempts_by_answer':metrics['successful_attempts_by_answer'],
+                              'machine_coverage':metrics['machine_coverage'],
+                              'policy_updates':metrics['policy_updates']}),
+                  flush=True)
             if training:
                 state.update(phase='eval',next_index=0)
             elif phase=='baseline':
