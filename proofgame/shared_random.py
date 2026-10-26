@@ -33,7 +33,7 @@ class SharedSimulator(Simulator):
     def state_key(self,g):
         # Identical proof syntax can derive different child goals after reduce
         # on different machines. Menus belong to the derived state, not syntax.
-        return repr((g.answer,g.proof,g.focus,g.draft,tuple(g.goals())))
+        return repr((g.answer,g.proof,g.focus,g.draft,g.candidate,tuple(g.goals())))
 
     def transition(self,state,index):
         global _reads
