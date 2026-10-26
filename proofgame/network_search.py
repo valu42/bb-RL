@@ -54,7 +54,16 @@ class FrozenSampler:
         keys = torch.stack([self.action_features[a][0] for a in actions])
         biases = torch.stack([self.action_features[a][1] for a in actions])
         logits = (keys * self.policy.query(h)).sum(-1) / h.shape[-1] ** 0.5 + biases
-        result = tuple(logits.softmax(-1).tolist())
+        if not bool(torch.isfinite(logits).all()):
+            raise RuntimeError(
+                'non-finite policy logits during CPU rollout; inspect model weights and '
+                'the last training update (the current checkpoint may be corrupted)')
+        probabilities = logits.float().softmax(-1)
+        if (not bool(torch.isfinite(probabilities).all()) or
+                not bool((probabilities >= 0).all()) or
+                not bool(probabilities.sum() > 0)):
+            raise RuntimeError('invalid policy probabilities during CPU rollout')
+        result = tuple(probabilities.tolist())
         if self.capacity:
             self.cache[full_key] = result
             if len(self.cache) > self.capacity:
