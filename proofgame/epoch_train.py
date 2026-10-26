@@ -121,10 +121,16 @@ def init_worker(model_config):
 
 
 def execute_machine(selected, seed, attempts, budget, version, stop_on_success, sampler,
-                    exploration_epsilon=0.):
+                    exploration_epsilon=0., balanced_initial_answers=False):
     """Execute a machine with either a CPU policy or the central GPU sampler."""
     machine = Machine(selected['machine']['rows']); rng = random.Random(seed)
     successes = []; statuses = Counter(); actions = 0; start = time.monotonic()
+    if balanced_initial_answers and (attempts % 2 or stop_on_success):
+        raise ValueError('balanced initial answers require an even number of attempts and no early stopping')
+    schedule = (['HALT'] * (attempts//2) + ['NONHALT'] * (attempts//2)
+                if balanced_initial_answers else [None] * attempts)
+    if balanced_initial_answers:
+        random.Random(seed ^ 0xA5A5F00D).shuffle(schedule)
     first_actions=Counter(); policy_sums={'HALT':0.,'NONHALT':0.}
     behavior_sums={'HALT':0.,'NONHALT':0.}; initial_observations=0
     def record_initial(action, raw, mixed):
@@ -138,7 +144,8 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
     for i in range(attempts):
         cert, trace, status = attempt(sampler, machine, rng, budget,
                                       exploration_epsilon=exploration_epsilon,
-                                      on_initial_choice=record_initial)
+                                      on_initial_choice=record_initial,
+                                      forced_initial_answer=schedule[i])
         actions += len(trace); statuses[status] += 1
         if cert:
             successes.append({'attempt':i+1, 'actions':trace, 'certificate':cert})
@@ -151,20 +158,23 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
             'first_action_counts':dict(first_actions),
             'initial_choice_observations':initial_observations,
             'initial_policy_probability_sums':policy_sums,
-            'initial_behavior_probability_sums':behavior_sums}
+            'initial_behavior_probability_sums':behavior_sums,
+            'scheduled_initial_answer_counts':dict(Counter(
+                f'choose:{answer}' for answer in schedule if answer is not None))}
 
 
 def run_machine(task):
-    selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon = task
+    selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon, balanced = task
     saved = torch.load(weights_file, map_location='cpu', weights_only=True)
     if saved['version'] != version: raise RuntimeError('rollout policy version changed')
     _worker_policy.load_state_dict(saved['state_dict'])
     sampler = FrozenSampler(_worker_policy, capacity=10000)
-    return execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler,epsilon)
+    return execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler,
+                           epsilon,balanced)
 
 
 def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
-                exploration_epsilon=0.):
+                exploration_epsilon=0., balanced_initial_answers=False):
     """Zero-reward episodes contribute zero; identical state gradients combine.
 
     Every success is on-policy under the same frozen batch weights. Grouping
@@ -174,18 +184,32 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
     groups = {}; proof_count = 0; numerical_fallbacks = 0
     for result in results:
         machine = Machine(result['machine']['rows'])
-        for success in result['successes']:
+        for proof_number, success in enumerate(result['successes']):
             check(success['certificate'])
-            replay = Game(machine, budget=budget); proof_count += 1
-            for step in success['actions']:
+            replay = Game(machine, budget=budget)
+            use_for_learning = not balanced_initial_answers or proof_number == 0
+            if use_for_learning:
+                proof_count += 1
+            for step_number, step in enumerate(success['actions']):
                 obs = replay.observation(); encoded = encode_json(obs)
                 index = next(i for i,a in enumerate(obs['actions']) if a['id']==step['action'])
-                if encoded not in groups:
-                    groups[encoded] = ([0]*len(obs['actions']), {})
-                counts, expected = groups[encoded]; counts[index] += 1
-                if index in expected and not math.isclose(expected[index],step['probability'],rel_tol=1e-5,abs_tol=1e-7):
-                    raise RuntimeError('inconsistent sampled probabilities')
-                expected[index] = step['probability']
+                forced = step.get('forced_initial_answer')
+                if forced is not None:
+                    if (not balanced_initial_answers or step_number != 0 or
+                            step['action'] != 'choose:' + forced or
+                            step['probability'] != 1.):
+                        raise RuntimeError('invalid forced-answer trajectory')
+                elif balanced_initial_answers and step_number == 0:
+                    raise RuntimeError('balanced training proof lacks forced initial answer')
+                # A scheduled initial decision is deterministic, so its
+                # log probability is log(1)=0 and its gradient is zero.
+                if use_for_learning and forced is None:
+                    if encoded not in groups:
+                        groups[encoded] = ([0]*len(obs['actions']), {})
+                    counts, expected = groups[encoded]; counts[index] += 1
+                    if index in expected and not math.isclose(expected[index],step['probability'],rel_tol=1e-5,abs_tol=1e-7):
+                        raise RuntimeError('inconsistent sampled probabilities')
+                    expected[index] = step['probability']
                 replay.step(step['action'], observe=False)
             if replay.status != 'SOLVED' or json.loads(json.dumps(replay.certificate())) != json.loads(json.dumps(success['certificate'])):
                 raise ValueError('incomplete or mismatched training proof')
