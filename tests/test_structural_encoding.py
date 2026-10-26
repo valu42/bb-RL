@@ -54,6 +54,35 @@ class ASTEncodingTests(unittest.TestCase):
         with torch.no_grad():
             torch.testing.assert_close(clone(obs)[0],policy(obs)[0])
 
+    def test_verified_proof_can_update_ast_policy(self):
+        import torch
+        from proofgame.epoch_train import learn_batch
+        from proofgame.environment import Game
+        from proofgame.model import Policy
+        from proofgame.network_search import FrozenSampler
+        from proofgame.population_sample import from_rank
+        torch.set_num_threads(1)
+        torch.manual_seed(7)
+        policy=Policy(width=32,layers=1,representation='ast').eval()
+        optimizer=torch.optim.AdamW(policy.parameters(),lr=3e-4,weight_decay=0.)
+        sampler=FrozenSampler(policy)
+        machine=from_rank(8)
+        game=Game(machine,budget=20)
+        trajectory=[]
+        for action in ['choose:HALT','rule:exI','put:s','put:z','commit','rule:refl','submit']:
+            observation=game.observation()
+            probs=sampler.probabilities(observation)
+            index=next(i for i,a in enumerate(observation['actions']) if a['id']==action)
+            trajectory.append({'action':action,'probability':probs[index]})
+            game.step(action,observe=False)
+        self.assertEqual(game.status,'SOLVED')
+        success={'actions':trajectory,'certificate':game.certificate()}
+        result={'machine':machine.to_json(),'attempts':1,'successes':[success]}
+        update=learn_batch(policy,optimizer,[result],20)
+        self.assertTrue(update['updated'])
+        self.assertEqual(update['proofs'],1)
+        self.assertTrue(torch.isfinite(torch.tensor(update['loss'])))
+
     def test_limit_and_legacy_model_config(self):
         from proofgame.model import ModelLimit, Policy
         legacy=Policy(width=32,layers=1)
