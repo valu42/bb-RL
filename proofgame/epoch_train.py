@@ -72,12 +72,8 @@ def init_worker(model_config):
     _worker_policy = Policy(**model_config).eval()
 
 
-def run_machine(task):
-    selected, seed, attempts, budget, weights_file, version, stop_on_success = task
-    saved = torch.load(weights_file, map_location='cpu', weights_only=True)
-    if saved['version'] != version: raise RuntimeError('rollout policy version changed')
-    _worker_policy.load_state_dict(saved['state_dict'])
-    sampler = FrozenSampler(_worker_policy, capacity=10000)
+def execute_machine(selected, seed, attempts, budget, version, stop_on_success, sampler):
+    """Execute a machine with either a CPU policy or the central GPU sampler."""
     machine = Machine(selected['machine']['rows']); rng = random.Random(seed)
     successes = []; statuses = Counter(); actions = 0; start = time.monotonic()
     for i in range(attempts):
@@ -91,6 +87,15 @@ def run_machine(task):
             'attempts':sum(statuses.values()), 'actions':actions, 'statuses':dict(statuses),
             'successes':successes, 'seconds':time.monotonic()-start,
             'network_evaluations':sampler.misses, 'cache_hits':sampler.hits}
+
+
+def run_machine(task):
+    selected, seed, attempts, budget, weights_file, version, stop_on_success = task
+    saved = torch.load(weights_file, map_location='cpu', weights_only=True)
+    if saved['version'] != version: raise RuntimeError('rollout policy version changed')
+    _worker_policy.load_state_dict(saved['state_dict'])
+    sampler = FrozenSampler(_worker_policy, capacity=10000)
+    return execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler)
 
 
 def learn_batch(policy, optimizer, results, budget):
@@ -142,7 +147,7 @@ def learn_batch(policy, optimizer, results, budget):
                         f'sampled={probability:.9g}, grad={grad_probability:.9g}, '
                         f'inference={inference_probability:.9g}, action={observation["actions"][index]["id"]}')
                 numerical_fallbacks += 1
-        loss = -(logps*torch.tensor(counts,dtype=logps.dtype)).sum()/denominator
+        loss = -(logps*torch.tensor(counts,dtype=logps.dtype,device=logps.device)).sum()/denominator
         if not torch.isfinite(loss): raise RuntimeError('non-finite loss')
         loss.backward(); total_loss += float(loss.detach())
     norm = torch.nn.utils.clip_grad_norm_(policy.parameters(),1.,error_if_nonfinite=True)
@@ -177,11 +182,22 @@ def main():
     parser.add_argument('--lr',type=float,default=3e-4)
     parser.add_argument('--representation',choices=('bytes','ast'),default='bytes',
                         help='byte-level JSON or AST-aware tokens and learnable structural attention')
+    parser.add_argument('--device',choices=('cpu','mps'),default='cpu',
+                        help='MPS uses centralized batched GPU inference with CPU proof workers')
+    parser.add_argument('--gpu-inference-batch-size',type=int,default=8)
+    parser.add_argument('--gpu-inference-wait-ms',type=float,default=2.)
+    parser.add_argument('--gpu-max-attention-elements',type=int,default=8000000)
     parser.add_argument('--resume',action='store_true')
     parser.add_argument('--stop-after-first-train-proof',action='store_true',
                         help='stop each training machine after one verified proof; keep evaluation at the full attempt budget')
     args = parser.parse_args()
-    if min(args.epochs,args.attempts,args.batch_size,args.workers)<1:parser.error('positive counts required')
+    if min(args.epochs,args.attempts,args.batch_size,args.workers,
+           args.gpu_inference_batch_size,args.gpu_max_attention_elements)<1:
+        parser.error('positive counts required')
+    if not math.isfinite(args.gpu_inference_wait_ms) or args.gpu_inference_wait_ms<0:
+        parser.error('invalid GPU batching wait')
+    if args.device=='mps' and not torch.backends.mps.is_available():
+        parser.error('MPS is not available in this PyTorch/macOS environment')
     if args.out.exists() and not args.resume:parser.error('choose a new output directory or --resume')
     args.out.mkdir(parents=True,exist_ok=True)
     try:lock = acquire_run_lock(args.out/'run.lock')
@@ -223,7 +239,7 @@ def main():
             if [row['rank'] for row in dataset[split]] != [row['rank'] for row in expected[split]]:
                 parser.error('unfiltered dataset ranks do not match the claimed seed')
     torch.set_num_threads(1);torch.manual_seed(args.seed)
-    policy=Policy(width=32,layers=1,representation=args.representation).eval()
+    policy=Policy(width=32,layers=1,representation=args.representation).to(args.device).eval()
     optimizer=torch.optim.AdamW(policy.parameters(),lr=args.lr,weight_decay=0.)
     config={'dataset_sha256':hashlib.sha256(dataset_bytes).hexdigest(),
             'train_machines':len(dataset['train']),'test_machines':len(dataset['test']),
@@ -237,6 +253,11 @@ def main():
                           if dataset_format==UNFILTERED_FORMAT
                           else 'fixed filtered test set; fixed sampling seeds; no updates'),
             'selector_proofs_supplied':0,'initial_archive':0}
+    if args.device=='mps':
+        config['device']='mps'
+        config['gpu_inference']={'batch_size':args.gpu_inference_batch_size,
+                                 'wait_ms':args.gpu_inference_wait_ms,
+                                 'max_attention_elements':args.gpu_max_attention_elements}
     if args.resume:
         old=json.loads((args.out/'config.json').read_text())
         changing_strategy = False
@@ -278,7 +299,18 @@ def main():
     if state['phase'] != 'done':
         atomic_json(args.out/'report.json',{'complete':False,'epochs_completed':state['completed_epochs'],'epochs_requested':args.epochs})
     weights_file=(args.out/'workers_policy.pt').resolve()
-    with mp.get_context('spawn').Pool(args.workers,initializer=init_worker,initargs=(policy.config,),maxtasksperchild=50) as pool:
+    if args.device=='mps':
+        from .gpu_runtime import CentralRolloutPool
+        runner=CentralRolloutPool(policy,workers=args.workers,
+                                 inference_batch_size=args.gpu_inference_batch_size,
+                                 wait_ms=args.gpu_inference_wait_ms,
+                                 max_attention_elements=args.gpu_max_attention_elements)
+        print(json.dumps({'device':'mps','inference':'centralized-batched',
+                          'workers':args.workers,'gpu_batch_size':args.gpu_inference_batch_size}),flush=True)
+    else:
+        runner=mp.get_context('spawn').Pool(args.workers,initializer=init_worker,
+                                           initargs=(policy.config,),maxtasksperchild=50)
+    with runner as pool:
         while state['phase']!='done':
             phase=state['phase'];epoch=state['epoch']
             training=phase=='train';rows=list(dataset['train' if training else 'test'])
@@ -288,11 +320,18 @@ def main():
             start_index=state['next_index']
             if start_index<len(rows):
                 batch=rows[start_index:start_index+args.batch_size]
-                atomic_torch(weights_file,{'version':state['updates'],'config':policy.config,'state_dict':policy.state_dict()})
-                tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
-                        args.attempts,dataset['action_budget'],str(weights_file),state['updates'],
-                        training and args.stop_after_first_train_proof) for r in batch]
-                results=pool.map(run_machine,tasks,chunksize=1)
+                if args.device=='mps':
+                    tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
+                            args.attempts,dataset['action_budget'],state['updates'],
+                            training and args.stop_after_first_train_proof) for r in batch]
+                    results=pool.run(tasks)
+                else:
+                    atomic_torch(weights_file,{'version':state['updates'],'config':policy.config,
+                                               'state_dict':policy.state_dict()})
+                    tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
+                            args.attempts,dataset['action_budget'],str(weights_file),state['updates'],
+                            training and args.stop_after_first_train_proof) for r in batch]
+                    results=pool.map(run_machine,tasks,chunksize=1)
                 update=learn_batch(policy,optimizer,results,dataset['action_budget']) if training else {'updated':False}
                 state['updates']+=int(update['updated'])
                 batch_file=folder/f'batch_{start_index:04d}.json'
@@ -302,6 +341,8 @@ def main():
                           'machines_total':len(rows),'policy_updates':state['updates'],
                           'last_batch_solved':sum(bool(r['successes']) for r in results),
                           'last_batch_proofs':sum(len(r['successes']) for r in results),'active_seconds':state['active_seconds']}
+                if args.device=='mps':
+                    progress['gpu_inference']=pool.inference.stats()
                 atomic_json(args.out/'progress.json',progress);print(json.dumps(progress),flush=True)
                 continue
             metrics=summarize(sorted(folder.glob('batch_*.json')))
