@@ -40,7 +40,7 @@ def nonhalt_certificate():
                       node('impI',None,
                            node('specialize',(0,V),
                                 node('rewrite',(2,'forward'),
-                                     node('discriminate',1))))
+                                     node('discriminate',1)))))
     return {'format':'proofgame-0.1',
             'machine':MACHINE.to_json(),
             'answer':'NONHALT',
