@@ -67,6 +67,22 @@ class TraceTests(unittest.TestCase):
             self.assertEqual(path.read_text(),readable)
             self.assertEqual(json.loads(path.with_suffix('.json').read_text()),report)
 
+    def test_nonhalt_certificate_editor_is_visible(self):
+        from proofgame.logic import Machine
+        machine=Machine((('q0','b1','R'),('q0','b1','R'),
+                         ('qH','b0','R'),('qH','b1','R')))
+        row={'machine':machine.to_json(),'machine_id':'nonhalt-control'}
+        actions=['choose:NONHALT','rule:closedStates',
+                 'cert:add:q0','cert:verify','submit']
+        result=execute_machine(row,17,1,20,0,True,ScriptedSampler(actions),
+                               trace_diagnostics=True)
+        trace=result['diagnostic_traces']['success']
+        self.assertEqual(trace['status'],'SOLVED')
+        self.assertEqual(trace['certificate']['answer'],'NONHALT')
+        self.assertEqual(trace['steps'][3]['certificate_candidate']['states'],['q0'])
+        report=build_trace_report([result],'train',1,10,0)
+        self.assertIn('Certificate candidate:',format_trace_report(report))
+
     def test_empty_sample_and_fallback_are_labeled(self):
         row={'machine_id':'a','machine':{'rows':[]},'policy_version':0,
              'attempts':1,'successes':[],
