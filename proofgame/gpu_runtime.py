@@ -199,15 +199,14 @@ class BatchedPolicyInference:
                 keys = torch.stack([item[0] for item in features])
                 biases = torch.stack([item[1] for item in features])
                 logits = (keys * query).sum(-1) / math.sqrt(query.shape[-1]) + biases
-                if not bool(torch.isfinite(logits).all()):
-                    raise RuntimeError('non-finite policy logits in central GPU inference; '
-                                       'inspect model weights and the previous update')
+                # Avoid a per-request Metal -> CPU synchronization here.
                 probs = logits.float().softmax(-1)
-                if not bool(torch.isfinite(probs).all()) or not bool(probs.sum() > 0):
-                    raise RuntimeError('non-finite policy probabilities in central GPU inference')
                 probabilities.append(probs)
                 lengths.append(len(row[3]))
             flattened = torch.cat(probabilities).float().cpu().tolist()
+            if any(not math.isfinite(value) or value < 0 for value in flattened):
+                raise RuntimeError('non-finite policy probabilities in central GPU inference; '
+                                   'inspect the previous optimizer update')
             offset = 0
             for row, count in zip(group, lengths):
                 result = tuple(flattened[offset:offset + count])
