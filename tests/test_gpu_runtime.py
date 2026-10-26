@@ -1,20 +1,24 @@
 """Central batched inference and per-outcome reporting regression tests."""
+import importlib.util
 import unittest
 from pathlib import Path
 import tempfile
 import json
 
-import torch
+if importlib.util.find_spec('torch') is not None:
+    import torch
+    from proofgame.environment import Game
+    from proofgame.epoch_train import count_proofs_by_answer, execute_machine, learn_batch, summarize, summarize_rows
+    from proofgame.gpu_runtime import BatchedPolicyInference, CentralRolloutPool
+    from proofgame.model import Policy
+    from proofgame.network_search import FrozenSampler, encode_json
+    from proofgame.population_sample import from_rank
+    from proofgame.tasks import key
+else:
+    torch = None
 
-from proofgame.environment import Game
-from proofgame.epoch_train import count_proofs_by_answer, execute_machine, learn_batch, summarize, summarize_rows
-from proofgame.gpu_runtime import BatchedPolicyInference, CentralRolloutPool
-from proofgame.model import Policy
-from proofgame.network_search import FrozenSampler, encode_json
-from proofgame.population_sample import from_rank
-from proofgame.tasks import key
 
-
+@unittest.skipUnless(torch is not None, 'optional PyTorch dependency is not installed')
 class OutcomeLoggingTests(unittest.TestCase):
     def test_split_counts_proofs_and_distinct_machines(self):
         def machine(answer, proof_count, attempts):
@@ -42,6 +46,7 @@ class OutcomeLoggingTests(unittest.TestCase):
             count_proofs_by_answer([row])
 
 
+@unittest.skipUnless(torch is not None, 'optional PyTorch dependency is not installed')
 class CentralGPUInferenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -82,7 +87,7 @@ class CentralGPUInferenceTests(unittest.TestCase):
             for field in ('attempts','actions','statuses','successes','policy_version'):
                 self.assertEqual(left[field],right[field])
 
-    @unittest.skipUnless(torch.backends.mps.is_available(),'requires Apple Silicon Metal GPU')
+    @unittest.skipUnless(torch is not None and torch.backends.mps.is_available(),'requires Apple Silicon Metal GPU')
     def test_mps_inference_and_policy_gradient(self):
         torch.manual_seed(7)
         policy=Policy(width=32,layers=1,representation='ast').to('mps').eval()
