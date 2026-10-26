@@ -75,7 +75,7 @@ class EpochTests(unittest.TestCase):
         machine=from_rank(8)
         selected={'rank':8,'machine_id':'test-id','machine':machine.to_json()}
         sample={'version':0,'state_dict':{}}
-        def fake_attempt(sampler, machine, rng, budget):
+        def fake_attempt(sampler, machine, rng, budget, **kwargs):
             return {'proof':'mock'}, [{'action':'submit','probability':1.}], 'SOLVED'
         with patch.object(et,'_worker_policy',FakePolicy()), \
              patch.object(et.torch,'load',return_value=sample), \
