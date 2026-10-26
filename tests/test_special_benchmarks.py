@@ -24,7 +24,7 @@ class SpecialBenchmarkTests(unittest.TestCase):
         root=Path(__file__).resolve().parents[1]/'examples'/'interesting'
         for definition,row in zip(BENCHMARKS,rows):
             fixture=json.loads((root/(definition['id']+'.json')).read_text())
-            self.assertEqual(row['machine'],fixture)
+            self.assertEqual(json.loads(json.dumps(row['machine'])),fixture)
             self.assertEqual(row['machine'],Machine(definition['rows']).to_json())
         # Current standard seeded unfiltered split should contain neither.
         from proofgame.unfiltered_dataset import build_dataset
@@ -61,7 +61,8 @@ class SpecialBenchmarkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)
             write_benchmark_report(path,report)
-            self.assertEqual(json.loads((path/'special_benchmarks_epoch_01.json').read_text()),report)
+            self.assertEqual(json.loads((path/'special_benchmarks_epoch_01.json').read_text()),
+                             json.loads(json.dumps(report)))
             self.assertEqual((path/'special_benchmarks_epoch_01.txt').read_text(),text)
             self.assertEqual((path/'special_benchmarks_history.txt').read_text(),text)
             baseline=make_benchmark_report(0,[fail,{**busy,'attempts':100,'successes':[]}],100,100)
