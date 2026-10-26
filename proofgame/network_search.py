@@ -14,6 +14,7 @@ import time
 import torch
 
 from .environment import Game
+from .exploration import answer_indices, mix_probabilities
 from .kernel import check
 from .model import Policy, ModelLimit
 from .population_sample import from_rank
@@ -71,7 +72,7 @@ class FrozenSampler:
         return result
 
 
-def attempt(sampler, machine, rng, budget=20):
+def attempt(sampler, machine, rng, budget=20, exploration_epsilon=0., on_initial_choice=None):
     game = Game(machine, budget=budget)
     trace = []
     while game.status == "ACTIVE":
@@ -80,9 +81,17 @@ def attempt(sampler, machine, rng, budget=20):
             probabilities = sampler.probabilities(observation)
         except ModelLimit:
             return None, trace, "MODEL_LIMIT"
-        index = rng.choices(range(len(probabilities)), weights=probabilities, k=1)[0]
+        behavior = mix_probabilities(observation, probabilities, exploration_epsilon)
+        index = rng.choices(range(len(behavior)), weights=behavior, k=1)[0]
         action = observation["actions"][index]["id"]
-        trace.append({"action": action, "probability": probabilities[index]})
+        if not trace and on_initial_choice is not None:
+            branch_indices = answer_indices(observation)
+            raw = {'HALT': probabilities[branch_indices[0]],
+                   'NONHALT': probabilities[branch_indices[1]]} if branch_indices else {}
+            mixed = {'HALT': behavior[branch_indices[0]],
+                     'NONHALT': behavior[branch_indices[1]]} if branch_indices else {}
+            on_initial_choice(action, raw, mixed)
+        trace.append({"action": action, "probability": behavior[index]})
         game.step(action, observe=False)
     if game.status == "SOLVED":
         certificate = game.certificate()
