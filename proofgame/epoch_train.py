@@ -571,17 +571,20 @@ def main():
                 if args.device=='mps':
                     tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
                             args.attempts,dataset['action_budget'],state['updates'],
-                            training and args.stop_after_first_train_proof) for r in batch]
+                            training and args.stop_after_first_train_proof,
+                            args.train_exploration_epsilon if training else 0.) for r in batch]
                     results=pool.run(tasks)
                 else:
                     atomic_torch(weights_file,{'version':state['updates'],'config':policy.config,
                                                'state_dict':policy.state_dict()})
                     tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
                             args.attempts,dataset['action_budget'],str(weights_file),state['updates'],
-                            training and args.stop_after_first_train_proof) for r in batch]
+                            training and args.stop_after_first_train_proof,
+                            args.train_exploration_epsilon if training else 0.) for r in batch]
                     results=pool.map(run_machine,tasks,chunksize=1)
                 update=learn_batch(policy,optimizer,results,dataset['action_budget'],
-                                   gpu_gradient_batch_size=args.gpu_gradient_batch_size) if training else {'updated':False}
+                                   gpu_gradient_batch_size=args.gpu_gradient_batch_size,
+                                   exploration_epsilon=args.train_exploration_epsilon) if training else {'updated':False}
                 state['updates']+=int(update['updated'])
                 if update.get('rejected_update'):
                     state['rejected_updates']=state.get('rejected_updates',0)+1
@@ -592,11 +595,15 @@ def main():
                 atomic_json(batch_file,{'epoch':epoch,'phase':phase,'start_index':start_index,'machines':results,'update':update})
                 state['next_index']+=len(batch);save_state()
                 batch_outcomes=count_proofs_by_answer(results)
+                batch_choices=summarize_initial_choices(results)
                 progress={'phase':phase,'epoch':epoch,'target_epochs':args.epochs,'machines_done':state['next_index'],
                           'machines_total':len(rows),'policy_updates':state['updates'],
                           'last_batch_solved':sum(bool(r['successes']) for r in results),
                           'last_batch_proofs':sum(len(r['successes']) for r in results),
                           'rejected_updates':state.get('rejected_updates',0),
+                          'last_batch_first_action_counts':batch_choices['first_action_counts'],
+                          'last_batch_mean_initial_policy_probability':batch_choices['mean_initial_policy_probability'],
+                          'last_batch_mean_initial_behavior_probability':batch_choices['mean_initial_behavior_probability'],
                           'last_batch_machines_proved_by_answer':batch_outcomes['machines_proved_by_answer'],
                           'last_batch_successful_attempts_by_answer':batch_outcomes['successful_attempts_by_answer'],
                           'active_seconds':state['active_seconds']}
@@ -618,6 +625,10 @@ def main():
                               'attempts':metrics['attempts'],
                               'successful_attempts':metrics['successful_attempts'],
                               'attempt_success_pct':metrics['attempt_success_pct'],
+                              'first_action_counts':metrics['first_action_counts'],
+                              'mean_initial_policy_probability':metrics['mean_initial_policy_probability'],
+                              'mean_initial_behavior_probability':metrics['mean_initial_behavior_probability'],
+                              'train_exploration_epsilon':args.train_exploration_epsilon if training else 0.,
                               'policy_updates':metrics['policy_updates']}),
                   flush=True)
             if not training:
