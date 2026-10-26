@@ -97,6 +97,30 @@ class ShortNonhaltProofTests(unittest.TestCase):
         with self.assertRaises(Invalid):
             check(bad)
 
+    def test_shared_cache_never_reuses_nonhalt_success_on_a_halter(self):
+        from proofgame.shared_random import SharedSimulator
+        for nonhalter,actions in [
+            (CLOSED,['choose:NONHALT','rule:closedStates',
+                     'cert:add:q0','cert:verify','submit']),
+            (PARITY,['choose:NONHALT','rule:exactCycle',
+                     'cert:start:2','cert:period:2','cert:verify','submit']),
+        ]:
+            sim=SharedSimulator(nonhalter,max_cached_states=1000)
+            for machine,expected_success in [(nonhalter,True),(HALTER,False),(nonhalter,True)]:
+                sim.set_machine(machine)
+                game=Game(machine,budget=100)
+                state=sim.root
+                for action in actions:
+                    if action not in game.available_actions():
+                        break
+                    index=sim.menu(state).index(action)
+                    state=sim.transition(state,index)
+                    game.step(action,observe=False)
+                    if isinstance(state,tuple):
+                        break
+                self.assertEqual(game.status=='SOLVED',expected_success)
+                self.assertEqual(isinstance(state,tuple),expected_success)
+
     def test_no_certificate_action_on_halt_branch(self):
         game=Game(CLOSED,budget=20)
         game.step('choose:HALT',observe=False)
