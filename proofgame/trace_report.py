@@ -69,6 +69,9 @@ def format_trace_report(report):
                 lines.append('     Goal: '+goal[:240]+('…' if len(goal)>240 else ''))
             if step['draft']:
                 lines.append('     Building: '+str(step['draft'].get('expression',''))[:200])
+            if step.get('certificate_candidate'):
+                lines.append('     Certificate candidate: '+
+                             json.dumps(step['certificate_candidate'],sort_keys=True)[:240])
             top=', '.join(f"{x['action']} {100*x['probability']:.1f}%"
                           for x in step['alternatives'])
             lines.append('     Top choices: '+top)
