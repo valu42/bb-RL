@@ -8,7 +8,59 @@ The proof environment works. The Transformer and training loop run. **This is
 not yet evidence that the model learns to prove machines.** Included example
 proofs are human-written verification fixtures; the trainer never loads them.
 
-## Current experiment: 1,000 training machines, 100 test machines, 10 epochs
+## Unfiltered two-state experiment: 1,000 train, 100 test, 100 epochs
+
+This harder experiment **does not preselect machines based on stochastic proof
+search**. It samples 1,100 distinct labelled two-state Turing machines uniformly
+without replacement from all 20,736 possible transition tables. The first
+1,000 form the fixed training set and the remaining 100 form the fixed
+held-out evaluation set. Neither split contains proof labels or certificates.
+The seed fixes the complete dataset. No halting/non-halting behavior is checked
+when selecting machines.
+
+Create the dataset once (choose a path that does not already exist):
+
+```bash
+python -m proofgame.unfiltered_dataset \
+  --train 1000 --test 100 --budget 100 --seed 20261026 \
+  --out runs/unfiltered_1000_100/dataset.json
+```
+
+Train a **new** randomly initialized model, evaluate before training (epoch 0)
+and after each of 100 epochs:
+
+```bash
+python -m proofgame.epoch_train \
+  --dataset runs/unfiltered_1000_100/dataset.json \
+  --out runs/unfiltered_100_epochs \
+  --epochs 100 --attempts 100 --batch-size 8 --workers 8 \
+  --stop-after-first-train-proof
+```
+
+Each machine gets up to **100 independent proof attempts**, with up to **100
+proof-game actions per attempt**. Training attempts stop early when the first
+verified proof is found on that machine. Evaluation uses all 100 attempts for
+every held-out machine and never updates the model. Epochs re-use the same
+training machines, with a new deterministic shuffle and training action seeds
+each epoch. There is no `--resume` flag in the command, and the output path
+must be new to start from epoch 0.
+
+This is potentially **very CPU-intensive**: in the worst case, 100 epochs x
+1,000 training machines x 100 attempts x 100 actions = 1 billion training
+actions, plus baseline and per-epoch evaluations. Training may have no useful
+gradient updates if no valid proof is discovered; zero successes do not imply
+unprovability. Also, because the unfiltered sample may contain non-halting
+machines, the earlier filtered benchmark's success rates cannot be compared
+directly to this benchmark. Measure held-out machine coverage as well as
+training policy updates.
+
+To run tests:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+## Earlier filtered experiment: 1,000 training machines, 100 test machines, 10 epochs
 
 Everything needed for this experiment is in this archive. The main runner is
 `proofgame/epoch_train.py`. The fixed, disjoint dataset is
