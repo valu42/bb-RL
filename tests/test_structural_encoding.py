@@ -79,7 +79,7 @@ class ASTEncodingTests(unittest.TestCase):
         success={'actions':trajectory,'certificate':game.certificate()}
         result={'machine':machine.to_json(),'attempts':1,'successes':[success]}
         update=learn_batch(policy,optimizer,[result],20)
-        self.assertTrue(update['updated'])
+        self.assertTrue(update['updated'],f'AST update rejected: {update}')
         self.assertEqual(update['proofs'],1)
         self.assertTrue(torch.isfinite(torch.tensor(update['loss'])))
 
