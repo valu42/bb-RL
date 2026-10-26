@@ -45,6 +45,9 @@ class Policy(nn.Module):
         n=max(map(len,encoded))
         if n>self.config["max_tokens"]: raise ModelLimit(f"input needs {n} tokens; maximum is {self.config['max_tokens']}")
         device=self.embedding.weight.device
+        # Limit unique Metal graph shapes for variable-length inputs.
+        if device.type=='mps':
+            n=min(self.config['max_tokens'],((n+15)//16)*16)
         ids=torch.zeros((len(texts),n),dtype=torch.long,device=device)
         for i,row in enumerate(encoded): ids[i,:len(row)]=torch.tensor(row,device=device)
         x=self.embedding(ids)*math.sqrt(self.config["width"])
@@ -53,6 +56,35 @@ class Policy(nn.Module):
         pe=torch.zeros((n,x.shape[-1]),device=device,dtype=x.dtype)
         pe[:,0::2]=torch.sin(pos*scale); pe[:,1::2]=torch.cos(pos*scale)
         return self.encoder(x+pe,src_key_padding_mask=ids.eq(0))[:,0]
+
+    def score_many(self,observations):
+        """Differentiable, shared-embedding scores for a group of observations.
+
+        Actions are encoded only once per unique JSON description, and states
+        share one encoder invocation. Useful for MPS policy-gradient updates.
+        Scores have the same per-observation action ordering as forward().
+        """
+        if not observations:
+            return []
+        contexts=[{k:v for k,v in obs.items() if k!='actions'} for obs in observations]
+        context_texts=[json.dumps(obj,sort_keys=True,separators=(',',':')) for obj in contexts]
+        action_groups=[[json.dumps(a,sort_keys=True,separators=(',',':')) for a in obs['actions']]
+                       for obs in observations]
+        if any(not group for group in action_groups):
+            raise ValueError('terminal observation has no actions')
+        unique=list(dict.fromkeys(action for group in action_groups for action in group))
+        positions={value:i for i,value in enumerate(unique)}
+        context_embeddings=self.encode(context_texts)
+        action_embeddings=self.encode(unique)
+        keys=self.key(action_embeddings)
+        biases=self.action_bias(action_embeddings).squeeze(-1)
+        queries=self.query(context_embeddings)
+        scores=[]
+        for query,group in zip(queries,action_groups):
+            indices=torch.tensor([positions[a] for a in group],dtype=torch.long,device=keys.device)
+            logits=(keys.index_select(0,indices)*query).sum(-1)/math.sqrt(query.shape[-1])
+            scores.append(logits+biases.index_select(0,indices))
+        return scores
 
     def forward(self,observation):
         actions=observation["actions"]

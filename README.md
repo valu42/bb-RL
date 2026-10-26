@@ -8,6 +8,62 @@ The proof environment works. The Transformer and training loop run. **This is
 not yet evidence that the model learns to prove machines.** Included example
 proofs are human-written verification fixtures; the trainer never loads them.
 
+## Apple Silicon GPU training (MPS, experimental)
+
+The epoch trainer now supports `--device mps` on an Apple Silicon Mac with an
+MPS-capable version of PyTorch. Only the **main process** owns the Metal
+device and the policy. CPU processes run the symbolic proof environments and
+send observations to a central **batched inference server**, which caches
+frozen-policy action embeddings and observation probabilities. GPU gradients
+are accumulated using microbatched observations and deduplicated actions.
+Tokens are length-bucketed on MPS to reduce repeated shape compilation.
+
+First confirm `python -c "import torch; print(torch.backends.mps.is_available())"`
+prints `True`. Keep the dataset from the earlier unfiltered experiment.
+
+Start a **new run from fresh weights** (no `--resume`):
+
+```bash
+python -m proofgame.epoch_train \
+  --dataset runs/unfiltered_1000_100/dataset.json \
+  --out runs/unfiltered_100_epochs_ast_mps \
+  --epochs 100 --attempts 100 --batch-size 8 --workers 8 \
+  --stop-after-first-train-proof --representation ast --device mps \
+  --gpu-inference-batch-size 8 --gpu-inference-wait-ms 2 \
+  --gpu-gradient-batch-size 4
+```
+
+MPS is **opt-in**: omitting `--device mps` preserves the existing
+multiprocessing CPU runner. The GPU settings are saved in `config.json` to
+protect checkpoint compatibility. If memory use is excessive, first reduce
+`--gpu-inference-batch-size` to 4 and `--gpu-gradient-batch-size` to 1,
+or reduce `--workers` to 4. This architecture does not guarantee speedups
+for such a small Transformer; benchmark completed proof-game actions per
+second and wall-clock time against CPU on the same dataset and model.
+
+Every training and evaluation epoch writes `epoch_NN_training.json` or
+`epoch_NN_evaluation.json` and prints an `event: epoch_summary` line.
+In addition to overall machine coverage, these include:
+
+- `machines_proved_by_answer.HALT` and `.NONHALT`: **distinct machines**
+  with at least one formally checked proof of that answer
+- `successful_attempts_by_answer.HALT` and `.NONHALT`: total verified
+  successful attempts, including repeated proofs of one evaluation machine
+- `machines_unproved`: machines with **no proof found within the budget**
+- `first_proof_attempt_mean_by_answer`: mean attempt index of the first
+  success per solved machine, or `null` when no success exists
+
+These are **proved claims only**, not omniscient counts of truly halting or
+nonhalting machines. The filtered experiment contains mostly easy halting
+machines; the unfiltered dataset can contain both kinds. The per-batch
+`progress.json` also includes answer-specific counts. The final
+`report.json` retains the complete epoch-by-epoch training and evaluation
+summary. Evaluation remains at all 100 attempts per machine.
+
+MPS functionality requires a real Apple GPU for hardware validation. Run
+`python -m unittest discover -s tests -v` before long experiments; the
+optional Metal test runs only when MPS is available.
+
 ## Optional AST-aware Transformer (experimental)
 
 The epoch trainer can use `--representation ast` instead of its default
