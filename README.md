@@ -42,6 +42,65 @@ records also include `machines_solved_pct` and `attempt_success_pct` on a 0–10
 scale; existing fraction fields retain their 0–1 scale. A resumed run does not
 repeat an already completed baseline.
 
+## Short, verified NONHALT certificates
+
+The proof game now supports two additional **formally checked** ways to
+prove NONHALT without constructing a long induction proof.
+
+**Closed state set:** the agent proposes a set of non-halting states
+containing `q0`. The checker verifies that for *both* read symbols, every
+transition from every state in the set remains in the set. `qH` must not
+appear. This is an inductive invariant, not a simulation heuristic.
+
+Example (5 proof-game actions on a two-state machine whose `q0` rows
+both return to `q0`):
+
+```text
+choose:NONHALT
+rule:closedStates
+cert:add:q0
+cert:verify
+submit
+```
+
+**Exact recurrence:** the agent proposes `start` and positive `period`.
+The checker simulates only the proposed finite segment and verifies that
+the **entire** machine configuration at `start` and `start+period`
+matches: state, absolute head position, and all nonblank tape cells.
+It also rejects a halt anywhere in the checked prefix. Determinism
+then proves the machine runs forever. Merely not halting within a
+finite number of steps is **never** sufficient.
+
+Example (6 proof-game actions for the two-state parity trap):
+
+```text
+choose:NONHALT
+rule:exactCycle
+cert:start:2
+cert:period:2
+cert:verify
+submit
+```
+
+The candidate editor currently exposes starts 0..32 and periods 1..32,
+while the trusted checker supports proposals with up to 4,096 simulated
+transitions. The editor range is deliberately small to keep action
+menus manageable; this restricts which recurrence certificates the
+policy can propose, not the logical soundness of accepted proofs.
+Exact recurrence cannot prove non-halting machines with endlessly
+growing tapes and no repeated complete configuration.
+
+These rules are only available for an unproved NONHALT root. Failed
+candidates produce an error and **zero reward**; the kernel independently
+rechecks successful certificates, including after saving/loading.
+Existing general natural-deduction proof rules remain available.
+
+Run the constructive and adversarial tests:
+
+```bash
+python -m unittest discover -s tests -p 'test_short_nonhalt_certificates.py' -v
+```
+
 ## Balanced HALT/NONHALT attempts until the first verified proof
 
 With `--balanced-initial-answers --attempts 100`, each training machine
