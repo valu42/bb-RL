@@ -706,7 +706,7 @@ def main():
                 if args.device=='mps':
                     challenge_tasks=[
                         (row,task_seed(args.seed,'eval',0,row['machine_id']),
-                         args.attempts,dataset['action_budget'],state['updates'],True,0.)
+                         args.attempts,dataset['action_budget'],state['updates'],True,0.,False)
                         for row in challenge_rows
                     ]
                     challenge_results=pool.run(challenge_tasks)
@@ -717,7 +717,7 @@ def main():
                     challenge_tasks=[
                         (row,task_seed(args.seed,'eval',0,row['machine_id']),
                          args.attempts,dataset['action_budget'],
-                         str(weights_file),state['updates'],True,0.)
+                         str(weights_file),state['updates'],True,0.,False)
                         for row in challenge_rows
                     ]
                     challenge_results=pool.map(run_machine,challenge_tasks,chunksize=1)
