@@ -84,6 +84,40 @@ within its own limits. The test probes the attempt and reports checker
 errors. Don't count this machine as solved under the 100-action budget
 unless the formal kernel accepts the certificate.
 
+## Verified NONHALT proof: a two-state control
+
+The project now has an **actual kernel-checked NONHALT proof**, not just a
+mathematical explanation. The regression
+`tests/test_nonhalt_proof_feasibility.py` constructs a proof certificate and
+replays its **39 proof-game actions** against the real action menu, with
+`budget=100`. Both `Game` and `kernel.check` accept it.
+
+The control machine has two states:
+
+| State, read | Write | Move | Next |
+| --- | --- | --- | --- |
+| q0, b0 | b1 | R | q0 |
+| q0, b1 | b1 | R | q0 |
+| q1, b0 | b0 | R | qH |
+| q1, b1 | b1 | R | qH |
+
+It proves the stronger invariant `forall n, qof(at n C0) = q0` using
+`natI`, `casesBit`, `rewrite`, and `refl`, then proves NONHALT
+using `cut`, `allI`, `impI`, `specialize`, and `discriminate`.
+This demonstrates that NONHALT proofs **are expressible, constructible and
+rewarded** in the current environment.
+
+It does **not** demonstrate that the random policy discovers such proofs,
+nor that the more challenging **parity trap** or **growing frontier**
+invariants have been formalized under the same action budget. Those remain
+separate research questions.
+
+Run the exact constructive test:
+
+```bash
+python -m unittest discover -s tests -p 'test_nonhalt_proof_feasibility.py' -v
+```
+
 ## Formal-proof status versus mathematical nonhalting
 
 The two NONHALT machines have complete **human mathematical invariants**
