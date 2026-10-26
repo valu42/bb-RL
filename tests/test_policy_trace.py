@@ -22,11 +22,11 @@ class ScriptedSampler:
         desired=next(self.actions)
         names=[a['id'] for a in observation['actions']]
         assert desired in names,(desired,names)
-        # Include a meaningful second-best choice in the trace.
-        values=[0.01]*len(names)
-        values[names.index(desired)]=0.8
-        total=sum(values)
-        return tuple(x/total for x in values)
+        # Make the scripted path deterministic. Real policy traces have
+        # nontrivial alternatives; this fixture checks the recorder itself.
+        values=[0.]*len(names)
+        values[names.index(desired)]=1.
+        return tuple(values)
 
 
 class TraceTests(unittest.TestCase):
