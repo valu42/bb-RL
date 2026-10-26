@@ -1,9 +1,10 @@
 """Resumable filtered curriculum with fixed train/test sets and epoch evaluation.
 
-Every machine receives exactly the configured number of independent-reset
-attempts. Rollout batches share frozen weights; only training successes supply
-REINFORCE gradients. Evaluation never updates parameters. Selector proofs are
-not accepted in the dataset. Checkpoints commit after every rollout batch.
+Evaluation always runs the exact configured number of independent-reset
+attempts per machine. Training can optionally stop on its first verified proof.
+Rollout batches share frozen weights; only training successes supply REINFORCE
+gradients. Evaluation never updates parameters. Selector proofs are not accepted
+in the dataset. Checkpoints commit after every rollout batch.
 """
 import argparse
 from collections import Counter
@@ -70,7 +71,7 @@ def init_worker(model_config):
 
 
 def run_machine(task):
-    selected, seed, attempts, budget, weights_file, version = task
+    selected, seed, attempts, budget, weights_file, version, stop_on_success = task
     saved = torch.load(weights_file, map_location='cpu', weights_only=True)
     if saved['version'] != version: raise RuntimeError('rollout policy version changed')
     _worker_policy.load_state_dict(saved['state_dict'])
@@ -82,8 +83,10 @@ def run_machine(task):
         actions += len(trace); statuses[status] += 1
         if cert:
             successes.append({'attempt':i+1, 'actions':trace, 'certificate':cert})
+            if stop_on_success:
+                break
     return {**selected, 'action_seed':seed, 'policy_version':version,
-            'attempts':attempts, 'actions':actions, 'statuses':dict(statuses),
+            'attempts':sum(statuses.values()), 'actions':actions, 'statuses':dict(statuses),
             'successes':successes, 'seconds':time.monotonic()-start,
             'network_evaluations':sampler.misses, 'cache_hits':sampler.hits}
 
@@ -95,7 +98,7 @@ def learn_batch(policy, optimizer, results, budget):
     identical observations/actions is algebraically the same as summing their
     individual log-probability gradients, divided by all attempts in the batch.
     """
-    groups = {}; proof_count = 0
+    groups = {}; proof_count = 0; numerical_fallbacks = 0
     for result in results:
         machine = Machine(result['machine']['rows'])
         for success in result['successes']:
@@ -118,17 +121,33 @@ def learn_batch(policy, optimizer, results, budget):
     optimizer.zero_grad(set_to_none=True)
     denominator = sum(r['attempts'] for r in results); total_loss = 0.
     for encoded, (counts, expected) in groups.items():
-        logits,_ = policy(json.loads(encoded)); logps = logits.log_softmax(-1)
+        observation = json.loads(encoded)
+        logits,_ = policy(observation); logps = logits.log_softmax(-1)
+        inference_probs = None
         for index, probability in expected.items():
-            if not math.isclose(float(logps[index].detach().exp()), probability, rel_tol=2e-5, abs_tol=2e-7):
-                raise RuntimeError('off-policy training trajectory')
+            grad_probability = float(logps[index].detach().exp())
+            if not math.isclose(grad_probability, probability, rel_tol=2e-5, abs_tol=2e-7):
+                # On some PyTorch versions, the eval/no-grad transformer kernel
+                # used by FrozenSampler differs slightly from the grad kernel.
+                # Verify against the inference path before rejecting the rollout.
+                if inference_probs is None:
+                    with torch.inference_mode():
+                        inference_probs = policy(observation)[0].softmax(-1).tolist()
+                inference_probability = inference_probs[index]
+                if not math.isclose(inference_probability, probability, rel_tol=2e-4, abs_tol=2e-6):
+                    raise RuntimeError(
+                        'off-policy training trajectory: '
+                        f'sampled={probability:.9g}, grad={grad_probability:.9g}, '
+                        f'inference={inference_probability:.9g}, action={observation["actions"][index]["id"]}')
+                numerical_fallbacks += 1
         loss = -(logps*torch.tensor(counts,dtype=logps.dtype)).sum()/denominator
         if not torch.isfinite(loss): raise RuntimeError('non-finite loss')
         loss.backward(); total_loss += float(loss.detach())
     norm = torch.nn.utils.clip_grad_norm_(policy.parameters(),1.,error_if_nonfinite=True)
     optimizer.step()
     return {'updated':True, 'proofs':proof_count, 'unique_gradient_observations':len(groups),
-            'loss':total_loss, 'gradient_norm':float(norm)}
+            'loss':total_loss, 'gradient_norm':float(norm),
+            'inference_gradient_probability_differences':numerical_fallbacks}
 
 
 def summarize(files):
@@ -155,6 +174,8 @@ def main():
     parser.add_argument('--seed',type=int,default=7)
     parser.add_argument('--lr',type=float,default=3e-4)
     parser.add_argument('--resume',action='store_true')
+    parser.add_argument('--stop-after-first-train-proof',action='store_true',
+                        help='stop each training machine after one verified proof; keep evaluation at the full attempt budget')
     args = parser.parse_args()
     if min(args.epochs,args.attempts,args.batch_size,args.workers)<1:parser.error('positive counts required')
     if args.out.exists() and not args.resume:parser.error('choose a new output directory or --resume')
@@ -181,15 +202,32 @@ def main():
             'batch_size':args.batch_size,'seed':args.seed,'lr':args.lr,'model':policy.config,
             'parameters':sum(p.numel() for p in policy.parameters()),'epochs_requested':args.epochs,
             'algorithm':'on-policy REINFORCE batches; zero baseline; mean gradient over all attempts',
-            'attempts_after_success':'continue to exact attempt budget',
+            'attempts_after_success':('training: stop after first verified proof; evaluation: full attempt budget'
+                                       if args.stop_after_first_train_proof else 'continue to exact attempt budget'),
             'evaluation':'fixed filtered test set; fixed sampling seeds; no updates',
             'selector_proofs_supplied':0,'initial_archive':0}
     if args.resume:
         old=json.loads((args.out/'config.json').read_text())
+        changing_strategy = False
         for k in config:
-            if k!='epochs_requested' and config[k]!=old[k]:parser.error('resume configuration changed: '+k)
+            if k!='epochs_requested' and config[k]!=old[k]:
+                if (k=='attempts_after_success' and args.stop_after_first_train_proof
+                        and old[k]=='continue to exact attempt budget'):
+                    changing_strategy = True
+                else:
+                    parser.error('resume configuration changed: '+k)
         state=torch.load(args.out/'state.pt',map_location='cpu',weights_only=True)
         if args.epochs < state['completed_epochs']:parser.error('requested epoch count is below completed epochs')
+        changes=list(old.get('strategy_changes',[]))
+        if changing_strategy:
+            changes.append({'phase':state['phase'],'epoch':state['epoch'],
+                            'next_machine_index':state['next_index'],
+                            'from':old['attempts_after_success'],
+                            'to':config['attempts_after_success']})
+            print('WARNING: changing the training attempt strategy while resuming. '
+                  'The current epoch may contain mixed training budgets.',flush=True)
+        if changes:
+            config['strategy_changes']=changes
         policy.load_state_dict(state['state_dict']);optimizer.load_state_dict(state['optimizer_state_dict'])
         if state['phase']=='done' and state['completed_epochs']<args.epochs:
             state.update(phase='train',epoch=state['completed_epochs']+1,next_index=0)
@@ -220,7 +258,9 @@ def main():
             if start_index<len(rows):
                 batch=rows[start_index:start_index+args.batch_size]
                 atomic_torch(weights_file,{'version':state['updates'],'config':policy.config,'state_dict':policy.state_dict()})
-                tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),args.attempts,dataset['action_budget'],str(weights_file),state['updates']) for r in batch]
+                tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
+                        args.attempts,dataset['action_budget'],str(weights_file),state['updates'],
+                        training and args.stop_after_first_train_proof) for r in batch]
                 results=pool.map(run_machine,tasks,chunksize=1)
                 update=learn_batch(policy,optimizer,results,dataset['action_budget']) if training else {'updated':False}
                 state['updates']+=int(update['updated'])
