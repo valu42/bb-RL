@@ -162,7 +162,16 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
             if cert and first_success_trace is None:
                 first_success_trace=sample
             elif not cert:
-                last_failed_trace=sample
+                # Prefer an informative failed trajectory over a trivial
+                # sequence of resets when many attempts have failed.
+                def diagnostic_score(item):
+                    steps=item['steps']
+                    return (sum(x['action'].startswith(('rule:','cert:')) for x in steps),
+                            sum(x['action']!='reset' for x in steps),
+                            len(steps))
+                if (last_failed_trace is None or
+                        diagnostic_score(sample)>diagnostic_score(last_failed_trace)):
+                    last_failed_trace=sample
         if cert:
             successes.append({'attempt':i+1, 'actions':trace, 'certificate':cert})
             if stop_on_success:
