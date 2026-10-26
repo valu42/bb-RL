@@ -228,7 +228,10 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4):
     old_optimizer=copy.deepcopy(optimizer.state_dict())
     try:
         optimizer.step()
-        healthy=policy_is_finite(policy) and optimizer_is_finite(optimizer)
+        weights_ok=policy_is_finite(policy)
+        optimizer_ok=optimizer_is_finite(optimizer)
+        logits_ok=True
+        healthy=weights_ok and optimizer_ok
         if healthy:
             # A finite weight vector can still yield invalid attention logits.
             # Probe a couple of the actual successful states before committing.
@@ -236,6 +239,7 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4):
                 for encoded, _ in (observations[0], observations[-1]):
                     logits,_=policy(json.loads(encoded))
                     if not bool(torch.isfinite(logits).all()):
+                        logits_ok=False
                         healthy=False
                         break
     except Exception:
@@ -254,7 +258,10 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4):
         return {'updated':False, 'proofs':proof_count,
                 'unique_gradient_observations':len(groups),
                 'loss':total_loss, 'gradient_norm':float(norm),
-                'rejected_update':'nonfinite_optimizer_result'}
+                'rejected_update':'nonfinite_optimizer_result',
+                'numerical_health':{'weights_finite':weights_ok,
+                                    'optimizer_finite':optimizer_ok,
+                                    'probe_logits_finite':logits_ok}}
     return {'updated':True, 'proofs':proof_count, 'unique_gradient_observations':len(groups),
             'loss':total_loss, 'gradient_norm':float(norm),
             'inference_gradient_probability_differences':numerical_fallbacks}
