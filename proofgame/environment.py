@@ -77,6 +77,7 @@ class Game:
         self.machine=machine; self.budget=budget; self.left=budget
         self.max_nodes=max_nodes; self.max_depth=max_depth
         self.answer=None; self.proof=None; self.focus=(); self.draft=None
+        self.candidate=None
         self.status="ACTIVE"; self.error=None; self.reward=0
         self._cached_goals=None
 
@@ -108,6 +109,10 @@ class Game:
               "rule:raa":("raa",None,None),
               "rule:casesBit":("casesBit",None,"Bit"),
               "rule:casesState":("casesState",None,"State")}
+        if (self.answer=="NONHALT" and self.proof is None and
+                target==root_goal("NONHALT") and not g.variables and not g.facts):
+            menu["rule:closedStates"]=("closedStates",None,None)
+            menu["rule:exactCycle"]=("exactCycle",None,None)
         tag=target[0] if isinstance(target,tuple) else target
         rules={"all":["allI"],"ex":["exI"],"imp":["impI"],"and":["andI"],
                "or":["orL","orR"],"eq":["refl"]}.get(tag,[])
@@ -137,6 +142,18 @@ class Game:
     def available_actions(self):
         if self.status!="ACTIVE": return []
         if self.answer is None: return ["choose:HALT","choose:NONHALT","reset"]
+        if self.candidate is not None:
+            candidate=self.candidate
+            if candidate["kind"]=="closedStates":
+                states=candidate["states"]
+                choices=[("cert:remove:" if q in states else "cert:add:")+q
+                         for q in self.machine.states if q!="qH"]
+                return [*choices,"cert:verify","cert:cancel","reset"]
+            if candidate["kind"]=="exactCycle":
+                return ([*(f"cert:start:{n}" for n in range(33)),
+                         *(f"cert:period:{n}" for n in range(1,33)),
+                         "cert:verify","cert:cancel","reset"])
+            raise Invalid("unknown certificate draft")
         if self.draft:
             return [*self.expression_menu(),*([] if first_hole(self.draft["expr"]) else ["commit"]),"cancel","reset"]
         goals=self.goals()
@@ -147,7 +164,8 @@ class Game:
         obs={"machine":self.machine.to_json(),"answer":self.answer,"status":self.status,
              "actions_left":self.left,"limits":{"nodes":self.max_nodes,"depth":self.max_depth},
              "focus":self.focus,"goals":[{"path":p,**g.text()} for p,g in goals],
-             "proof":self.proof,"draft":None,"last_error":self.error}
+             "proof":self.proof,"draft":None,"candidate":self.candidate,
+             "last_error":self.error}
         if self.draft:
             h=first_hole(self.draft["expr"])
             obs["draft"]={"rule":self.draft["rule"],"data":self.draft["data"],
@@ -188,6 +206,7 @@ class Game:
                 for v in x: walk(v,depth+1)
         walk(self.proof)
         if self.draft: walk(self.draft)
+        if self.candidate: walk(self.candidate)
         for _,g in self.goals():
             walk(g.target)
             for f in g.facts: walk(f)
@@ -195,14 +214,40 @@ class Game:
     def step(self,action,observe=True):
         if self.status!="ACTIVE": raise Invalid("episode is terminal")
         self.left-=1; self.error=None; self.reward=0
-        old=(self.answer,self.proof,self.focus,self.draft)
+        old=(self.answer,self.proof,self.focus,self.draft,self.candidate)
         try:
             if action not in self.available_actions(): raise Invalid("action is not in current menu")
             if action=="reset":
                 self.answer=None; self.proof=None; self.focus=(); self.draft=None
-                self._cached_goals=None
+                self.candidate=None; self._cached_goals=None
             elif action.startswith("choose:"):
                 self.answer=action.split(":")[1]; self._cached_goals=None
+            elif action=="rule:closedStates":
+                self.candidate={"kind":"closedStates","states":[]}
+            elif action=="rule:exactCycle":
+                self.candidate={"kind":"exactCycle","start":None,"period":None}
+            elif self.candidate is not None:
+                candidate=self.candidate
+                if action=="cert:cancel":
+                    self.candidate=None
+                elif action=="cert:verify":
+                    if candidate["kind"]=="closedStates":
+                        data=tuple(candidate["states"])
+                        rule="closedStates"
+                    else:
+                        data=(candidate["start"],candidate["period"])
+                        rule="exactCycle"
+                    self._commit(rule,data)
+                    self.candidate=None
+                elif candidate["kind"]=="closedStates":
+                    op,q=action.split(":")[1:]
+                    selected=set(candidate["states"])
+                    if op=="add": selected.add(q)
+                    else: selected.remove(q)
+                    self.candidate={**candidate,"states":sorted(selected)}
+                else:
+                    _,field,number=action.split(":")
+                    self.candidate={**candidate,field:int(number)}
             elif action.startswith("focus:"): self.focus=self.goals()[int(action.split(":")[1])][0]
             elif action=="cancel": self.draft=None
             elif action=="submit":
@@ -220,7 +265,7 @@ class Game:
                 else: self._commit(rule,data)
             self._limits()
         except (Invalid,RecursionError) as e:
-            self.answer,self.proof,self.focus,self.draft=old
+            self.answer,self.proof,self.focus,self.draft,self.candidate=old
             self._cached_goals=None
             self.error=str(e); self.status="ACTIVE"; self.reward=0
         if self.left==0 and self.status!="SOLVED": self.status="EXHAUSTED"
