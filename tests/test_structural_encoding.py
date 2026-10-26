@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import math
 import unittest
 
 
@@ -82,6 +83,15 @@ class ASTEncodingTests(unittest.TestCase):
         self.assertTrue(update['updated'],f'AST update rejected: {update}')
         self.assertEqual(update['proofs'],1)
         self.assertTrue(torch.isfinite(torch.tensor(update['loss'])))
+        # This specifically regresses the eval/no-grad fastpath producing NaNs
+        # after the first *finite* AdamW update on a structural attention mask.
+        after=Game(machine,budget=20).observation()
+        probs=FrozenSampler(policy).probabilities(after)
+        self.assertTrue(all(math.isfinite(p) for p in probs))
+        with torch.enable_grad():
+            logits,_=policy(after)
+        torch.testing.assert_close(torch.tensor(probs),logits.detach().softmax(-1),
+                                   rtol=5e-4,atol=5e-6)
 
     def test_limit_and_legacy_model_config(self):
         from proofgame.model import ModelLimit, Policy
