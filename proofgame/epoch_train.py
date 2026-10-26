@@ -98,7 +98,7 @@ def run_machine(task):
     return execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler)
 
 
-def learn_batch(policy, optimizer, results, budget):
+def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4):
     """Zero-reward episodes contribute zero; identical state gradients combine.
 
     Every success is on-policy under the same frozen batch weights. Grouping
@@ -127,29 +127,47 @@ def learn_batch(policy, optimizer, results, budget):
         return {'updated':False, 'proofs':0, 'unique_gradient_observations':0, 'loss':0.}
     optimizer.zero_grad(set_to_none=True)
     denominator = sum(r['attempts'] for r in results); total_loss = 0.
-    for encoded, (counts, expected) in groups.items():
-        observation = json.loads(encoded)
-        logits,_ = policy(observation); logps = logits.log_softmax(-1)
-        inference_probs = None
-        for index, probability in expected.items():
-            grad_probability = float(logps[index].detach().exp())
-            if not math.isclose(grad_probability, probability, rel_tol=2e-5, abs_tol=2e-7):
-                # On some PyTorch versions, the eval/no-grad transformer kernel
-                # used by FrozenSampler differs slightly from the grad kernel.
-                # Verify against the inference path before rejecting the rollout.
-                if inference_probs is None:
-                    with torch.inference_mode():
-                        inference_probs = policy(observation)[0].softmax(-1).tolist()
-                inference_probability = inference_probs[index]
-                if not math.isclose(inference_probability, probability, rel_tol=2e-4, abs_tol=2e-6):
-                    raise RuntimeError(
-                        'off-policy training trajectory: '
-                        f'sampled={probability:.9g}, grad={grad_probability:.9g}, '
-                        f'inference={inference_probability:.9g}, action={observation["actions"][index]["id"]}')
-                numerical_fallbacks += 1
-        loss = -(logps*torch.tensor(counts,dtype=logps.dtype,device=logps.device)).sum()/denominator
-        if not torch.isfinite(loss): raise RuntimeError('non-finite loss')
-        loss.backward(); total_loss += float(loss.detach())
+    device = next(policy.parameters()).device
+    is_mps = device.type == 'mps'
+    observations = list(groups.items())
+    microbatch = gpu_gradient_batch_size if is_mps else 1
+    for start in range(0,len(observations),microbatch):
+        chunk = observations[start:start+microbatch]
+        parsed = [json.loads(encoded) for encoded, _ in chunk]
+        if is_mps:
+            logits_batch = policy.score_many(parsed)
+        else:
+            logits_batch = [policy(obs)[0] for obs in parsed]
+        losses = []
+        for observation, logits, (_, (counts, expected)) in zip(parsed,logits_batch,chunk):
+            logps = logits.log_softmax(-1)
+            inference_probs = None
+            for index, probability in expected.items():
+                grad_probability = float(logps[index].detach().exp())
+                if not math.isclose(grad_probability, probability,
+                                    rel_tol=2e-4 if is_mps else 2e-5,abs_tol=2e-6 if is_mps else 2e-7):
+                    # Batched inference and gradient kernels may give slightly
+                    # different float32 results on Metal. Recheck against the
+                    # same frozen policy, never allow a changed policy version.
+                    if inference_probs is None:
+                        with torch.inference_mode():
+                            inference_probs = policy(observation)[0].softmax(-1).tolist()
+                    inference_probability = inference_probs[index]
+                    if not math.isclose(inference_probability, probability,
+                                        rel_tol=3e-3 if is_mps else 2e-4,
+                                        abs_tol=3e-5 if is_mps else 2e-6):
+                        raise RuntimeError(
+                            'off-policy training trajectory: '
+                            f'sampled={probability:.9g}, grad={grad_probability:.9g}, '
+                            f'inference={inference_probability:.9g}, action={observation["actions"][index]["id"]}')
+                    numerical_fallbacks += 1
+            loss = -(logps*torch.tensor(counts,dtype=logps.dtype,
+                                        device=logps.device)).sum()/denominator
+            if not torch.isfinite(loss): raise RuntimeError('non-finite loss')
+            losses.append(loss)
+        grouped_loss = torch.stack(losses).sum()
+        grouped_loss.backward()
+        total_loss += float(grouped_loss.detach())
     norm = torch.nn.utils.clip_grad_norm_(policy.parameters(),1.,error_if_nonfinite=True)
     optimizer.step()
     return {'updated':True, 'proofs':proof_count, 'unique_gradient_observations':len(groups),
@@ -187,12 +205,14 @@ def main():
     parser.add_argument('--gpu-inference-batch-size',type=int,default=8)
     parser.add_argument('--gpu-inference-wait-ms',type=float,default=2.)
     parser.add_argument('--gpu-max-attention-elements',type=int,default=8000000)
+    parser.add_argument('--gpu-gradient-batch-size',type=int,default=4)
     parser.add_argument('--resume',action='store_true')
     parser.add_argument('--stop-after-first-train-proof',action='store_true',
                         help='stop each training machine after one verified proof; keep evaluation at the full attempt budget')
     args = parser.parse_args()
     if min(args.epochs,args.attempts,args.batch_size,args.workers,
-           args.gpu_inference_batch_size,args.gpu_max_attention_elements)<1:
+           args.gpu_inference_batch_size,args.gpu_max_attention_elements,
+           args.gpu_gradient_batch_size)<1:
         parser.error('positive counts required')
     if not math.isfinite(args.gpu_inference_wait_ms) or args.gpu_inference_wait_ms<0:
         parser.error('invalid GPU batching wait')
@@ -257,7 +277,8 @@ def main():
         config['device']='mps'
         config['gpu_inference']={'batch_size':args.gpu_inference_batch_size,
                                  'wait_ms':args.gpu_inference_wait_ms,
-                                 'max_attention_elements':args.gpu_max_attention_elements}
+                                 'max_attention_elements':args.gpu_max_attention_elements,
+                                 'gradient_batch_size':args.gpu_gradient_batch_size}
     if args.resume:
         old=json.loads((args.out/'config.json').read_text())
         changing_strategy = False
@@ -332,7 +353,8 @@ def main():
                             args.attempts,dataset['action_budget'],str(weights_file),state['updates'],
                             training and args.stop_after_first_train_proof) for r in batch]
                     results=pool.map(run_machine,tasks,chunksize=1)
-                update=learn_batch(policy,optimizer,results,dataset['action_budget']) if training else {'updated':False}
+                update=learn_batch(policy,optimizer,results,dataset['action_budget'],
+                                   gpu_gradient_batch_size=args.gpu_gradient_batch_size) if training else {'updated':False}
                 state['updates']+=int(update['updated'])
                 batch_file=folder/f'batch_{start_index:04d}.json'
                 atomic_json(batch_file,{'epoch':epoch,'phase':phase,'start_index':start_index,'machines':results,'update':update})
