@@ -1,4 +1,4 @@
-"""Resumable filtered curriculum with fixed train/test sets and epoch evaluation.
+"""Resumable epoch training on fixed, disjoint train/test datasets.
 
 Evaluation always runs the exact configured number of independent-reset
 attempts per machine. Training can optionally stop on its first verified proof.
@@ -24,7 +24,9 @@ from .kernel import check
 from .logic import Machine
 from .model import Policy
 from .network_search import FrozenSampler, attempt, encode_json
+from .population_sample import from_rank
 from .tasks import is_test, key
+from .unfiltered_dataset import DATASET_FORMAT as UNFILTERED_FORMAT, POPULATION
 
 
 def atomic_json(path, value):
@@ -183,14 +185,28 @@ def main():
     try:lock = acquire_run_lock(args.out/'run.lock')
     except RuntimeError as e:parser.error(str(e))
     dataset_bytes = args.dataset.read_bytes(); dataset = json.loads(dataset_bytes)
-    if dataset['format']!='proofgame-epoch-curriculum-1':parser.error('unsupported dataset')
+    dataset_format = dataset.get('format')
+    if dataset_format not in ('proofgame-epoch-curriculum-1', UNFILTERED_FORMAT):
+        parser.error('unsupported dataset')
+    if type(dataset.get('action_budget')) is not int or dataset['action_budget'] < 1:
+        parser.error('invalid action budget')
     ids = []
     for split in ['train','test']:
-        if not dataset[split]:parser.error('empty split')
+        if not dataset.get(split): parser.error('empty split')
         for row in dataset[split]:
-            if set(row)!={'rank','machine_id','machine'}:parser.error('dataset must contain only machine identities and tables')
+            if set(row)!={'rank','machine_id','machine'}:
+                parser.error('dataset must contain only machine identities and tables')
             machine=Machine(row['machine']['rows'])
-            if key(machine)!=row['machine_id'] or is_test(machine)!=(split=='test'):parser.error('invalid identity or split')
+            if key(machine)!=row['machine_id']:
+                parser.error('invalid machine identity')
+            if dataset_format=='proofgame-epoch-curriculum-1':
+                if is_test(machine)!=(split=='test'):
+                    parser.error('invalid filtered dataset split')
+            else:
+                rank=row['rank']
+                if (type(rank) is not int or not 0<=rank<POPULATION
+                        or from_rank(rank,states=2).to_json()!=machine.to_json()):
+                    parser.error('invalid unfiltered two-state machine/rank')
             ids.append(row['machine_id'])
     if len(set(ids))!=len(ids):parser.error('duplicate/overlapping machines')
     torch.set_num_threads(1);torch.manual_seed(args.seed)
@@ -204,7 +220,9 @@ def main():
             'algorithm':'on-policy REINFORCE batches; zero baseline; mean gradient over all attempts',
             'attempts_after_success':('training: stop after first verified proof; evaluation: full attempt budget'
                                        if args.stop_after_first_train_proof else 'continue to exact attempt budget'),
-            'evaluation':'fixed filtered test set; fixed sampling seeds; no updates',
+            'evaluation':('fixed unfiltered test set; fixed sampling seeds; no updates'
+                          if dataset_format==UNFILTERED_FORMAT
+                          else 'fixed filtered test set; fixed sampling seeds; no updates'),
             'selector_proofs_supplied':0,'initial_archive':0}
     if args.resume:
         old=json.loads((args.out/'config.json').read_text())
