@@ -121,7 +121,8 @@ def init_worker(model_config):
 
 
 def execute_machine(selected, seed, attempts, budget, version, stop_on_success, sampler,
-                    exploration_epsilon=0., balanced_initial_answers=False):
+                    exploration_epsilon=0., balanced_initial_answers=False,
+                    trace_diagnostics=False):
     """Execute a machine with either a CPU policy or the central GPU sampler."""
     machine = Machine(selected['machine']['rows']); rng = random.Random(seed)
     successes = []; statuses = Counter(); actions = 0; start = time.monotonic()
@@ -135,6 +136,8 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
                 if balanced_initial_answers else [None] * attempts)
     if balanced_initial_answers:
         random.Random(seed ^ 0xA5A5F00D).shuffle(schedule)
+    first_success_trace = None
+    last_failed_trace = None
     first_actions=Counter(); policy_sums={'HALT':0.,'NONHALT':0.}
     behavior_sums={'HALT':0.,'NONHALT':0.}; initial_observations=0
     def record_initial(action, raw, mixed):
@@ -146,11 +149,20 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
                 policy_sums[answer]+=raw[answer]
                 behavior_sums[answer]+=mixed[answer]
     for i in range(attempts):
+        detail = [] if trace_diagnostics else None
         cert, trace, status = attempt(sampler, machine, rng, budget,
                                       exploration_epsilon=exploration_epsilon,
                                       on_initial_choice=record_initial,
-                                      forced_initial_answer=schedule[i])
+                                      forced_initial_answer=schedule[i],
+                                      diagnostic_steps=detail)
         actions += len(trace); statuses[status] += 1
+        if trace_diagnostics:
+            sample = {'attempt':i+1, 'status':status, 'steps':detail,
+                      'certificate':cert if cert else None}
+            if cert and first_success_trace is None:
+                first_success_trace=sample
+            elif not cert:
+                last_failed_trace=sample
         if cert:
             successes.append({'attempt':i+1, 'actions':trace, 'certificate':cert})
             if stop_on_success:
@@ -165,17 +177,20 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
             'initial_behavior_probability_sums':behavior_sums,
             'scheduled_initial_answer_counts':dict(Counter(
                 f'choose:{answer}' for answer in schedule[:sum(statuses.values())]
-                if answer is not None))}
+                if answer is not None)),
+            **({'diagnostic_traces':{'success':first_success_trace,
+                                    'failure':last_failed_trace}}
+               if trace_diagnostics else {})}
 
 
 def run_machine(task):
-    selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon, balanced = task
+    selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon, balanced, diagnostics = task
     saved = torch.load(weights_file, map_location='cpu', weights_only=True)
     if saved['version'] != version: raise RuntimeError('rollout policy version changed')
     _worker_policy.load_state_dict(saved['state_dict'])
     sampler = FrozenSampler(_worker_policy, capacity=10000)
     return execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler,
-                           epsilon,balanced)
+                           epsilon,balanced,diagnostics)
 
 
 def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
