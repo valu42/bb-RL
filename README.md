@@ -85,12 +85,19 @@ This avoids silently saving a corrupted model. A non-finite distribution
 from inference raises an explicit diagnostic rather than the opaque
 `random.choices: Total of weights must be finite` exception.
 
-**Existing corrupted checkpoints cannot be repaired by these safeguards.**
-If `--resume` reports non-finite model weights or optimizer state, keep
-the old run directory for inspection and start a fresh run (the unique-run
-suffix feature preserves earlier outputs). Don't assume a successful
-`policy_updates: 1` log means that particular update was numerically valid
-on every future observation.
+The AST encoder also disables PyTorch's native inference-only MHA fastpath,
+which can produce NaN logits from otherwise finite post-update weights when
+using our learned per-head structural masks. This keeps rollout inference and
+gradient replay on the same attention implementation.
+
+**Existing checkpoints may still be usable** if their model and optimizer
+tensors are finite: the new attention path can fix an inference-only NaN
+without changing the saved weights. Resume with the exact same run settings
+and `--resume` after updating the repository. If resume instead reports
+non-finite model weights or optimizer state, keep the old run directory for
+inspection and start a fresh run (the unique-run suffix feature preserves
+earlier outputs). Don't assume a successful `policy_updates: 1` log means
+that particular update was numerically valid on every future observation.
 
 For the current tiny model, **CPU may outperform MPS**. CPU rollout workers
 make policy calls locally, while MPS needs worker queues, JSON parsing,
