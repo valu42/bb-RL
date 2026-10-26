@@ -72,7 +72,8 @@ class FrozenSampler:
         return result
 
 
-def attempt(sampler, machine, rng, budget=20, exploration_epsilon=0., on_initial_choice=None):
+def attempt(sampler, machine, rng, budget=20, exploration_epsilon=0., on_initial_choice=None,
+            forced_initial_answer=None):
     game = Game(machine, budget=budget)
     trace = []
     while game.status == "ACTIVE":
@@ -82,7 +83,19 @@ def attempt(sampler, machine, rng, budget=20, exploration_epsilon=0., on_initial
         except ModelLimit:
             return None, trace, "MODEL_LIMIT"
         behavior = mix_probabilities(observation, probabilities, exploration_epsilon)
-        index = rng.choices(range(len(behavior)), weights=behavior, k=1)[0]
+        forced = not trace and forced_initial_answer is not None
+        if forced:
+            if forced_initial_answer not in ('HALT','NONHALT'):
+                raise ValueError('invalid forced initial answer')
+            indices = answer_indices(observation)
+            if indices is None:
+                raise RuntimeError('initial answer choices missing from proof game')
+            index = indices[0 if forced_initial_answer == 'HALT' else 1]
+            # Conditional training: the scheduled initial action has probability
+            # one, and therefore no policy-gradient contribution.
+            behavior = tuple(1. if j == index else 0. for j in range(len(probabilities)))
+        else:
+            index = rng.choices(range(len(behavior)), weights=behavior, k=1)[0]
         action = observation["actions"][index]["id"]
         if not trace and on_initial_choice is not None:
             branch_indices = answer_indices(observation)
@@ -91,7 +104,10 @@ def attempt(sampler, machine, rng, budget=20, exploration_epsilon=0., on_initial
             mixed = {'HALT': behavior[branch_indices[0]],
                      'NONHALT': behavior[branch_indices[1]]} if branch_indices else {}
             on_initial_choice(action, raw, mixed)
-        trace.append({"action": action, "probability": behavior[index]})
+        step = {"action": action, "probability": behavior[index]}
+        if forced:
+            step['forced_initial_answer'] = forced_initial_answer
+        trace.append(step)
         game.step(action, observe=False)
     if game.status == "SOLVED":
         certificate = game.certificate()
