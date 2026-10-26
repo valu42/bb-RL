@@ -22,6 +22,7 @@ import time
 import torch
 
 from .environment import Game
+from .exploration import behavior_log_probs
 from .kernel import check
 from .logic import Machine
 from .model import Policy
@@ -119,12 +120,25 @@ def init_worker(model_config):
     _worker_policy = Policy(**model_config).eval()
 
 
-def execute_machine(selected, seed, attempts, budget, version, stop_on_success, sampler):
+def execute_machine(selected, seed, attempts, budget, version, stop_on_success, sampler,
+                    exploration_epsilon=0.):
     """Execute a machine with either a CPU policy or the central GPU sampler."""
     machine = Machine(selected['machine']['rows']); rng = random.Random(seed)
     successes = []; statuses = Counter(); actions = 0; start = time.monotonic()
+    first_actions=Counter(); policy_sums={'HALT':0.,'NONHALT':0.}
+    behavior_sums={'HALT':0.,'NONHALT':0.}; initial_observations=0
+    def record_initial(action, raw, mixed):
+        nonlocal initial_observations
+        first_actions[action]+=1
+        if raw:
+            initial_observations+=1
+            for answer in ('HALT','NONHALT'):
+                policy_sums[answer]+=raw[answer]
+                behavior_sums[answer]+=mixed[answer]
     for i in range(attempts):
-        cert, trace, status = attempt(sampler, machine, rng, budget)
+        cert, trace, status = attempt(sampler, machine, rng, budget,
+                                      exploration_epsilon=exploration_epsilon,
+                                      on_initial_choice=record_initial)
         actions += len(trace); statuses[status] += 1
         if cert:
             successes.append({'attempt':i+1, 'actions':trace, 'certificate':cert})
@@ -133,19 +147,24 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
     return {**selected, 'action_seed':seed, 'policy_version':version,
             'attempts':sum(statuses.values()), 'actions':actions, 'statuses':dict(statuses),
             'successes':successes, 'seconds':time.monotonic()-start,
-            'network_evaluations':sampler.misses, 'cache_hits':sampler.hits}
+            'network_evaluations':sampler.misses, 'cache_hits':sampler.hits,
+            'first_action_counts':dict(first_actions),
+            'initial_choice_observations':initial_observations,
+            'initial_policy_probability_sums':policy_sums,
+            'initial_behavior_probability_sums':behavior_sums}
 
 
 def run_machine(task):
-    selected, seed, attempts, budget, weights_file, version, stop_on_success = task
+    selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon = task
     saved = torch.load(weights_file, map_location='cpu', weights_only=True)
     if saved['version'] != version: raise RuntimeError('rollout policy version changed')
     _worker_policy.load_state_dict(saved['state_dict'])
     sampler = FrozenSampler(_worker_policy, capacity=10000)
-    return execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler)
+    return execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler,epsilon)
 
 
-def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4):
+def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
+                exploration_epsilon=0.):
     """Zero-reward episodes contribute zero; identical state gradients combine.
 
     Every success is on-policy under the same frozen batch weights. Grouping
@@ -187,7 +206,7 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4):
             logits_batch = [policy(obs)[0] for obs in parsed]
         losses = []
         for observation, logits, (_, (counts, expected)) in zip(parsed,logits_batch,chunk):
-            logps = logits.log_softmax(-1)
+            logps = behavior_log_probs(logits,observation,exploration_epsilon)
             inference_probs = None
             for index, probability in expected.items():
                 grad_probability = float(logps[index].detach().exp())
@@ -198,7 +217,9 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4):
                     # same frozen policy, never allow a changed policy version.
                     if inference_probs is None:
                         with torch.inference_mode():
-                            inference_probs = policy(observation)[0].softmax(-1).tolist()
+                            inference_logits=policy(observation)[0]
+                            inference_probs=behavior_log_probs(
+                                inference_logits,observation,exploration_epsilon).exp().tolist()
                     inference_probability = inference_probs[index]
                     if not math.isclose(inference_probability, probability,
                                         rel_tol=3e-3 if is_mps else 2e-4,
@@ -312,6 +333,26 @@ def count_proofs_by_answer(rows):
     }
 
 
+def summarize_initial_choices(rows):
+    counts=Counter(); raw={'HALT':0.,'NONHALT':0.}
+    behavior={'HALT':0.,'NONHALT':0.}; n=0
+    for row in rows:
+        counts.update(row.get('first_action_counts',{}))
+        n+=row.get('initial_choice_observations',0)
+        for answer in ('HALT','NONHALT'):
+            raw[answer]+=row.get('initial_policy_probability_sums',{}).get(answer,0.)
+            behavior[answer]+=row.get('initial_behavior_probability_sums',{}).get(answer,0.)
+    return {
+        'first_action_counts':{action:counts.get(action,0)
+                               for action in ('choose:HALT','choose:NONHALT','reset')},
+        'initial_choice_observations':n,
+        'mean_initial_policy_probability':{
+            answer:raw[answer]/n if n else None for answer in ('HALT','NONHALT')},
+        'mean_initial_behavior_probability':{
+            answer:behavior[answer]/n if n else None for answer in ('HALT','NONHALT')}
+    }
+
+
 def summarize_rows(rows):
     successes = sum(len(r['successes']) for r in rows)
     attempts = sum(r['attempts'] for r in rows)
@@ -324,7 +365,7 @@ def summarize_rows(rows):
             'attempt_success_pct':100*successes/attempts if attempts else 0.,
             'actions':sum(r['actions'] for r in rows),
             'statuses':dict(sum((Counter(r['statuses']) for r in rows),Counter())),
-            **count_proofs_by_answer(rows)}
+            **count_proofs_by_answer(rows), **summarize_initial_choices(rows)}
 
 
 def summarize(files):
@@ -367,6 +408,8 @@ def main():
     parser.add_argument('--workers',type=int,default=8)
     parser.add_argument('--seed',type=int,default=7)
     parser.add_argument('--lr',type=float,default=3e-4)
+    parser.add_argument('--train-exploration-epsilon',type=float,default=0.2,
+                        help='fraction of initial training decisions sampled uniformly between HALT/NONHALT (default 0.2); evaluation unchanged')
     parser.add_argument('--representation',choices=('bytes','ast'),default='bytes',
                         help='byte-level JSON or AST-aware tokens and learnable structural attention')
     parser.add_argument('--device',choices=('cpu','mps'),default='cpu',
@@ -383,6 +426,8 @@ def main():
            args.gpu_inference_batch_size,args.gpu_max_attention_elements,
            args.gpu_gradient_batch_size)<1:
         parser.error('positive counts required')
+    if not math.isfinite(args.train_exploration_epsilon) or not 0<=args.train_exploration_epsilon<1:
+        parser.error('train-exploration-epsilon must be in [0,1)')
     if not math.isfinite(args.gpu_inference_wait_ms) or args.gpu_inference_wait_ms<0:
         parser.error('invalid GPU batching wait')
     if args.device=='mps' and not torch.backends.mps.is_available():
@@ -441,6 +486,7 @@ def main():
             'batch_size':args.batch_size,'seed':args.seed,'lr':args.lr,'model':policy.config,
             'parameters':sum(p.numel() for p in policy.parameters()),'epochs_requested':args.epochs,
             'algorithm':'on-policy REINFORCE batches; zero baseline; mean gradient over all attempts',
+            'train_exploration_epsilon':args.train_exploration_epsilon,
             'attempts_after_success':('training: stop after first verified proof; evaluation: full attempt budget'
                                        if args.stop_after_first_train_proof else 'continue to exact attempt budget'),
             'evaluation':('fixed unfiltered test set; fixed sampling seeds; no updates'
@@ -457,7 +503,7 @@ def main():
         old=json.loads((args.out/'config.json').read_text())
         changing_strategy = False
         for k in config:
-            if k!='epochs_requested' and config[k]!=old[k]:
+            if k!='epochs_requested' and config[k]!=old.get(k,0. if k=='train_exploration_epsilon' else None):
                 if (k=='attempts_after_success' and args.stop_after_first_train_proof
                         and old[k]=='continue to exact attempt budget'):
                     changing_strategy = True
@@ -525,17 +571,20 @@ def main():
                 if args.device=='mps':
                     tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
                             args.attempts,dataset['action_budget'],state['updates'],
-                            training and args.stop_after_first_train_proof) for r in batch]
+                            training and args.stop_after_first_train_proof,
+                            args.train_exploration_epsilon if training else 0.) for r in batch]
                     results=pool.run(tasks)
                 else:
                     atomic_torch(weights_file,{'version':state['updates'],'config':policy.config,
                                                'state_dict':policy.state_dict()})
                     tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
                             args.attempts,dataset['action_budget'],str(weights_file),state['updates'],
-                            training and args.stop_after_first_train_proof) for r in batch]
+                            training and args.stop_after_first_train_proof,
+                            args.train_exploration_epsilon if training else 0.) for r in batch]
                     results=pool.map(run_machine,tasks,chunksize=1)
                 update=learn_batch(policy,optimizer,results,dataset['action_budget'],
-                                   gpu_gradient_batch_size=args.gpu_gradient_batch_size) if training else {'updated':False}
+                                   gpu_gradient_batch_size=args.gpu_gradient_batch_size,
+                                   exploration_epsilon=args.train_exploration_epsilon) if training else {'updated':False}
                 state['updates']+=int(update['updated'])
                 if update.get('rejected_update'):
                     state['rejected_updates']=state.get('rejected_updates',0)+1
@@ -546,11 +595,15 @@ def main():
                 atomic_json(batch_file,{'epoch':epoch,'phase':phase,'start_index':start_index,'machines':results,'update':update})
                 state['next_index']+=len(batch);save_state()
                 batch_outcomes=count_proofs_by_answer(results)
+                batch_choices=summarize_initial_choices(results)
                 progress={'phase':phase,'epoch':epoch,'target_epochs':args.epochs,'machines_done':state['next_index'],
                           'machines_total':len(rows),'policy_updates':state['updates'],
                           'last_batch_solved':sum(bool(r['successes']) for r in results),
                           'last_batch_proofs':sum(len(r['successes']) for r in results),
                           'rejected_updates':state.get('rejected_updates',0),
+                          'last_batch_first_action_counts':batch_choices['first_action_counts'],
+                          'last_batch_mean_initial_policy_probability':batch_choices['mean_initial_policy_probability'],
+                          'last_batch_mean_initial_behavior_probability':batch_choices['mean_initial_behavior_probability'],
                           'last_batch_machines_proved_by_answer':batch_outcomes['machines_proved_by_answer'],
                           'last_batch_successful_attempts_by_answer':batch_outcomes['successful_attempts_by_answer'],
                           'active_seconds':state['active_seconds']}
@@ -572,8 +625,23 @@ def main():
                               'attempts':metrics['attempts'],
                               'successful_attempts':metrics['successful_attempts'],
                               'attempt_success_pct':metrics['attempt_success_pct'],
+                              'first_action_counts':metrics['first_action_counts'],
+                              'mean_initial_policy_probability':metrics['mean_initial_policy_probability'],
+                              'mean_initial_behavior_probability':metrics['mean_initial_behavior_probability'],
+                              'train_exploration_epsilon':args.train_exploration_epsilon if training else 0.,
                               'policy_updates':metrics['policy_updates']}),
                   flush=True)
+            counts=metrics['first_action_counts']
+            raw=metrics['mean_initial_policy_probability']
+            behavior=metrics['mean_initial_behavior_probability']
+            if raw['HALT'] is not None:
+                print(f"Answer exploration — {phase} epoch {epoch}: "
+                      f"first actions HALT={counts['choose:HALT']}, "
+                      f"NONHALT={counts['choose:NONHALT']}, reset={counts['reset']}; "
+                      f"mean raw P(HALT)={raw['HALT']:.3f}, "
+                      f"P(NONHALT)={raw['NONHALT']:.3f}; "
+                      f"sampling P(HALT)={behavior['HALT']:.3f}, "
+                      f"P(NONHALT)={behavior['NONHALT']:.3f}",flush=True)
             if not training:
                 print(evaluation_line(metrics),flush=True)
                 write_evaluation_csv(args.out)
@@ -586,7 +654,7 @@ def main():
                 if args.device=='mps':
                     challenge_tasks=[
                         (row,task_seed(args.seed,'eval',0,row['machine_id']),
-                         args.attempts,dataset['action_budget'],state['updates'],True)
+                         args.attempts,dataset['action_budget'],state['updates'],True,0.)
                         for row in challenge_rows
                     ]
                     challenge_results=pool.run(challenge_tasks)
@@ -597,7 +665,7 @@ def main():
                     challenge_tasks=[
                         (row,task_seed(args.seed,'eval',0,row['machine_id']),
                          args.attempts,dataset['action_budget'],
-                         str(weights_file),state['updates'],True)
+                         str(weights_file),state['updates'],True,0.)
                         for row in challenge_rows
                     ]
                     challenge_results=pool.map(run_machine,challenge_tasks,chunksize=1)

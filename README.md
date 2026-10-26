@@ -42,6 +42,64 @@ records also include `machines_solved_pct` and `attempt_success_pct` on a 0–10
 scale; existing fraction fields retain their 0–1 scale. A resumed run does not
 repeat an already completed baseline.
 
+## Balanced answer exploration and choice logging
+
+The epoch trainer now uses **on-policy epsilon-mixture exploration only during
+training** (default `--train-exploration-epsilon 0.2`). Whenever the model
+must select an answer, the action distribution is
+
+```text
+behavior(a | state) = 0.8 * policy(a | state)
+                      + 0.2 * Uniform({choose:HALT, choose:NONHALT})(a)
+```
+
+Thus both answer choices retain at least 10% probability on each
+answer-selection step. This does not guarantee a successful NONHALT proof,
+nor does it force the network to predict 50/50: it preserves exploration
+while the network learns which machines need which proof. The reset action
+retains 80% of its original probability. The **actual mixed probability**
+is recorded in successful trajectories, and REINFORCE differentiates the
+**log of the mixed behavior distribution**, not the unmodified policy.
+This avoids the off-policy bias from forcing an answer and pretending the
+policy chose it. No proof examples or true machine labels are supplied.
+
+**Evaluation and special parity/Busy Beaver benchmarks always use the
+unmodified policy** (epsilon 0), so they measure what the model learned
+without forced exploration.
+
+The per-batch `progress.json` and per-epoch training/evaluation JSON now
+include:
+
+- `first_action_counts`: actual first actions `choose:HALT`,
+  `choose:NONHALT`, and `reset`, across **all attempts**, including
+  failures (not just successful proofs).
+- `mean_initial_policy_probability`: average raw policy probabilities
+  for HALT and NONHALT at the beginning of an attempt.
+- `mean_initial_behavior_probability`: average probabilities after
+  training exploration is applied (identical to raw values in evaluation).
+- `initial_choice_observations`: denominator for those averages.
+
+These diagnostics help distinguish **policy collapse** (raw NONHALT
+probability near zero) from **proof-construction difficulty** (NONHALT
+still chosen, but never successfully proved). Results are logged after
+each epoch and saved in the usual files.
+
+Example fresh training command (output directory automatically receives
+a new run ID if already present):
+
+```bash
+python -m proofgame.epoch_train \
+  --dataset runs/unfiltered_1000_100/dataset.json \
+  --out runs/ast_cpu_exploration \
+  --epochs 100 --attempts 100 --batch-size 8 --workers 8 \
+  --representation ast --device cpu \
+  --stop-after-first-train-proof --train-exploration-epsilon 0.2
+```
+
+To resume a run created before this option existed, pass
+`--train-exploration-epsilon 0` to preserve its original behavior.
+Changing the sampling strategy mid-checkpoint is intentionally rejected.
+
 ## Separate two-state diagnostic evaluations after every epoch
 
 The epoch runner automatically tests two fixed challenge machines at **baseline
