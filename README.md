@@ -42,6 +42,47 @@ records also include `machines_solved_pct` and `attempt_success_pct` on a 0–10
 scale; existing fraction fields retain their 0–1 scale. A resumed run does not
 repeat an already completed baseline.
 
+## Exact 50/50 initial-answer attempts per training machine
+
+Use `--balanced-initial-answers` to run **exactly 50 HALT-first and
+50 NONHALT-first attempts on each training machine** with `--attempts 100`.
+The 100 initial decisions are shuffled reproducibly per machine and training
+epoch. This is an alternative to epsilon-mixture exploration; the initial
+answer is **scheduled**, not sampled from the network.
+
+```bash
+python -m proofgame.epoch_train \
+  --dataset runs/unfiltered_1000_100/dataset.json \
+  --out runs/ast_cpu_balanced_50_50 \
+  --epochs 100 --attempts 100 --batch-size 8 --workers 8 \
+  --representation ast --device cpu --balanced-initial-answers
+```
+
+Do **not** include `--stop-after-first-train-proof`: it conflicts with
+exactly 100 attempts per machine and is rejected with a clear error.
+All attempts run, even if a valid proof was found earlier. To avoid
+repeatedly reinforcing the same machine, **only the first successful
+trajectory per machine contributes to the gradient**. All successes still
+count toward the diagnostic totals. Training can therefore be substantially
+slower than stopping after the first success.
+
+For each forced first action, the actual sampling probability is 1 and its
+log-probability gradient is zero. Subsequent actions are sampled and learned
+normally. This optimizes **conditional proof construction given the chosen
+answer**, not the model's ability to select HALT versus NONHALT on its own.
+It is a useful targeted exploration experiment, but the held-out policy
+may still favor HALT until we explicitly train answer selection.
+
+The regular held-out evaluation and the parity/Busy Beaver diagnostics
+remain **unforced** and unchanged, so their results are comparable with
+earlier experiments. The training reports include exact
+`scheduled_initial_answer_counts`, and the usual first-choice and raw
+probability diagnostics remain available.
+
+For a different even number of attempts, the schedule divides them
+equally. Existing checkpoints cannot silently switch to balanced mode:
+use a fresh output directory to preserve experiment comparability.
+
 ## Balanced answer exploration and choice logging
 
 The epoch trainer now uses **on-policy epsilon-mixture exploration only during

@@ -121,10 +121,16 @@ def init_worker(model_config):
 
 
 def execute_machine(selected, seed, attempts, budget, version, stop_on_success, sampler,
-                    exploration_epsilon=0.):
+                    exploration_epsilon=0., balanced_initial_answers=False):
     """Execute a machine with either a CPU policy or the central GPU sampler."""
     machine = Machine(selected['machine']['rows']); rng = random.Random(seed)
     successes = []; statuses = Counter(); actions = 0; start = time.monotonic()
+    if balanced_initial_answers and (attempts % 2 or stop_on_success):
+        raise ValueError('balanced initial answers require an even number of attempts and no early stopping')
+    schedule = (['HALT'] * (attempts//2) + ['NONHALT'] * (attempts//2)
+                if balanced_initial_answers else [None] * attempts)
+    if balanced_initial_answers:
+        random.Random(seed ^ 0xA5A5F00D).shuffle(schedule)
     first_actions=Counter(); policy_sums={'HALT':0.,'NONHALT':0.}
     behavior_sums={'HALT':0.,'NONHALT':0.}; initial_observations=0
     def record_initial(action, raw, mixed):
@@ -138,7 +144,8 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
     for i in range(attempts):
         cert, trace, status = attempt(sampler, machine, rng, budget,
                                       exploration_epsilon=exploration_epsilon,
-                                      on_initial_choice=record_initial)
+                                      on_initial_choice=record_initial,
+                                      forced_initial_answer=schedule[i])
         actions += len(trace); statuses[status] += 1
         if cert:
             successes.append({'attempt':i+1, 'actions':trace, 'certificate':cert})
@@ -151,20 +158,23 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
             'first_action_counts':dict(first_actions),
             'initial_choice_observations':initial_observations,
             'initial_policy_probability_sums':policy_sums,
-            'initial_behavior_probability_sums':behavior_sums}
+            'initial_behavior_probability_sums':behavior_sums,
+            'scheduled_initial_answer_counts':dict(Counter(
+                f'choose:{answer}' for answer in schedule if answer is not None))}
 
 
 def run_machine(task):
-    selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon = task
+    selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon, balanced = task
     saved = torch.load(weights_file, map_location='cpu', weights_only=True)
     if saved['version'] != version: raise RuntimeError('rollout policy version changed')
     _worker_policy.load_state_dict(saved['state_dict'])
     sampler = FrozenSampler(_worker_policy, capacity=10000)
-    return execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler,epsilon)
+    return execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler,
+                           epsilon,balanced)
 
 
 def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
-                exploration_epsilon=0.):
+                exploration_epsilon=0., balanced_initial_answers=False):
     """Zero-reward episodes contribute zero; identical state gradients combine.
 
     Every success is on-policy under the same frozen batch weights. Grouping
@@ -174,18 +184,32 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
     groups = {}; proof_count = 0; numerical_fallbacks = 0
     for result in results:
         machine = Machine(result['machine']['rows'])
-        for success in result['successes']:
+        for proof_number, success in enumerate(result['successes']):
             check(success['certificate'])
-            replay = Game(machine, budget=budget); proof_count += 1
-            for step in success['actions']:
+            replay = Game(machine, budget=budget)
+            use_for_learning = not balanced_initial_answers or proof_number == 0
+            if use_for_learning:
+                proof_count += 1
+            for step_number, step in enumerate(success['actions']):
                 obs = replay.observation(); encoded = encode_json(obs)
                 index = next(i for i,a in enumerate(obs['actions']) if a['id']==step['action'])
-                if encoded not in groups:
-                    groups[encoded] = ([0]*len(obs['actions']), {})
-                counts, expected = groups[encoded]; counts[index] += 1
-                if index in expected and not math.isclose(expected[index],step['probability'],rel_tol=1e-5,abs_tol=1e-7):
-                    raise RuntimeError('inconsistent sampled probabilities')
-                expected[index] = step['probability']
+                forced = step.get('forced_initial_answer')
+                if forced is not None:
+                    if (not balanced_initial_answers or step_number != 0 or
+                            step['action'] != 'choose:' + forced or
+                            step['probability'] != 1.):
+                        raise RuntimeError('invalid forced-answer trajectory')
+                elif balanced_initial_answers and step_number == 0:
+                    raise RuntimeError('balanced training proof lacks forced initial answer')
+                # A scheduled initial decision is deterministic, so its
+                # log probability is log(1)=0 and its gradient is zero.
+                if use_for_learning and forced is None:
+                    if encoded not in groups:
+                        groups[encoded] = ([0]*len(obs['actions']), {})
+                    counts, expected = groups[encoded]; counts[index] += 1
+                    if index in expected and not math.isclose(expected[index],step['probability'],rel_tol=1e-5,abs_tol=1e-7):
+                        raise RuntimeError('inconsistent sampled probabilities')
+                    expected[index] = step['probability']
                 replay.step(step['action'], observe=False)
             if replay.status != 'SOLVED' or json.loads(json.dumps(replay.certificate())) != json.loads(json.dumps(success['certificate'])):
                 raise ValueError('incomplete or mismatched training proof')
@@ -334,10 +358,11 @@ def count_proofs_by_answer(rows):
 
 
 def summarize_initial_choices(rows):
-    counts=Counter(); raw={'HALT':0.,'NONHALT':0.}
+    counts=Counter(); scheduled=Counter(); raw={'HALT':0.,'NONHALT':0.}
     behavior={'HALT':0.,'NONHALT':0.}; n=0
     for row in rows:
         counts.update(row.get('first_action_counts',{}))
+        scheduled.update(row.get('scheduled_initial_answer_counts',{}))
         n+=row.get('initial_choice_observations',0)
         for answer in ('HALT','NONHALT'):
             raw[answer]+=row.get('initial_policy_probability_sums',{}).get(answer,0.)
@@ -345,6 +370,8 @@ def summarize_initial_choices(rows):
     return {
         'first_action_counts':{action:counts.get(action,0)
                                for action in ('choose:HALT','choose:NONHALT','reset')},
+        'scheduled_initial_answer_counts':{
+            action:scheduled.get(action,0) for action in ('choose:HALT','choose:NONHALT')},
         'initial_choice_observations':n,
         'mean_initial_policy_probability':{
             answer:raw[answer]/n if n else None for answer in ('HALT','NONHALT')},
@@ -408,6 +435,8 @@ def main():
     parser.add_argument('--workers',type=int,default=8)
     parser.add_argument('--seed',type=int,default=7)
     parser.add_argument('--lr',type=float,default=3e-4)
+    parser.add_argument('--balanced-initial-answers',action='store_true',
+                        help='train with exactly half HALT and half NONHALT initial attempts per machine; requires even --attempts, disables first-proof early stop')
     parser.add_argument('--train-exploration-epsilon',type=float,default=0.2,
                         help='fraction of initial training decisions sampled uniformly between HALT/NONHALT (default 0.2); evaluation unchanged')
     parser.add_argument('--representation',choices=('bytes','ast'),default='bytes',
@@ -426,6 +455,14 @@ def main():
            args.gpu_inference_batch_size,args.gpu_max_attention_elements,
            args.gpu_gradient_batch_size)<1:
         parser.error('positive counts required')
+    if args.balanced_initial_answers:
+        if args.attempts % 2:
+            parser.error('--balanced-initial-answers requires an even --attempts')
+        if args.stop_after_first_train_proof:
+            parser.error('--balanced-initial-answers cannot be combined with --stop-after-first-train-proof (all attempts are required)')
+        if args.train_exploration_epsilon != 0.2:
+            parser.error('balanced initial answers replaces epsilon exploration; omit --train-exploration-epsilon')
+        args.train_exploration_epsilon=0.
     if not math.isfinite(args.train_exploration_epsilon) or not 0<=args.train_exploration_epsilon<1:
         parser.error('train-exploration-epsilon must be in [0,1)')
     if not math.isfinite(args.gpu_inference_wait_ms) or args.gpu_inference_wait_ms<0:
@@ -487,6 +524,7 @@ def main():
             'parameters':sum(p.numel() for p in policy.parameters()),'epochs_requested':args.epochs,
             'algorithm':'on-policy REINFORCE batches; zero baseline; mean gradient over all attempts',
             'train_exploration_epsilon':args.train_exploration_epsilon,
+            'balanced_initial_answers':args.balanced_initial_answers,
             'attempts_after_success':('training: stop after first verified proof; evaluation: full attempt budget'
                                        if args.stop_after_first_train_proof else 'continue to exact attempt budget'),
             'evaluation':('fixed unfiltered test set; fixed sampling seeds; no updates'
@@ -503,7 +541,9 @@ def main():
         old=json.loads((args.out/'config.json').read_text())
         changing_strategy = False
         for k in config:
-            if k!='epochs_requested' and config[k]!=old.get(k,0. if k=='train_exploration_epsilon' else None):
+            if k!='epochs_requested' and config[k]!=old.get(
+                    k,False if k=='balanced_initial_answers' else
+                    (0. if k=='train_exploration_epsilon' else None)):
                 if (k=='attempts_after_success' and args.stop_after_first_train_proof
                         and old[k]=='continue to exact attempt budget'):
                     changing_strategy = True
@@ -572,7 +612,8 @@ def main():
                     tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
                             args.attempts,dataset['action_budget'],state['updates'],
                             training and args.stop_after_first_train_proof,
-                            args.train_exploration_epsilon if training else 0.) for r in batch]
+                            args.train_exploration_epsilon if training else 0.,
+                            training and args.balanced_initial_answers) for r in batch]
                     results=pool.run(tasks)
                 else:
                     atomic_torch(weights_file,{'version':state['updates'],'config':policy.config,
@@ -580,11 +621,13 @@ def main():
                     tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
                             args.attempts,dataset['action_budget'],str(weights_file),state['updates'],
                             training and args.stop_after_first_train_proof,
-                            args.train_exploration_epsilon if training else 0.) for r in batch]
+                            args.train_exploration_epsilon if training else 0.,
+                            training and args.balanced_initial_answers) for r in batch]
                     results=pool.map(run_machine,tasks,chunksize=1)
                 update=learn_batch(policy,optimizer,results,dataset['action_budget'],
                                    gpu_gradient_batch_size=args.gpu_gradient_batch_size,
-                                   exploration_epsilon=args.train_exploration_epsilon) if training else {'updated':False}
+                                   exploration_epsilon=args.train_exploration_epsilon,
+                                   balanced_initial_answers=args.balanced_initial_answers) if training else {'updated':False}
                 state['updates']+=int(update['updated'])
                 if update.get('rejected_update'):
                     state['rejected_updates']=state.get('rejected_updates',0)+1
@@ -602,6 +645,7 @@ def main():
                           'last_batch_proofs':sum(len(r['successes']) for r in results),
                           'rejected_updates':state.get('rejected_updates',0),
                           'last_batch_first_action_counts':batch_choices['first_action_counts'],
+                          'last_batch_scheduled_initial_answer_counts':batch_choices['scheduled_initial_answer_counts'],
                           'last_batch_mean_initial_policy_probability':batch_choices['mean_initial_policy_probability'],
                           'last_batch_mean_initial_behavior_probability':batch_choices['mean_initial_behavior_probability'],
                           'last_batch_machines_proved_by_answer':batch_outcomes['machines_proved_by_answer'],
@@ -626,6 +670,8 @@ def main():
                               'successful_attempts':metrics['successful_attempts'],
                               'attempt_success_pct':metrics['attempt_success_pct'],
                               'first_action_counts':metrics['first_action_counts'],
+                              'scheduled_initial_answer_counts':metrics['scheduled_initial_answer_counts'],
+                              'balanced_initial_answers':training and args.balanced_initial_answers,
                               'mean_initial_policy_probability':metrics['mean_initial_policy_probability'],
                               'mean_initial_behavior_probability':metrics['mean_initial_behavior_probability'],
                               'train_exploration_epsilon':args.train_exploration_epsilon if training else 0.,
@@ -634,6 +680,12 @@ def main():
             counts=metrics['first_action_counts']
             raw=metrics['mean_initial_policy_probability']
             behavior=metrics['mean_initial_behavior_probability']
+            if training and args.balanced_initial_answers:
+                scheduled=metrics['scheduled_initial_answer_counts']
+                print(f"Balanced initial attempts — epoch {epoch}: "
+                      f"HALT={scheduled['choose:HALT']}, "
+                      f"NONHALT={scheduled['choose:NONHALT']} "
+                      f"(each machine receives {args.attempts//2} of each)",flush=True)
             if raw['HALT'] is not None:
                 print(f"Answer exploration — {phase} epoch {epoch}: "
                       f"first actions HALT={counts['choose:HALT']}, "
@@ -654,7 +706,7 @@ def main():
                 if args.device=='mps':
                     challenge_tasks=[
                         (row,task_seed(args.seed,'eval',0,row['machine_id']),
-                         args.attempts,dataset['action_budget'],state['updates'],True,0.)
+                         args.attempts,dataset['action_budget'],state['updates'],True,0.,False)
                         for row in challenge_rows
                     ]
                     challenge_results=pool.run(challenge_tasks)
@@ -665,7 +717,7 @@ def main():
                     challenge_tasks=[
                         (row,task_seed(args.seed,'eval',0,row['machine_id']),
                          args.attempts,dataset['action_budget'],
-                         str(weights_file),state['updates'],True,0.)
+                         str(weights_file),state['updates'],True,0.,False)
                         for row in challenge_rows
                     ]
                     challenge_results=pool.map(run_machine,challenge_tasks,chunksize=1)

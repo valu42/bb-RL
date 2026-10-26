@@ -76,10 +76,10 @@ def _worker_loop(worker_id, jobs, events, replies):
                 return
             task_id, task = item
             try:
-                selected, seed, attempts, budget, version, stop_on_success, epsilon = task
+                selected, seed, attempts, budget, version, stop_on_success, epsilon, balanced = task
                 sampler = RemoteSampler(worker_id, events, replies)
                 result = execute_machine(selected, seed, attempts, budget,
-                                         version, stop_on_success, sampler, epsilon)
+                                         version, stop_on_success, sampler, epsilon, balanced)
                 events.put(('done', task_id, result))
             except BaseException:
                 events.put(('error', worker_id, traceback.format_exc()))
@@ -286,7 +286,7 @@ class CentralRolloutPool:
             return None
 
     def run(self, tasks):
-        """Tasks: selected, seed, max_attempts, budget, version, stop_on_success, epsilon."""
+        """Tasks: selected, seed, max_attempts, budget, version, stop_on_success, epsilon, balanced."""
         if not tasks:
             return []
         versions = {task[4] for task in tasks}
