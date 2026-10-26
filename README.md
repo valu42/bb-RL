@@ -42,6 +42,46 @@ records also include `machines_solved_pct` and `attempt_success_pct` on a 0–10
 scale; existing fraction fields retain their 0–1 scale. A resumed run does not
 repeat an already completed baseline.
 
+## Inspect what the policy actually does (every 10th batch)
+
+The epoch trainer now automatically captures **one verified successful
+proof** and **one failed attempt on an unproved machine** from every
+10th batch in both training and evaluation (when such examples exist).
+If every machine in the batch was proved, the failure sample is instead
+a failed attempt from a proved machine and is explicitly labeled. If no
+example exists, the report says so rather than fabricating one.
+
+The complete action-by-action trace includes:
+
+- The machine's transition table, attempt number and final status.
+- Every selected action, its **actual sampling probability**, and the
+  model's raw probability (different for forced initial HALT/NONHALT).
+- The top three alternative actions with probabilities at every step.
+- The current proof goal or partially built expression, checker errors,
+  and final verified certificate answer for successful proofs.
+
+These are the **actual trajectories under the frozen rollout policy before
+the optimizer update**, not trajectories reconstructed afterward using
+different weights. Trace capture runs only on every 10th batch to limit
+overhead; the diagnostics never enter gradient updates.
+
+The human-readable report is printed in the terminal and saved to
+`policy_traces/epoch_01_train_batch_0010.txt`, with matching JSON for
+programmatic analysis. Evaluation batches use `eval` in the filename.
+For example:
+
+```text
+  1. choose:NONHALT — 100.00% [FORCED] (raw model 1.30%)
+     Top choices: choose:NONHALT 100.0%, choose:HALT 0.0%, reset 0.0%
+  2. rule:closedStates — 28.40% (raw model 28.40%)
+     Goal: (all Nat ...)
+     Top choices: rule:closedStates 28.4%, rule:cut 21.0%, rule:exactCycle 18.1%
+```
+
+These example numbers are illustrative. The trace probabilities are
+action-selection probabilities, **not** probabilities that a proof claim is
+mathematically true. No new CLI flag is required.
+
 ## Short, verified NONHALT certificates
 
 The proof game now supports two additional **formally checked** ways to
