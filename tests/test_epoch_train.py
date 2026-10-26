@@ -123,4 +123,18 @@ class EpochTests(unittest.TestCase):
             torch.testing.assert_close(value,original[name])
 
 
+    def test_invalid_policy_probabilities_fail_before_sampling(self):
+        import torch
+        from proofgame.model import Policy
+        from proofgame.network_search import FrozenSampler
+        from proofgame.environment import Game
+        from proofgame.population_sample import from_rank
+        policy=Policy(width=32,layers=1).eval()
+        with torch.no_grad():
+            next(policy.parameters()).fill_(float('nan'))
+        sampler=FrozenSampler(policy)
+        with self.assertRaisesRegex(RuntimeError,'non-finite policy logits'):
+            sampler.probabilities(Game(from_rank(8),budget=20).observation())
+
+
 if __name__=='__main__':unittest.main()
