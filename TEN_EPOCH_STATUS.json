@@ -1,0 +1,11 @@
+{
+  "complete": false,
+  "requested_epochs": 10,
+  "training_machines": 1000,
+  "test_machines": 100,
+  "attempts_per_machine_per_epoch": 100,
+  "actions_per_attempt": 20,
+  "runner": "proofgame/epoch_train.py",
+  "dataset": "runs/epoch_dataset_1000_100/dataset.json",
+  "note": "The full run has started. This package contains the runnable code and fixed dataset; active cloud-run files are excluded to avoid packaging a partial checkpoint. The small end-to-end and resume checks passed, as did all 33 unit tests."
+}

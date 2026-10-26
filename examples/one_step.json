@@ -1,0 +1,32 @@
+{
+  "format": "proofgame-0.1",
+  "machine": {
+    "rows": [
+      [
+        "qH",
+        "b0",
+        "R"
+      ],
+      [
+        "qH",
+        "b1",
+        "R"
+      ]
+    ]
+  },
+  "answer": "HALT",
+  "proof": {
+    "rule": "exI",
+    "data": [
+      "s",
+      "z"
+    ],
+    "children": [
+      {
+        "rule": "refl",
+        "data": null,
+        "children": []
+      }
+    ]
+  }
+}

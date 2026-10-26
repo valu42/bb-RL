@@ -1,0 +1,9 @@
+[
+  "choose:HALT",
+  "rule:exI",
+  "put:s",
+  "put:z",
+  "commit",
+  "rule:refl",
+  "submit"
+]

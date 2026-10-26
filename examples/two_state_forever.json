@@ -1,0 +1,220 @@
+{
+  "format": "proofgame-0.1",
+  "machine": {
+    "rows": [
+      [
+        "q1",
+        "b1",
+        "R"
+      ],
+      [
+        "q1",
+        "b1",
+        "R"
+      ],
+      [
+        "q0",
+        "b1",
+        "R"
+      ],
+      [
+        "q0",
+        "b1",
+        "R"
+      ]
+    ]
+  },
+  "answer": "NONHALT",
+  "proof": {
+    "rule": "natI",
+    "data": null,
+    "children": [
+      {
+        "rule": "impI",
+        "data": null,
+        "children": [
+          {
+            "rule": "discriminate",
+            "data": 0,
+            "children": []
+          }
+        ]
+      },
+      {
+        "rule": "impI",
+        "data": null,
+        "children": [
+          {
+            "rule": "reduce",
+            "data": null,
+            "children": [
+              {
+                "rule": "casesState",
+                "data": [
+                  "qof",
+                  [
+                    "at",
+                    [
+                      "var",
+                      0
+                    ],
+                    [
+                      "cfg",
+                      "q0",
+                      "nil",
+                      "nil"
+                    ]
+                  ]
+                ],
+                "children": [
+                  {
+                    "rule": "rewrite",
+                    "data": [
+                      2,
+                      "forward"
+                    ],
+                    "children": [
+                      {
+                        "rule": "casesBit",
+                        "data": [
+                          "head",
+                          [
+                            "right",
+                            [
+                              "at",
+                              [
+                                "var",
+                                0
+                              ],
+                              [
+                                "cfg",
+                                "q0",
+                                "nil",
+                                "nil"
+                              ]
+                            ]
+                          ]
+                        ],
+                        "children": [
+                          {
+                            "rule": "rewrite",
+                            "data": [
+                              3,
+                              "forward"
+                            ],
+                            "children": [
+                              {
+                                "rule": "discriminate",
+                                "data": 1,
+                                "children": []
+                              }
+                            ]
+                          },
+                          {
+                            "rule": "rewrite",
+                            "data": [
+                              3,
+                              "forward"
+                            ],
+                            "children": [
+                              {
+                                "rule": "discriminate",
+                                "data": 1,
+                                "children": []
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "rule": "rewrite",
+                    "data": [
+                      2,
+                      "forward"
+                    ],
+                    "children": [
+                      {
+                        "rule": "casesBit",
+                        "data": [
+                          "head",
+                          [
+                            "right",
+                            [
+                              "at",
+                              [
+                                "var",
+                                0
+                              ],
+                              [
+                                "cfg",
+                                "q0",
+                                "nil",
+                                "nil"
+                              ]
+                            ]
+                          ]
+                        ],
+                        "children": [
+                          {
+                            "rule": "rewrite",
+                            "data": [
+                              3,
+                              "forward"
+                            ],
+                            "children": [
+                              {
+                                "rule": "discriminate",
+                                "data": 1,
+                                "children": []
+                              }
+                            ]
+                          },
+                          {
+                            "rule": "rewrite",
+                            "data": [
+                              3,
+                              "forward"
+                            ],
+                            "children": [
+                              {
+                                "rule": "discriminate",
+                                "data": 1,
+                                "children": []
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "rule": "rewrite",
+                    "data": [
+                      2,
+                      "forward"
+                    ],
+                    "children": [
+                      {
+                        "rule": "apply",
+                        "data": 0,
+                        "children": [
+                          {
+                            "rule": "refl",
+                            "data": null,
+                            "children": []
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

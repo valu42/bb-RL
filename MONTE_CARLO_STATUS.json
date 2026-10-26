@@ -1,0 +1,15 @@
+{
+  "complete": true,
+  "requested_machines": 10000,
+  "completed_machines": 10000,
+  "proved": 3629,
+  "unproved_within_budget": 6371,
+  "proved_fraction": 0.3629,
+  "proved_answers": {
+    "HALT": 3629,
+    "NONHALT": 0
+  },
+  "attempts_per_machine": 10000,
+  "actions_per_attempt": 20,
+  "final_audit_passed": true
+}

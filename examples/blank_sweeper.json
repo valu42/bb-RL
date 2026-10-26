@@ -1,0 +1,156 @@
+{
+  "format": "proofgame-0.1",
+  "machine": {
+    "rows": [
+      [
+        "q0",
+        "b1",
+        "R"
+      ],
+      [
+        "qH",
+        "b1",
+        "R"
+      ]
+    ]
+  },
+  "answer": "NONHALT",
+  "proof": {
+    "rule": "cut",
+    "data": [
+      "all",
+      "Nat",
+      [
+        "ex",
+        "List",
+        [
+          "eq",
+          [
+            "at",
+            [
+              "bound",
+              1
+            ],
+            [
+              "cfg",
+              "q0",
+              "nil",
+              "nil"
+            ]
+          ],
+          [
+            "cfg",
+            "q0",
+            [
+              "bound",
+              0
+            ],
+            "nil"
+          ]
+        ]
+      ]
+    ],
+    "children": [
+      {
+        "rule": "natI",
+        "data": null,
+        "children": [
+          {
+            "rule": "exI",
+            "data": "nil",
+            "children": [
+              {
+                "rule": "refl",
+                "data": null,
+                "children": []
+              }
+            ]
+          },
+          {
+            "rule": "destruct",
+            "data": 0,
+            "children": [
+              {
+                "rule": "exI",
+                "data": [
+                  "cons",
+                  "b1",
+                  [
+                    "var",
+                    1
+                  ]
+                ],
+                "children": [
+                  {
+                    "rule": "reduce",
+                    "data": null,
+                    "children": [
+                      {
+                        "rule": "rewrite",
+                        "data": [
+                          1,
+                          "forward"
+                        ],
+                        "children": [
+                          {
+                            "rule": "refl",
+                            "data": null,
+                            "children": []
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "rule": "allI",
+        "data": null,
+        "children": [
+          {
+            "rule": "impI",
+            "data": null,
+            "children": [
+              {
+                "rule": "specialize",
+                "data": [
+                  0,
+                  [
+                    "var",
+                    0
+                  ]
+                ],
+                "children": [
+                  {
+                    "rule": "destruct",
+                    "data": 2,
+                    "children": [
+                      {
+                        "rule": "rewrite",
+                        "data": [
+                          3,
+                          "forward"
+                        ],
+                        "children": [
+                          {
+                            "rule": "discriminate",
+                            "data": 1,
+                            "children": []
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

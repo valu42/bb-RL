@@ -1,0 +1,19 @@
+{
+  "source": "runs/two_state_monte_carlo_10000/records.jsonl",
+  "eligible_pool": {
+    "train": 2897,
+    "test": 732
+  },
+  "selected": {
+    "train": 1000,
+    "test": 100
+  },
+  "distinct_machines": 1100,
+  "exact_train_test_overlap": 0,
+  "certificates_rechecked": 1100,
+  "proofs_or_answers_in_model_dataset": false,
+  "filter_rule": "proof found within 10000 uniform-random attempts, each at most 20 actions",
+  "eligibility_answers": {
+    "HALT": 1100
+  }
+}
