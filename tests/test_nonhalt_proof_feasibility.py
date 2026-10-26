@@ -89,8 +89,11 @@ class NonhaltProofFeasibilityTests(unittest.TestCase):
         self.assertEqual(game.reward,1)
         self.assertEqual(check(game.certificate()),'NONHALT')
         self.assertEqual(game.certificate(),nonhalt_certificate())
+        def count_nodes(proof):
+            return 1+sum(count_nodes(child) for child in proof['children'])
         print('NONHALT_PROOF_VERIFIED',{'states':2,'proof_actions':len(actions),
-                                         'certificate_nodes':12},flush=True)
+                                         'certificate_nodes':count_nodes(game.certificate()['proof'])},
+              flush=True)
 
 
 if __name__=='__main__':
