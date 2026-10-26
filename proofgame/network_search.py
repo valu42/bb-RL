@@ -73,7 +73,7 @@ class FrozenSampler:
 
 
 def attempt(sampler, machine, rng, budget=20, exploration_epsilon=0., on_initial_choice=None,
-            forced_initial_answer=None):
+            forced_initial_answer=None, diagnostic_steps=None):
     game = Game(machine, budget=budget)
     trace = []
     while game.status == "ACTIVE":
@@ -108,7 +108,31 @@ def attempt(sampler, machine, rng, budget=20, exploration_epsilon=0., on_initial
         if forced:
             step['forced_initial_answer'] = forced_initial_answer
         trace.append(step)
+        if diagnostic_steps is not None:
+            # Capture only a compact human-readable view, not the entire
+            # observation tensor or all possible actions.
+            top = sorted(range(len(behavior)), key=lambda j: behavior[j], reverse=True)[:3]
+            detail = {
+                'step': len(trace), 'action': action,
+                'probability': float(behavior[index]),
+                'raw_policy_probability': float(probabilities[index]),
+                'forced': bool(forced),
+                'alternatives': [
+                    {'action': observation['actions'][j]['id'],
+                     'probability': float(behavior[j])} for j in top
+                ],
+                'actions_left_before': observation['actions_left'],
+                'goal': [g['goal'] for g in observation['goals'][:2]],
+                'goal_count': len(observation['goals']),
+                'draft': observation.get('draft'),
+                'certificate_candidate': observation.get('candidate'),
+                'answer': observation['answer'],
+            }
         game.step(action, observe=False)
+        if diagnostic_steps is not None:
+            detail['status_after'] = game.status
+            detail['error_after'] = game.error
+            diagnostic_steps.append(detail)
     if game.status == "SOLVED":
         certificate = game.certificate()
         check(certificate)

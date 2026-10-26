@@ -121,7 +121,8 @@ def init_worker(model_config):
 
 
 def execute_machine(selected, seed, attempts, budget, version, stop_on_success, sampler,
-                    exploration_epsilon=0., balanced_initial_answers=False):
+                    exploration_epsilon=0., balanced_initial_answers=False,
+                    trace_diagnostics=False):
     """Execute a machine with either a CPU policy or the central GPU sampler."""
     machine = Machine(selected['machine']['rows']); rng = random.Random(seed)
     successes = []; statuses = Counter(); actions = 0; start = time.monotonic()
@@ -135,6 +136,8 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
                 if balanced_initial_answers else [None] * attempts)
     if balanced_initial_answers:
         random.Random(seed ^ 0xA5A5F00D).shuffle(schedule)
+    first_success_trace = None
+    last_failed_trace = None
     first_actions=Counter(); policy_sums={'HALT':0.,'NONHALT':0.}
     behavior_sums={'HALT':0.,'NONHALT':0.}; initial_observations=0
     def record_initial(action, raw, mixed):
@@ -146,11 +149,29 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
                 policy_sums[answer]+=raw[answer]
                 behavior_sums[answer]+=mixed[answer]
     for i in range(attempts):
+        detail = [] if trace_diagnostics else None
         cert, trace, status = attempt(sampler, machine, rng, budget,
                                       exploration_epsilon=exploration_epsilon,
                                       on_initial_choice=record_initial,
-                                      forced_initial_answer=schedule[i])
+                                      forced_initial_answer=schedule[i],
+                                      diagnostic_steps=detail)
         actions += len(trace); statuses[status] += 1
+        if trace_diagnostics:
+            sample = {'attempt':i+1, 'status':status, 'steps':detail,
+                      'certificate':cert if cert else None}
+            if cert and first_success_trace is None:
+                first_success_trace=sample
+            elif not cert:
+                # Prefer an informative failed trajectory over a trivial
+                # sequence of resets when many attempts have failed.
+                def diagnostic_score(item):
+                    steps=item['steps']
+                    return (sum(x['action'].startswith(('rule:','cert:')) for x in steps),
+                            sum(x['action']!='reset' for x in steps),
+                            len(steps))
+                if (last_failed_trace is None or
+                        diagnostic_score(sample)>diagnostic_score(last_failed_trace)):
+                    last_failed_trace=sample
         if cert:
             successes.append({'attempt':i+1, 'actions':trace, 'certificate':cert})
             if stop_on_success:
@@ -165,17 +186,20 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
             'initial_behavior_probability_sums':behavior_sums,
             'scheduled_initial_answer_counts':dict(Counter(
                 f'choose:{answer}' for answer in schedule[:sum(statuses.values())]
-                if answer is not None))}
+                if answer is not None)),
+            **({'diagnostic_traces':{'success':first_success_trace,
+                                    'failure':last_failed_trace}}
+               if trace_diagnostics else {})}
 
 
 def run_machine(task):
-    selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon, balanced = task
+    selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon, balanced, diagnostics = task
     saved = torch.load(weights_file, map_location='cpu', weights_only=True)
     if saved['version'] != version: raise RuntimeError('rollout policy version changed')
     _worker_policy.load_state_dict(saved['state_dict'])
     sampler = FrozenSampler(_worker_policy, capacity=10000)
     return execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler,
-                           epsilon,balanced)
+                           epsilon,balanced,diagnostics)
 
 
 def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
@@ -614,12 +638,15 @@ def main():
             start_index=state['next_index']
             if start_index<len(rows):
                 batch=rows[start_index:start_index+args.batch_size]
+                batch_number=start_index//args.batch_size+1
+                inspect_batch=(batch_number % 10 == 0)
                 if args.device=='mps':
                     tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
                             args.attempts,dataset['action_budget'],state['updates'],
                             training and args.stop_after_first_train_proof,
                             args.train_exploration_epsilon if training else 0.,
-                            training and args.balanced_initial_answers) for r in batch]
+                            training and args.balanced_initial_answers,
+                            inspect_batch) for r in batch]
                     results=pool.run(tasks)
                 else:
                     atomic_torch(weights_file,{'version':state['updates'],'config':policy.config,
@@ -628,7 +655,8 @@ def main():
                             args.attempts,dataset['action_budget'],str(weights_file),state['updates'],
                             training and args.stop_after_first_train_proof,
                             args.train_exploration_epsilon if training else 0.,
-                            training and args.balanced_initial_answers) for r in batch]
+                            training and args.balanced_initial_answers,
+                            inspect_batch) for r in batch]
                     results=pool.map(run_machine,tasks,chunksize=1)
                 update=learn_batch(policy,optimizer,results,dataset['action_budget'],
                                    gpu_gradient_batch_size=args.gpu_gradient_batch_size,
@@ -640,6 +668,17 @@ def main():
                     print(json.dumps({'event':'training_update_rejected','phase':phase,'epoch':epoch,
                                       'machine_index':start_index,'reason':update['rejected_update'],
                                       'rejected_updates':state['rejected_updates']}),flush=True)
+                if inspect_batch:
+                    from .trace_report import build_trace_report,write_trace_report
+                    trace_report=build_trace_report(results,phase,epoch,batch_number,
+                                                     results[0]['policy_version'])
+                    trace_path=write_trace_report(args.out,trace_report)
+                    print(json.dumps({'event':'policy_trace_saved',
+                                      'path':str(trace_path)}),flush=True)
+                # Diagnostic traces are written separately and never included
+                # in gradient replay or the standard per-batch checkpoint.
+                for result in results:
+                    result.pop('diagnostic_traces',None)
                 batch_file=folder/f'batch_{start_index:04d}.json'
                 atomic_json(batch_file,{'epoch':epoch,'phase':phase,'start_index':start_index,'machines':results,'update':update})
                 state['next_index']+=len(batch);save_state()
@@ -713,7 +752,7 @@ def main():
                 if args.device=='mps':
                     challenge_tasks=[
                         (row,task_seed(args.seed,'eval',0,row['machine_id']),
-                         args.attempts,dataset['action_budget'],state['updates'],True,0.,False)
+                         args.attempts,dataset['action_budget'],state['updates'],True,0.,False,False)
                         for row in challenge_rows
                     ]
                     challenge_results=pool.run(challenge_tasks)
@@ -724,7 +763,7 @@ def main():
                     challenge_tasks=[
                         (row,task_seed(args.seed,'eval',0,row['machine_id']),
                          args.attempts,dataset['action_budget'],
-                         str(weights_file),state['updates'],True,0.,False)
+                         str(weights_file),state['updates'],True,0.,False,False)
                         for row in challenge_rows
                     ]
                     challenge_results=pool.map(run_machine,challenge_tasks,chunksize=1)
