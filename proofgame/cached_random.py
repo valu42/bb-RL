@@ -33,11 +33,11 @@ class Simulator:
         self.root=self.intern(Game(machine,budget=1000))
 
     def pack(self,g):
-        return pickle.dumps((g.answer,g.proof,g.focus,g.draft,g.candidate),protocol=5)
+        return pickle.dumps((g.answer,g.proof,g.focus,g.draft,g.candidate,g.submit_failed),protocol=5)
 
     def restore(self,board):
         g=Game(self.machine,budget=1000)
-        g.answer,g.proof,g.focus,g.draft,g.candidate=pickle.loads(board)
+        g.answer,g.proof,g.focus,g.draft,g.candidate,g.submit_failed=pickle.loads(board)
         return g
 
     def intern(self,g):
@@ -53,7 +53,7 @@ class Simulator:
         return idx
 
     def state_key(self,g):
-        return repr((g.answer,g.proof,g.focus,g.draft,g.candidate))
+        return repr((g.answer,g.proof,g.focus,g.draft,g.candidate,g.submit_failed))
 
     def transition(self,state,index):
         if isinstance(state,int):

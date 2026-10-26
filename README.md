@@ -82,6 +82,39 @@ These example numbers are illustrative. The trace probabilities are
 action-selection probabilities, **not** probabilities that a proof claim is
 mathematically true. No new CLI flag is required.
 
+## State-based masking of redundant proof checks
+
+The proof game prevents repeated failed verification of an **unchanged**
+candidate, without giving the model an action history or revealing the
+correct answer.
+
+- `cert:verify` appears only when a state-set candidate is nonempty, or
+  when both recurrence fields have been supplied. These are syntactic
+  readiness checks; the menu does **not** test whether the certificate is
+  mathematically valid.
+- If the kernel rejects a candidate, the current candidate receives an
+  observable `verify_failed: true` flag and `cert:verify` is hidden
+  until the candidate is edited. Changing a state-set member or a
+  recurrence parameter resets that flag. Cancelling or resetting
+  discards the candidate. Choosing the same recurrence number twice is
+  also suppressed as a no-op.
+- `submit` appears only after all proof goals are closed. If a fully
+  assembled proof is rejected, an observable `submit_failed` flag
+  prevents resubmitting the identical proof until the proof changes or
+  the episode resets.
+
+These flags describe the **current proof state**, not a list of prior
+actions. They are included in observations and in the random simulator's
+cache keys. A failed verification still consumes one proof-game action
+and returns its normal checker error, but repeating the same check
+without editing is no longer a legal action.
+
+No reward or proof is granted unless the unchanged kernel accepts the
+certificate. This reduces useless loops; it does not guarantee that the
+model will learn new proof methods. Because the available action menus
+change, begin a **fresh run** for a clean before/after comparison; a
+previously running Python process will not pick up this code automatically.
+
 ## Short, verified NONHALT certificates
 
 The proof game now supports two additional **formally checked** ways to
