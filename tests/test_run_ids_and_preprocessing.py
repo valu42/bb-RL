@@ -71,7 +71,7 @@ class StructuralPreprocessingTests(unittest.TestCase):
         for item in examples:
             with self.subTest(item=item):
                 text=json.dumps(item,sort_keys=True,separators=(',',':'))
-                tokens,parents,bindings=encode_tree(item)
+                tokens,parents,bindings=encode_tree(json.loads(text))
                 cached=cached_tree(text)
                 self.assertEqual(cached,(tuple(tokens),tuple(parents),tuple(bindings)))
                 torch.testing.assert_close(relation_ids(parents,bindings),
