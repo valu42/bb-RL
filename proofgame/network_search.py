@@ -125,6 +125,7 @@ def attempt(sampler, machine, rng, budget=20, exploration_epsilon=0., on_initial
                 'goal': [g['goal'] for g in observation['goals'][:2]],
                 'goal_count': len(observation['goals']),
                 'draft': observation.get('draft'),
+                'certificate_candidate': observation.get('candidate'),
                 'answer': observation['answer'],
             }
         game.step(action, observe=False)
