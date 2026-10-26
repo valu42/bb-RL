@@ -125,8 +125,12 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
     """Execute a machine with either a CPU policy or the central GPU sampler."""
     machine = Machine(selected['machine']['rows']); rng = random.Random(seed)
     successes = []; statuses = Counter(); actions = 0; start = time.monotonic()
-    if balanced_initial_answers and (attempts % 2 or stop_on_success):
-        raise ValueError('balanced initial answers require an even number of attempts and no early stopping')
+    if balanced_initial_answers and attempts % 2:
+        raise ValueError('balanced initial answers require an even number of attempts')
+    # Balanced training is an upper bound of 50/50 attempts, not a requirement
+    # to keep trying after either branch has produced a verified certificate.
+    if balanced_initial_answers:
+        stop_on_success = True
     schedule = (['HALT'] * (attempts//2) + ['NONHALT'] * (attempts//2)
                 if balanced_initial_answers else [None] * attempts)
     if balanced_initial_answers:
@@ -160,7 +164,8 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
             'initial_policy_probability_sums':policy_sums,
             'initial_behavior_probability_sums':behavior_sums,
             'scheduled_initial_answer_counts':dict(Counter(
-                f'choose:{answer}' for answer in schedule if answer is not None))}
+                f'choose:{answer}' for answer in schedule[:sum(statuses.values())]
+                if answer is not None))}
 
 
 def run_machine(task):
@@ -436,7 +441,7 @@ def main():
     parser.add_argument('--seed',type=int,default=7)
     parser.add_argument('--lr',type=float,default=3e-4)
     parser.add_argument('--balanced-initial-answers',action='store_true',
-                        help='train with exactly half HALT and half NONHALT initial attempts per machine; requires even --attempts, disables first-proof early stop')
+                        help='alternate balanced HALT/NONHALT first attempts (50/50 over 100 max), stopping immediately after the first verified proof')
     parser.add_argument('--train-exploration-epsilon',type=float,default=0.2,
                         help='fraction of initial training decisions sampled uniformly between HALT/NONHALT (default 0.2); evaluation unchanged')
     parser.add_argument('--representation',choices=('bytes','ast'),default='bytes',
@@ -458,11 +463,12 @@ def main():
     if args.balanced_initial_answers:
         if args.attempts % 2:
             parser.error('--balanced-initial-answers requires an even --attempts')
-        if args.stop_after_first_train_proof:
-            parser.error('--balanced-initial-answers cannot be combined with --stop-after-first-train-proof (all attempts are required)')
+        # Both flags request the same early-stop behavior in balanced mode.
         if args.train_exploration_epsilon != 0.2:
             parser.error('balanced initial answers replaces epsilon exploration; omit --train-exploration-epsilon')
         args.train_exploration_epsilon=0.
+    if args.balanced_initial_answers:
+        args.stop_after_first_train_proof = True
     if not math.isfinite(args.train_exploration_epsilon) or not 0<=args.train_exploration_epsilon<1:
         parser.error('train-exploration-epsilon must be in [0,1)')
     if not math.isfinite(args.gpu_inference_wait_ms) or args.gpu_inference_wait_ms<0:
@@ -685,7 +691,8 @@ def main():
                 print(f"Balanced initial attempts — epoch {epoch}: "
                       f"HALT={scheduled['choose:HALT']}, "
                       f"NONHALT={scheduled['choose:NONHALT']} "
-                      f"(each machine receives {args.attempts//2} of each)",flush=True)
+                      f"(maximum {args.attempts//2} per branch; "
+                      f"stops after first verified proof)",flush=True)
             if raw['HALT'] is not None:
                 print(f"Answer exploration — {phase} epoch {epoch}: "
                       f"first actions HALT={counts['choose:HALT']}, "
