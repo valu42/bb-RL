@@ -35,8 +35,15 @@ class SimulationTests(unittest.TestCase):
         for m in [halt,loop,halt,loop]:
             sim.set_machine(m);state=sim.root;g=Game(m,budget=20)
             for action in trace:
-                state=sim.transition(state,sim.menu(state).index(action));g.step(action,observe=False)
+                # An incomplete proof no longer offers 'submit'. The cached
+                # simulator must agree on that menu for each machine.
+                self.assertEqual(tuple(g.available_actions()),sim.menu(state))
+                if action not in g.available_actions():
+                    break
+                state=sim.transition(state,sim.menu(state).index(action))
+                g.step(action,observe=False)
             self.assertEqual(isinstance(state,tuple),g.status=='SOLVED')
+            self.assertEqual(g.status=='SOLVED',m is halt)
 
     def test_shared_cache_distinguishes_reduced_goals(self):
         from proofgame.logic import Machine
