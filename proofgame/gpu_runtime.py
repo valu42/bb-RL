@@ -145,8 +145,23 @@ class BatchedPolicyInference:
         # Encode each distinct action only once per frozen weight version.
         needed = list(dict.fromkeys(action for record in records for action in record[3]
                                     if action not in self.actions))
-        for start in range(0, len(needed), 64):
-            texts = needed[start:start + 64]
+        needed.sort(key=lambda text: token_count(text, self.policy.representation))
+        at = 0
+        while at < len(needed):
+            # Sort and bucket action lengths rather than padding many short
+            # candidates up to one long copy-expression action.
+            texts = []
+            longest = 0
+            heads = self.policy.config['heads']
+            while at < len(needed) and len(texts) < 16:
+                candidate = needed[at]
+                length = token_count(candidate, self.policy.representation)
+                worst = max(longest, length)
+                if texts and (len(texts)+1)*heads*worst*worst > self.max_attention_elements:
+                    break
+                texts.append(candidate)
+                longest = worst
+                at += 1
             embeddings = self.policy.encode(texts)
             keys = self.policy.key(embeddings)
             biases = self.policy.action_bias(embeddings).squeeze(-1)
