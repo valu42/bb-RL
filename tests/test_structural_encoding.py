@@ -93,6 +93,62 @@ class ASTEncodingTests(unittest.TestCase):
         torch.testing.assert_close(torch.tensor(probs),logits.detach().softmax(-1),
                                    rtol=5e-4,atol=5e-6)
 
+    def test_repeated_updates_remain_finite_in_inference_and_after_reload(self):
+        import torch
+        from proofgame.epoch_train import learn_batch, policy_is_finite, optimizer_is_finite
+        from proofgame.environment import Game
+        from proofgame.model import Policy
+        from proofgame.network_search import FrozenSampler
+        from proofgame.population_sample import from_rank
+
+        torch.set_num_threads(1)
+        actions = ['choose:HALT', 'rule:exI', 'put:s', 'put:z',
+                   'commit', 'rule:refl', 'submit']
+        machine = from_rank(8)
+        for seed in (7, 19):
+            with self.subTest(seed=seed):
+                torch.manual_seed(seed)
+                policy = Policy(width=32, layers=1, representation='ast').eval()
+                optimizer = torch.optim.AdamW(policy.parameters(), lr=3e-4, weight_decay=0.)
+                for iteration in range(4):
+                    sampler = FrozenSampler(policy)
+                    game = Game(machine, budget=20)
+                    trace = []
+                    observations = []
+                    for action in actions:
+                        obs = game.observation()
+                        observations.append(obs)
+                        probabilities = sampler.probabilities(obs)
+                        self.assertTrue(all(math.isfinite(p) for p in probabilities))
+                        index = next(i for i, item in enumerate(obs['actions'])
+                                     if item['id'] == action)
+                        trace.append({'action': action, 'probability': probabilities[index]})
+                        game.step(action, observe=False)
+                    self.assertEqual(game.status, 'SOLVED')
+                    result = {'machine': machine.to_json(), 'attempts': 1,
+                              'successes': [{'actions': trace,
+                                             'certificate': game.certificate()}]}
+                    update = learn_batch(policy, optimizer, [result], 20)
+                    self.assertTrue(update['updated'],
+                                    f'seed={seed}, iteration={iteration}, update={update}')
+                    self.assertTrue(policy_is_finite(policy))
+                    self.assertTrue(optimizer_is_finite(optimizer))
+                    with torch.inference_mode():
+                        for obs in observations:
+                            logits, value = policy(obs)
+                            self.assertTrue(bool(torch.isfinite(logits).all()))
+                            self.assertTrue(bool(torch.isfinite(value).all()))
+                            probabilities = logits.float().softmax(-1)
+                            self.assertTrue(bool(torch.isfinite(probabilities).all()))
+                            self.assertAlmostEqual(float(probabilities.sum()), 1., places=5)
+                    restored = Policy(**policy.config).eval()
+                    restored.load_state_dict(policy.state_dict())
+                    with torch.inference_mode():
+                        for obs in observations:
+                            expected = policy(obs)[0]
+                            actual = restored(obs)[0]
+                            torch.testing.assert_close(actual, expected)
+
     def test_limit_and_legacy_model_config(self):
         from proofgame.model import ModelLimit, Policy
         legacy=Policy(width=32,layers=1)
