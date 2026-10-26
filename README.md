@@ -8,6 +8,43 @@ The proof environment works. The Transformer and training loop run. **This is
 not yet evidence that the model learns to prove machines.** Included example
 proofs are human-written verification fixtures; the trainer never loads them.
 
+## Optional AST-aware Transformer (experimental)
+
+The epoch trainer can use `--representation ast` instead of its default
+`--representation bytes`. This changes **only the observation/action encoder**,
+not the proof checker, transition rules, reward, optimizer or dataset.
+
+AST mode parses existing JSON into an ordered field/list tree, and complete
+displayed goal/hypothesis expressions into operator/argument trees. Bound
+variable occurrences retain links to their quantifier via existing de Bruijn
+indices. Common formal-language symbols use atomic token IDs; unseen names
+fall back to UTF-8 byte tokens without hash collisions. The network still
+attends globally, but its attention logits include nine **learned** directed
+relationship biases (e.g. parent/child, siblings, binder/occurrence). These
+start at zero: no relationship is initially assumed to be useful. No
+simulator-derived halting labels, proof traces or theorem hints enter the
+encoder. It is a syntax-aware model, **not** a formally invariant graph model.
+
+To compare fairly with the existing byte encoder, **keep the same dataset,
+seed, training budget, and model dimensions** but use a separate new output
+directory. For example, after generating the unfiltered dataset above:
+
+```bash
+python -m proofgame.epoch_train \
+  --dataset runs/unfiltered_1000_100/dataset.json \
+  --out runs/unfiltered_100_epochs_ast \
+  --epochs 100 --attempts 100 --batch-size 8 --workers 8 \
+  --stop-after-first-train-proof --representation ast
+```
+
+The original default command still uses byte tokens, so old saved checkpoints
+continue to load. AST checkpoints record `representation: ast` in their model
+config; do not mix checkpoints from different representations when resuming.
+The architecture has a different parameter count and may have different
+memory/CPU characteristics. Treat it as a controlled research hypothesis,
+not an established improvement. Use `python -m unittest discover -s tests -v`
+before starting long training runs.
+
 ## Unfiltered two-state experiment: 1,000 train, 100 test, 100 epochs
 
 This harder experiment **does not preselect machines based on stochastic proof

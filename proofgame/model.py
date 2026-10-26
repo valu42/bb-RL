@@ -1,7 +1,7 @@
-"""Randomly initialized byte-level Transformer scoring a variable action menu.
+"""Randomly initialized byte/AST Transformer scoring a variable action menu.
 
-No pretrained tokenizer, embeddings, fixed variable vocabulary, or proof corpus.
-Context overflow raises ModelLimit instead of silently dropping proof state.
+The optional AST mode exposes formal syntax and learnable relation biases but
+never adds proof demonstrations or proof-outcome features.
 """
 import json
 import math
@@ -14,23 +14,33 @@ class ModelLimit(RuntimeError):
 
 
 class Policy(nn.Module):
-    def __init__(self,width=64,layers=2,heads=4,max_tokens=4096):
+    def __init__(self,width=64,layers=2,heads=4,max_tokens=4096,representation="bytes"):
         super().__init__()
         if width%heads or width%2: raise ValueError("width must be even and divisible by heads")
+        if representation not in ('bytes', 'ast'):
+            raise ValueError('representation must be bytes or ast')
         self.config=dict(width=width,layers=layers,heads=heads,max_tokens=max_tokens)
-        self.embedding=nn.Embedding(258,width,padding_idx=0)
-        layer=nn.TransformerEncoderLayer(width,heads,4*width,dropout=0.,batch_first=True)
-        self.encoder=nn.TransformerEncoder(layer,layers,enable_nested_tensor=False)
-        # TransformerEncoder clones initial layer weights; initialize each independently.
-        for block in self.encoder.layers:
-            for p in block.parameters():
-                if p.dim()>1: nn.init.xavier_uniform_(p)
+        self.representation=representation
+        if representation=='bytes':
+            self.embedding=nn.Embedding(258,width,padding_idx=0)
+            layer=nn.TransformerEncoderLayer(width,heads,4*width,dropout=0.,batch_first=True)
+            self.encoder=nn.TransformerEncoder(layer,layers,enable_nested_tensor=False)
+            # TransformerEncoder clones initial layer weights; initialize each independently.
+            for block in self.encoder.layers:
+                for p in block.parameters():
+                    if p.dim()>1: nn.init.xavier_uniform_(p)
+        else:
+            from .structural_encoding import StructuralEncoder
+            self.structural_encoder=StructuralEncoder(width,layers,heads,max_tokens)
+            self.config['representation']='ast'
         self.query=nn.Linear(width,width)
         self.key=nn.Linear(width,width)
         self.action_bias=nn.Linear(width,1)
         self.value=nn.Linear(width,1)
 
     def encode(self,texts):
+        if self.representation=='ast':
+            return self.structural_encoder(texts)
         encoded=[[257]+[b+1 for b in t.encode("utf-8")] for t in texts]
         n=max(map(len,encoded))
         if n>self.config["max_tokens"]: raise ModelLimit(f"input needs {n} tokens; maximum is {self.config['max_tokens']}")
