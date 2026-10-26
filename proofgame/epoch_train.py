@@ -612,7 +612,8 @@ def main():
                     tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
                             args.attempts,dataset['action_budget'],state['updates'],
                             training and args.stop_after_first_train_proof,
-                            args.train_exploration_epsilon if training else 0.) for r in batch]
+                            args.train_exploration_epsilon if training else 0.,
+                            training and args.balanced_initial_answers) for r in batch]
                     results=pool.run(tasks)
                 else:
                     atomic_torch(weights_file,{'version':state['updates'],'config':policy.config,
@@ -620,11 +621,13 @@ def main():
                     tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
                             args.attempts,dataset['action_budget'],str(weights_file),state['updates'],
                             training and args.stop_after_first_train_proof,
-                            args.train_exploration_epsilon if training else 0.) for r in batch]
+                            args.train_exploration_epsilon if training else 0.,
+                            training and args.balanced_initial_answers) for r in batch]
                     results=pool.map(run_machine,tasks,chunksize=1)
                 update=learn_batch(policy,optimizer,results,dataset['action_budget'],
                                    gpu_gradient_batch_size=args.gpu_gradient_batch_size,
-                                   exploration_epsilon=args.train_exploration_epsilon) if training else {'updated':False}
+                                   exploration_epsilon=args.train_exploration_epsilon,
+                                   balanced_initial_answers=args.balanced_initial_answers) if training else {'updated':False}
                 state['updates']+=int(update['updated'])
                 if update.get('rejected_update'):
                     state['rejected_updates']=state.get('rejected_updates',0)+1
@@ -642,6 +645,7 @@ def main():
                           'last_batch_proofs':sum(len(r['successes']) for r in results),
                           'rejected_updates':state.get('rejected_updates',0),
                           'last_batch_first_action_counts':batch_choices['first_action_counts'],
+                          'last_batch_scheduled_initial_answer_counts':batch_choices['scheduled_initial_answer_counts'],
                           'last_batch_mean_initial_policy_probability':batch_choices['mean_initial_policy_probability'],
                           'last_batch_mean_initial_behavior_probability':batch_choices['mean_initial_behavior_probability'],
                           'last_batch_machines_proved_by_answer':batch_outcomes['machines_proved_by_answer'],
@@ -666,6 +670,8 @@ def main():
                               'successful_attempts':metrics['successful_attempts'],
                               'attempt_success_pct':metrics['attempt_success_pct'],
                               'first_action_counts':metrics['first_action_counts'],
+                              'scheduled_initial_answer_counts':metrics['scheduled_initial_answer_counts'],
+                              'balanced_initial_answers':training and args.balanced_initial_answers,
                               'mean_initial_policy_probability':metrics['mean_initial_policy_probability'],
                               'mean_initial_behavior_probability':metrics['mean_initial_behavior_probability'],
                               'train_exploration_epsilon':args.train_exploration_epsilon if training else 0.,
@@ -674,6 +680,12 @@ def main():
             counts=metrics['first_action_counts']
             raw=metrics['mean_initial_policy_probability']
             behavior=metrics['mean_initial_behavior_probability']
+            if training and args.balanced_initial_answers:
+                scheduled=metrics['scheduled_initial_answer_counts']
+                print(f"Balanced initial attempts — epoch {epoch}: "
+                      f"HALT={scheduled['choose:HALT']}, "
+                      f"NONHALT={scheduled['choose:NONHALT']} "
+                      f"(each machine receives {args.attempts//2} of each)",flush=True)
             if raw['HALT'] is not None:
                 print(f"Answer exploration — {phase} epoch {epoch}: "
                       f"first actions HALT={counts['choose:HALT']}, "
