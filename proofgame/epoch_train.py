@@ -235,9 +235,14 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4):
         healthy=weights_ok and optimizer_ok
         if healthy:
             # A finite weight vector can still yield invalid attention logits.
-            # Probe a couple of the actual successful states before committing.
+            # Validate up to 8 *distinct* replay states spread across the
+            # successful trajectories (not just the first and last).
+            probe_count=min(8,len(observations))
+            probe_indices=sorted({round(i*(len(observations)-1)/(probe_count-1))
+                                  for i in range(probe_count)}) if probe_count>1 else [0]
             with torch.inference_mode():
-                for encoded, _ in (observations[0], observations[-1]):
+                for index in probe_indices:
+                    encoded,_=observations[index]
                     logits,_=policy(json.loads(encoded))
                     if not bool(torch.isfinite(logits).all()):
                         logits_ok=False
