@@ -74,6 +74,30 @@ time and proof actions per second before committing to a long run. To
 benchmark the CPU path, keep `--representation ast` and use `--device cpu`
 with the same dataset and attempts in a separate fresh run.
 
+## Numerical stability and failed-run recovery
+
+REINFORCE gradients can be unstable, especially after a rare first success.
+The epoch trainer now checks the gradient norm, parameters, optimizer state,
+and a sample of post-update logits. A non-finite update is **rejected and
+rolled back** (including AdamW state), with a
+`training_update_rejected` log event and a `rejected_updates` counter.
+This avoids silently saving a corrupted model. A non-finite distribution
+from inference raises an explicit diagnostic rather than the opaque
+`random.choices: Total of weights must be finite` exception.
+
+**Existing corrupted checkpoints cannot be repaired by these safeguards.**
+If `--resume` reports non-finite model weights or optimizer state, keep
+the old run directory for inspection and start a fresh run (the unique-run
+suffix feature preserves earlier outputs). Don't assume a successful
+`policy_updates: 1` log means that particular update was numerically valid
+on every future observation.
+
+For the current tiny model, **CPU may outperform MPS**. CPU rollout workers
+make policy calls locally, while MPS needs worker queues, JSON parsing,
+per-action GPU dispatch, and CPU synchronization of action probabilities.
+MPS is more promising for larger networks and genuinely large inference
+batches. Benchmark throughput rather than assuming the GPU will be faster.
+
 ## Apple Silicon GPU training (MPS, experimental)
 
 The epoch trainer now supports `--device mps` on an Apple Silicon Mac with an
