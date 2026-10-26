@@ -9,6 +9,7 @@ import json
 import math
 import re
 from collections import defaultdict
+from functools import lru_cache
 
 import torch
 from torch import nn
@@ -122,32 +123,51 @@ def encode_tree(value):
     return tokens, parents, bindings
 
 
+@lru_cache(maxsize=16384)
+def cached_tree(serialized):
+    """Cache parsed syntax for repeated action descriptions and proof states."""
+    tokens, parents, bindings = encode_tree(json.loads(serialized))
+    return tuple(tokens), tuple(parents), tuple(bindings)
+
+
 def relation_ids(parents, bindings):
-    """Directed structural relations; all other pairs retain global attention."""
+    """Construct directed structural relations with indexed CPU assignments.
+
+    Equivalent to the original scalar loop, without one torch dispatch per
+    parent/ancestor/sibling edge. Binder links retain highest precedence.
+    """
     count = len(parents)
     rel = torch.full((count, count), OTHER, dtype=torch.long)
-    rel.fill_diagonal_(SELF)
     children = defaultdict(list)
+    parent_edges = []
+    ancestors = []
     for i, parent in enumerate(parents):
-        if parent >= 0:
-            rel[parent, i] = PARENT
-            rel[i, parent] = CHILD
-            children[parent].append(i)
-            ancestor = parents[parent]
-            while ancestor >= 0:
-                rel[ancestor, i] = ANCESTOR
-                rel[i, ancestor] = DESCENDANT
-                ancestor = parents[ancestor]
+        if parent < 0:
+            continue
+        children[parent].append(i)
+        parent_edges.append((parent, i))
+        ancestor = parents[parent]
+        while ancestor >= 0:
+            ancestors.append((ancestor, i))
+            ancestor = parents[ancestor]
     for siblings in children.values():
-        for i in siblings:
-            for j in siblings:
-                if i != j:
-                    rel[i, j] = SIBLING
-    for binder, occurrence in bindings:
-        rel[binder, occurrence] = BINDS
-        rel[occurrence, binder] = BOUND_BY
+        if len(siblings) > 1:
+            idx = torch.tensor(siblings, dtype=torch.long)
+            rel[idx[:, None], idx[None, :]] = SIBLING
+    if ancestors:
+        pairs = torch.tensor(ancestors, dtype=torch.long)
+        rel[pairs[:, 0], pairs[:, 1]] = ANCESTOR
+        rel[pairs[:, 1], pairs[:, 0]] = DESCENDANT
+    if parent_edges:
+        pairs = torch.tensor(parent_edges, dtype=torch.long)
+        rel[pairs[:, 0], pairs[:, 1]] = PARENT
+        rel[pairs[:, 1], pairs[:, 0]] = CHILD
+    rel.fill_diagonal_(SELF)
+    if bindings:
+        pairs = torch.tensor(bindings, dtype=torch.long)
+        rel[pairs[:, 0], pairs[:, 1]] = BINDS
+        rel[pairs[:, 1], pairs[:, 0]] = BOUND_BY
     return rel
-
 
 class StructuralEncoder(nn.Module):
     """Global attention with additive, learned relation biases (zero initialized)."""
@@ -167,7 +187,7 @@ class StructuralEncoder(nn.Module):
 
     def forward(self, texts):
         from .model import ModelLimit
-        trees = [encode_tree(json.loads(text)) for text in texts]
+        trees = [cached_tree(text) for text in texts]
         size = max(len(tokens) for tokens, _, _ in trees)
         if size > self.max_tokens:
             raise ModelLimit(f'input needs {size} structural tokens; maximum is {self.max_tokens}')
