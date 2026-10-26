@@ -1,0 +1,96 @@
+name: One-off 100-action proof coverage probe
+on:
+  push:
+    branches: [experiment/proof-100-action-coverage]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install project
+        run: python -m pip install -e .
+      - name: Exhaustive two-state halting simulation and kernel-checked short proof sample
+        run: |
+          python - <<'PY'
+          import json
+          from collections import Counter
+          from proofgame.population_sample import from_rank
+          from proofgame.unfiltered_dataset import build_dataset
+          from proofgame.environment import Game
+          from proofgame.kernel import check
+
+          def halting_time(machine, bound=100):
+              state = 'q0'
+              position = 0
+              tape = {}
+              for step in range(1, bound+1):
+                  bit = 'b1' if tape.get(position, 0) else 'b0'
+                  next_state, write, move = machine.row(state, bit)
+                  if write == 'b1':
+                      tape[position] = 1
+                  else:
+                      tape.pop(position, None)
+                  position += 1 if move == 'R' else -1
+                  state = next_state
+                  if state == 'qH':
+                      return step
+              return None
+
+          distribution = Counter(halting_time(from_rank(rank)) for rank in range(20736))
+          print('EXHAUSTIVE_SIMULATION', json.dumps({
+              'population': 20736,
+              'halt_counts': {str(k): v for k,v in distribution.items() if k is not None},
+              'not_halted_within_100': distribution[None],
+              'halted_within_100': 20736-distribution[None]
+          }), flush=True)
+          dataset = build_dataset(1000,100,100,20261026)
+          for split in ('train', 'test'):
+              counts = Counter()
+              proof_actions = Counter()
+              for row in dataset[split]:
+                  machine = from_rank(row['rank'])
+                  t = halting_time(machine)
+                  if t is None:
+                      counts['not_halted_within_100'] += 1
+                      continue
+                  counts['halted_within_100'] += 1
+                  if t > 94:
+                      continue
+                  game = Game(machine, budget=100)
+                  actions = ['choose:HALT', 'rule:exI'] + ['put:s']*t + ['put:z','commit','rule:refl','submit']
+                  for action in actions:
+                      game.step(action, observe=False)
+                  if game.status != 'SOLVED':
+                      raise AssertionError((row['rank'], t, game.status, game.error))
+                  check(game.certificate())
+                  counts['checked_halt_proofs_within_100_actions'] += 1
+                  proof_actions[len(actions)] += 1
+              print('KERNEL_CHECKED_SHORT_PROOFS', json.dumps({
+                  'split': split, 'machines': len(dataset[split]),
+                  'counts': dict(counts), 'proof_action_lengths': dict(proof_actions)
+              }), flush=True)
+          PY
+      - name: Uniform random proof search, 20-action comparison
+        run: python -m proofgame.population_sample --sample 300 --attempts 100 --budget 20 --workers 2 --seed 20261026 --out /tmp/random_budget20
+      - name: Uniform random proof search, 100-action comparison
+        run: python -m proofgame.population_sample --sample 300 --attempts 100 --budget 100 --workers 2 --seed 20261026 --out /tmp/random_budget100
+      - name: Compare verified random-search successes
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          for budget in (20, 100):
+              report = json.loads((Path('/tmp')/f'random_budget{budget}'/'report.json').read_text())
+              print('RANDOM_SEARCH_RESULT', json.dumps({
+                  'action_budget': budget, 'sample_size': report['sample_without_replacement'],
+                  'attempts_per_machine': report['attempts_per_machine'],
+                  'proved_machines': report['proved'],
+                  'proved_answers': report['proved_answers'],
+                  'actions_simulated': report['actions_simulated'],
+                  'attempts_completed': report['attempts_completed']
+              }), flush=True)
+          PY
