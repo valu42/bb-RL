@@ -43,8 +43,41 @@ class BalancedAttemptsTests(unittest.TestCase):
         self.assertEqual(first['initial_behavior_probability_sums']['NONHALT'],50.)
         with self.assertRaisesRegex(ValueError,'even number'):
             execute_machine(row,17,3,1,0,False,Sampler(),0.,True)
-        with self.assertRaisesRegex(ValueError,'no early stopping'):
-            execute_machine(row,17,100,1,0,True,Sampler(),0.,True)
+        # Early stopping is allowed (and automatically enabled) in balanced mode.
+        early=execute_machine(row,17,100,1,0,True,Sampler(),0.,True)
+        self.assertEqual(early['attempts'],100)  # no successful proof in this fixture
+
+    def test_stops_after_first_verified_proof_from_either_branch(self):
+        from unittest.mock import patch
+        import proofgame.epoch_train as trainer
+        machine=from_rank(8)
+        row={'machine':machine.to_json(),'machine_id':'test'}
+        class Sampler:
+            misses=0
+            hits=0
+        for winner in ('HALT','NONHALT'):
+            with self.subTest(winner=winner):
+                attempts=[]
+                def fake_attempt(sampler,machine,rng,budget,**kwargs):
+                    answer=kwargs['forced_initial_answer']
+                    attempts.append(answer)
+                    kwargs['on_initial_choice']('choose:'+answer,
+                                                {'HALT':0.5,'NONHALT':0.5},
+                                                {'HALT':float(answer=='HALT'),
+                                                 'NONHALT':float(answer=='NONHALT')})
+                    if answer==winner:
+                        return {'answer':winner},[{'action':'choose:'+winner,
+                                                  'probability':1.}], 'SOLVED'
+                    return None,[{'action':'choose:'+answer,'probability':1.}], 'EXHAUSTED'
+                with patch.object(trainer,'attempt',side_effect=fake_attempt):
+                    result=execute_machine(row,17,100,20,0,False,Sampler(),0.,True)
+                self.assertEqual(len(result['successes']),1)
+                self.assertEqual(result['attempts'],len(attempts))
+                self.assertLess(result['attempts'],100)
+                self.assertEqual(attempts[-1],winner)
+                self.assertEqual(sum(result['scheduled_initial_answer_counts'].values()),
+                                 result['attempts'])
+                self.assertEqual(result['first_action_counts']['choose:'+winner],1)
 
     def test_conditional_reinforce_skips_forced_action_and_only_first_proof(self):
         torch.manual_seed(7)
