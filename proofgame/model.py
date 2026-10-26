@@ -45,6 +45,9 @@ class Policy(nn.Module):
         n=max(map(len,encoded))
         if n>self.config["max_tokens"]: raise ModelLimit(f"input needs {n} tokens; maximum is {self.config['max_tokens']}")
         device=self.embedding.weight.device
+        # Limit unique Metal graph shapes for variable-length inputs.
+        if device.type=='mps':
+            n=min(self.config['max_tokens'],((n+15)//16)*16)
         ids=torch.zeros((len(texts),n),dtype=torch.long,device=device)
         for i,row in enumerate(encoded): ids[i,:len(row)]=torch.tensor(row,device=device)
         x=self.embedding(ids)*math.sqrt(self.config["width"])
