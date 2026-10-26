@@ -7,6 +7,7 @@ gradients. Evaluation never updates parameters. Selector proofs are not accepted
 in the dataset. Checkpoints commit after every rollout batch.
 """
 import argparse
+import copy
 from collections import Counter
 import hashlib
 import json
@@ -76,6 +77,30 @@ def choose_run_directory(path, resume=False):
         except FileExistsError:
             continue
     raise RuntimeError('could not allocate a new output directory next to ' + str(path))
+
+
+def policy_is_finite(policy):
+    """Detect corrupt parameters and buffers before rollout/checkpoint."""
+    for tensor in policy.state_dict().values():
+        if (tensor.is_floating_point() or tensor.is_complex()) and not bool(torch.isfinite(tensor).all()):
+            return False
+    return True
+
+
+def optimizer_is_finite(optimizer):
+    for state in optimizer.state.values():
+        for value in state.values():
+            if torch.is_tensor(value) and (value.is_floating_point() or value.is_complex()):
+                if not bool(torch.isfinite(value).all()):
+                    return False
+    return True
+
+
+def assert_policy_finite(policy, where):
+    if not policy_is_finite(policy):
+        raise RuntimeError(
+            f'non-finite model weights {where}; the saved checkpoint may be corrupted. '
+            'Do not resume it without recovery. Start a fresh run or restore an earlier finite checkpoint.')
 
 
 def task_seed(seed, phase, epoch, machine_id):
@@ -189,8 +214,38 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4):
         grouped_loss = torch.stack(losses).sum()
         grouped_loss.backward()
         total_loss += float(grouped_loss.detach())
-    norm = torch.nn.utils.clip_grad_norm_(policy.parameters(),1.,error_if_nonfinite=True)
-    optimizer.step()
+    # A single bad REINFORCE gradient must not poison all future rollouts.
+    # Reject the update without changing the policy/optimizer; keep proof logs.
+    norm = torch.nn.utils.clip_grad_norm_(policy.parameters(),1.,error_if_nonfinite=False)
+    if not bool(torch.isfinite(norm)):
+        optimizer.zero_grad(set_to_none=True)
+        return {'updated':False, 'proofs':proof_count,
+                'unique_gradient_observations':len(groups),
+                'loss':total_loss, 'rejected_update':'nonfinite_gradient_norm'}
+    if not policy_is_finite(policy):
+        raise RuntimeError('non-finite policy parameters before optimizer step')
+    old_weights=[p.detach().clone() for p in policy.parameters()]
+    old_optimizer=copy.deepcopy(optimizer.state_dict())
+    try:
+        optimizer.step()
+        healthy=policy_is_finite(policy) and optimizer_is_finite(optimizer)
+    except Exception:
+        with torch.no_grad():
+            for p,old in zip(policy.parameters(),old_weights):
+                p.copy_(old)
+        optimizer.load_state_dict(old_optimizer)
+        optimizer.zero_grad(set_to_none=True)
+        raise
+    if not healthy:
+        with torch.no_grad():
+            for p,old in zip(policy.parameters(),old_weights):
+                p.copy_(old)
+        optimizer.load_state_dict(old_optimizer)
+        optimizer.zero_grad(set_to_none=True)
+        return {'updated':False, 'proofs':proof_count,
+                'unique_gradient_observations':len(groups),
+                'loss':total_loss, 'gradient_norm':float(norm),
+                'rejected_update':'nonfinite_optimizer_result'}
     return {'updated':True, 'proofs':proof_count, 'unique_gradient_observations':len(groups),
             'loss':total_loss, 'gradient_norm':float(norm),
             'inference_gradient_probability_differences':numerical_fallbacks}
@@ -365,6 +420,9 @@ def main():
         if changes:
             config['strategy_changes']=changes
         policy.load_state_dict(state['state_dict']);optimizer.load_state_dict(state['optimizer_state_dict'])
+        assert_policy_finite(policy, 'on resume')
+        if not optimizer_is_finite(optimizer):
+            parser.error('non-finite optimizer state on resume; restore a finite checkpoint or start a new run')
         if state['phase']=='done' and state['completed_epochs']<args.epochs:
             state.update(phase='train',epoch=state['completed_epochs']+1,next_index=0)
     else:
@@ -375,6 +433,9 @@ def main():
     segment_start=time.monotonic();previous_seconds=state['active_seconds']
 
     def save_state():
+        assert_policy_finite(policy, 'before saving state')
+        if not optimizer_is_finite(optimizer):
+            raise RuntimeError('non-finite optimizer state before checkpoint; refusing to save it')
         state['active_seconds']=previous_seconds+time.monotonic()-segment_start
         state.update(config=policy.config,state_dict=policy.state_dict(),optimizer_state_dict=optimizer.state_dict())
         atomic_torch(args.out/'state.pt',state)
@@ -419,6 +480,11 @@ def main():
                 update=learn_batch(policy,optimizer,results,dataset['action_budget'],
                                    gpu_gradient_batch_size=args.gpu_gradient_batch_size) if training else {'updated':False}
                 state['updates']+=int(update['updated'])
+                if update.get('rejected_update'):
+                    state['rejected_updates']=state.get('rejected_updates',0)+1
+                    print(json.dumps({'event':'training_update_rejected','phase':phase,'epoch':epoch,
+                                      'machine_index':start_index,'reason':update['rejected_update'],
+                                      'rejected_updates':state['rejected_updates']}),flush=True)
                 batch_file=folder/f'batch_{start_index:04d}.json'
                 atomic_json(batch_file,{'epoch':epoch,'phase':phase,'start_index':start_index,'machines':results,'update':update})
                 state['next_index']+=len(batch);save_state()
@@ -427,6 +493,7 @@ def main():
                           'machines_total':len(rows),'policy_updates':state['updates'],
                           'last_batch_solved':sum(bool(r['successes']) for r in results),
                           'last_batch_proofs':sum(len(r['successes']) for r in results),
+                          'rejected_updates':state.get('rejected_updates',0),
                           'last_batch_machines_proved_by_answer':batch_outcomes['machines_proved_by_answer'],
                           'last_batch_successful_attempts_by_answer':batch_outcomes['successful_attempts_by_answer'],
                           'active_seconds':state['active_seconds']}
