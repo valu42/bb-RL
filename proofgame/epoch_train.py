@@ -190,8 +190,7 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
                                       exploration_epsilon=exploration_epsilon,
                                       on_initial_choice=record_initial,
                                       forced_initial_answer=answer,
-                                      diagnostic_steps=detail, profile=profile,
-                                      lock_answer_branch=bool(branch_rounds))
+                                      diagnostic_steps=detail, profile=profile)
         actions += len(trace); statuses[status] += 1
         if group_relative:
             trajectory = {'attempt':i+1,'actions':trace,
@@ -220,9 +219,7 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
             successes.append({'attempt':i+1, 'actions':trace, 'certificate':cert})
             if branch_rounds:
                 if cert['answer'] != answer:
-                    raise RuntimeError(
-                        'branch-locked rollout produced a certificate for the other '
-                        'answer; inspect the proof-game reset handling')
+                    raise RuntimeError('verified proof contradicts forced initial answer')
                 if first_proof_round is None:
                     first_proof_round = round_number
                     first_proof_answer = answer
@@ -411,18 +408,12 @@ def prepare_group_relative_gradients(results, budget, length_penalty=0.,
                     raise ValueError('group replay action not available')
                 forced = step.get('forced_initial_answer')
                 if forced is not None:
-                    if (not balanced_initial_answers
+                    if (not balanced_initial_answers or step_number != 0
                             or step['action'] != 'choose:'+forced
-                            or step['probability'] != 1.
-                            or (step_number != 0 and not branch_rounds)
-                            or (branch_rounds and
-                                (forced != result['first_proof_answer']
-                                 or obs['answer'] is not None))):
+                            or step['probability'] != 1.):
                         raise RuntimeError('invalid forced-answer group trajectory')
-                elif (balanced_initial_answers and
-                      (step_number == 0 or
-                       (branch_rounds and obs['answer'] is None))):
-                    raise RuntimeError('group trajectory missing forced branch choice')
+                elif balanced_initial_answers and step_number == 0:
+                    raise RuntimeError('group trajectory missing forced first action')
                 if forced is None:
                     encoded = encode_json(obs)
                     if encoded not in groups:
