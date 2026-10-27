@@ -99,9 +99,12 @@ def digest_results(results):
     return hashes
 
 
-def run_case(case, config, rows, checkpoint, *, simulate_update_barriers=False):
+def run_case(case, config, rows, checkpoint, *, simulate_update_barriers=False,
+             cpu_topology_cache_mb=0, return_results=False):
     central = case['strategy'] in ('central-cpu', 'central-mps')
     device = 'mps' if case['strategy'] == 'central-mps' else 'cpu'
+    if cpu_topology_cache_mb and (central or cpu_topology_cache_mb < 0):
+        raise ValueError('topology cache is for local CPU workers only')
     if device == 'mps' and not torch.backends.mps.is_available():
         return {'status': 'unavailable_mps'}
     torch.set_num_threads(1)
@@ -125,7 +128,8 @@ def run_case(case, config, rows, checkpoint, *, simulate_update_barriers=False):
                 snapshots[version] = snapshot
             runner = mp.get_context('spawn').Pool(
                 case['workers'], initializer=init_worker,
-                initargs=(policy.config, case['strategy'] == 'worker-shared'),
+                initargs=(policy.config, case['strategy'] == 'worker-shared',
+                          cpu_topology_cache_mb),
                 maxtasksperchild=50)
         else:
             runner = CentralRolloutPool(
@@ -169,6 +173,7 @@ def run_case(case, config, rows, checkpoint, *, simulate_update_barriers=False):
         'attempts_per_second': total_attempts / elapsed,
         'machine_task_seconds_sum': worker_seconds,
         'simulated_update_barriers': simulate_update_barriers,
+        'cpu_topology_cache_mb': cpu_topology_cache_mb,
         'frozen_weight_versions': (
             (len(rows) + case['barrier'] - 1) // case['barrier']
             if simulate_update_barriers else 1),
@@ -185,6 +190,10 @@ def run_case(case, config, rows, checkpoint, *, simulate_update_barriers=False):
             row.get('profile', {}).get('action_feature_hits', 0) for row in output),
         'action_feature_cache_misses': sum(
             row.get('profile', {}).get('action_feature_misses', 0) for row in output),
+        'topology_cache_hits': sum(
+            row.get('profile', {}).get('topology_cache_hits', 0) for row in output),
+        'topology_cache_misses': sum(
+            row.get('profile', {}).get('topology_cache_misses', 0) for row in output),
         'trajectory_hash_by_machine': digest_results(output),
         'central_inference': inference,
         'caveats': [
@@ -198,6 +207,8 @@ def run_case(case, config, rows, checkpoint, *, simulate_update_barriers=False):
             'requiring an algorithm-preserving asynchronous design before training.',
         ],
     }
+    if return_results:
+        return result, output
     return result
 
 
