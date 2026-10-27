@@ -854,9 +854,11 @@ budget, and proof checker. Learned: which answer to attempt, which rule to use,
 which expressions and lemmas to construct, which hypothesis to select, and
 whether to abandon the current proof.
 
-The training reward is exactly 1 for a submitted proof accepted by the checker,
-and 0 otherwise. There is no intermediate reward for filling holes, writing
-lemmas, or constructing long expressions. There are no supplied demonstrations,
+By default, the training reward is exactly 1 for a submitted proof
+accepted by the checker, and 0 otherwise. The epoch trainer optionally
+scales verified terminal rewards by trajectory length with
+`--length-penalty`; failures still receive zero. There is no intermediate
+reward for filling holes, writing lemmas, or constructing long expressions. There are no supplied demonstrations,
 pretrained embeddings, theorem archives, hindsight relabeling, or curriculum in the original trainer. The epoch runner above adds machine selection, without supplying proof demonstrations.
 An optional entropy regularizer is available but defaults to zero.
 
