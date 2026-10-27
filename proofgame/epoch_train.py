@@ -254,9 +254,136 @@ def verified_proof_reward(actions, budget, length_penalty=0.):
     return 1. - length_penalty * (actions / budget)
 
 
+def prepare_group_relative_gradients(results, budget, length_penalty=0.,
+                                     balanced_initial_answers=False):
+    """Leave-one-out REINFORCE advantages within each machine's full group.
+
+    No PPO clipping, extra optimization epochs, value network, or proof labels.
+    Group-relative advantages can be negative: failed trajectories in a mixed
+    group teach the policy to avoid their sampled actions. All-zero and
+    constant-reward groups produce no gradients.
+    """
+    groups = {}
+    proofs = 0
+    reward_sum = 0.
+    proof_action_sum = 0
+    informative = 0
+    all_failed = 0
+    all_successful = 0
+    positive = negative = 0
+    absolute_advantage_sum = 0.
+    attempts_total = 0
+    for result in results:
+        trajectories = result.get('group_trajectories')
+        size = result['attempts']
+        if size < 2 or trajectories is None or len(trajectories) != size:
+            raise ValueError('group-relative learning requires every attempt in a group')
+        attempts_total += size
+        if balanced_initial_answers:
+            first = Counter(
+                t['actions'][0].get('forced_initial_answer')
+                if t['actions'] else None for t in trajectories)
+            if size % 2 or first != {'HALT':size//2,'NONHALT':size//2}:
+                raise ValueError('group must contain exactly balanced forced initial answers')
+        rewards = []
+        for i, trajectory in enumerate(trajectories):
+            if trajectory['attempt'] != i+1:
+                raise ValueError('group attempt indices must be contiguous')
+            steps = trajectory['actions']
+            if len(steps) > budget:
+                raise ValueError('group attempt exceeds proof-game action budget')
+            certificate = trajectory['certificate']
+            if certificate is not None:
+                if trajectory['status'] != 'SOLVED':
+                    raise ValueError('verified certificate has inconsistent status')
+                check(certificate)
+                reward = verified_proof_reward(len(steps),budget,length_penalty)
+                proofs += 1
+                reward_sum += reward
+                proof_action_sum += len(steps)
+            else:
+                if trajectory['status'] == 'SOLVED':
+                    raise ValueError('solved attempt has no verified certificate')
+                reward = 0.
+            rewards.append(reward)
+        if len([t for t in trajectories if t['certificate']]) != len(result['successes']):
+            raise ValueError('group proof count does not match verified successes')
+        if not any(rewards):
+            all_failed += 1
+        if all(rewards):
+            all_successful += 1
+        # Avoid meaningless replay of groups with identical rewards.
+        if max(rewards) == min(rewards):
+            continue
+        informative += 1
+        machine = Machine(result['machine']['rows'])
+        total_reward = sum(rewards)
+        for trajectory, reward in zip(trajectories,rewards):
+            advantage = (size * reward - total_reward) / (size-1)
+            if abs(advantage) < 1e-12:
+                continue
+            if advantage > 0:
+                positive += 1
+            else:
+                negative += 1
+            absolute_advantage_sum += abs(advantage)
+            replay = Game(machine,budget=budget)
+            for step_number,step in enumerate(trajectory['actions']):
+                obs = replay.observation()
+                index = next((i for i,a in enumerate(obs['actions'])
+                              if a['id']==step['action']),None)
+                if index is None:
+                    raise ValueError('group replay action not available')
+                forced = step.get('forced_initial_answer')
+                if forced is not None:
+                    if (not balanced_initial_answers or step_number != 0
+                            or step['action'] != 'choose:'+forced
+                            or step['probability'] != 1.):
+                        raise RuntimeError('invalid forced-answer group trajectory')
+                elif balanced_initial_answers and step_number == 0:
+                    raise RuntimeError('group trajectory missing forced first action')
+                if forced is None:
+                    encoded = encode_json(obs)
+                    if encoded not in groups:
+                        groups[encoded] = ([0.]*len(obs['actions']),{})
+                    counts,expected = groups[encoded]
+                    counts[index] += advantage
+                    if (index in expected and not math.isclose(
+                            expected[index],step['probability'],
+                            rel_tol=1e-5,abs_tol=1e-7)):
+                        raise RuntimeError('inconsistent group sampled probabilities')
+                    expected[index] = step['probability']
+                replay.step(step['action'],observe=False)
+            if trajectory['certificate'] is not None:
+                if (replay.status != 'SOLVED' or
+                        json.loads(json.dumps(replay.certificate())) !=
+                        json.loads(json.dumps(trajectory['certificate']))):
+                    raise ValueError('group replay verified proof mismatch')
+            elif trajectory['status'] != 'MODEL_LIMIT' and replay.status != trajectory['status']:
+                raise ValueError('group replay failure status mismatch')
+    stats = {
+        'group_relative':True,
+        'groups_total':len(results),
+        'groups_informative':informative,
+        'groups_all_failed':all_failed,
+        'groups_all_successful':all_successful,
+        'groups_uniform_reward':len(results)-informative,
+        'group_attempts':attempts_total,
+        'group_positive_advantage_attempts':positive,
+        'group_negative_advantage_attempts':negative,
+        'mean_absolute_group_advantage':(
+            absolute_advantage_sum/(positive+negative) if positive+negative else 0.),
+        'mean_group_reward':reward_sum/attempts_total if attempts_total else 0.,
+        'mean_verified_proof_reward':reward_sum/proofs if proofs else None,
+        'mean_verified_proof_actions':proof_action_sum/proofs if proofs else None,
+        'length_penalty':length_penalty,
+    }
+    return groups, proofs, stats
+
+
 def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
                 exploration_epsilon=0., balanced_initial_answers=False,
-                length_penalty=0.):
+                length_penalty=0., group_relative=False):
     """Zero-reward episodes contribute zero; identical state gradients combine.
 
     Every success is on-policy under the same frozen batch weights. Grouping
@@ -268,47 +395,57 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
     groups = {}; proof_count = 0; numerical_fallbacks = 0
     reward_sum = 0.
     successful_action_sum = 0
-    for result in results:
-        machine = Machine(result['machine']['rows'])
-        for proof_number, success in enumerate(result['successes']):
-            check(success['certificate'])
-            replay = Game(machine, budget=budget)
-            use_for_learning = not balanced_initial_answers or proof_number == 0
-            if use_for_learning:
-                proof_count += 1
-                reward = verified_proof_reward(len(success['actions']),budget,length_penalty)
-                reward_sum += reward
-                successful_action_sum += len(success['actions'])
-            for step_number, step in enumerate(success['actions']):
-                obs = replay.observation(); encoded = encode_json(obs)
-                index = next(i for i,a in enumerate(obs['actions']) if a['id']==step['action'])
-                forced = step.get('forced_initial_answer')
-                if forced is not None:
-                    if (not balanced_initial_answers or step_number != 0 or
-                            step['action'] != 'choose:' + forced or
-                            step['probability'] != 1.):
-                        raise RuntimeError('invalid forced-answer trajectory')
-                elif balanced_initial_answers and step_number == 0:
-                    raise RuntimeError('balanced training proof lacks forced initial answer')
-                # A scheduled initial decision is deterministic, so its
-                # log probability is log(1)=0 and its gradient is zero.
-                if use_for_learning and forced is None:
-                    if encoded not in groups:
-                        groups[encoded] = ([0]*len(obs['actions']), {})
-                    counts, expected = groups[encoded]; counts[index] += reward
-                    if index in expected and not math.isclose(expected[index],step['probability'],rel_tol=1e-5,abs_tol=1e-7):
-                        raise RuntimeError('inconsistent sampled probabilities')
-                    expected[index] = step['probability']
-                replay.step(step['action'], observe=False)
-            if replay.status != 'SOLVED' or json.loads(json.dumps(replay.certificate())) != json.loads(json.dumps(success['certificate'])):
-                raise ValueError('incomplete or mismatched training proof')
-    if not proof_count:
-        return {'updated':False, 'proofs':0, 'unique_gradient_observations':0, 'loss':0.,
-                'mean_verified_proof_reward':None,'mean_verified_proof_actions':None,
-                'length_penalty':length_penalty}
-    reward_metrics = {'mean_verified_proof_reward':reward_sum/proof_count,
-                      'mean_verified_proof_actions':successful_action_sum/proof_count,
-                      'length_penalty':length_penalty}
+    group_metrics = {}
+    if group_relative:
+        groups,proof_count,group_metrics = prepare_group_relative_gradients(
+            results,budget,length_penalty,balanced_initial_answers)
+    else:
+        for result in results:
+            machine = Machine(result['machine']['rows'])
+            for proof_number, success in enumerate(result['successes']):
+                check(success['certificate'])
+                replay = Game(machine, budget=budget)
+                use_for_learning = not balanced_initial_answers or proof_number == 0
+                if use_for_learning:
+                    proof_count += 1
+                    reward = verified_proof_reward(len(success['actions']),budget,length_penalty)
+                    reward_sum += reward
+                    successful_action_sum += len(success['actions'])
+                for step_number, step in enumerate(success['actions']):
+                    obs = replay.observation(); encoded = encode_json(obs)
+                    index = next(i for i,a in enumerate(obs['actions']) if a['id']==step['action'])
+                    forced = step.get('forced_initial_answer')
+                    if forced is not None:
+                        if (not balanced_initial_answers or step_number != 0 or
+                                step['action'] != 'choose:' + forced or
+                                step['probability'] != 1.):
+                            raise RuntimeError('invalid forced-answer trajectory')
+                    elif balanced_initial_answers and step_number == 0:
+                        raise RuntimeError('balanced training proof lacks forced initial answer')
+                    # A scheduled initial decision is deterministic, so its
+                    # log probability is log(1)=0 and its gradient is zero.
+                    if use_for_learning and forced is None:
+                        if encoded not in groups:
+                            groups[encoded] = ([0]*len(obs['actions']), {})
+                        counts, expected = groups[encoded]; counts[index] += reward
+                        if index in expected and not math.isclose(expected[index],step['probability'],rel_tol=1e-5,abs_tol=1e-7):
+                            raise RuntimeError('inconsistent sampled probabilities')
+                        expected[index] = step['probability']
+                    replay.step(step['action'], observe=False)
+                if replay.status != 'SOLVED' or json.loads(json.dumps(replay.certificate())) != json.loads(json.dumps(success['certificate'])):
+                    raise ValueError('incomplete or mismatched training proof')
+    if not proof_count or (group_relative and not groups):
+        return {'updated':False, 'proofs':proof_count,
+                'unique_gradient_observations':0, 'loss':0.,
+                'mean_verified_proof_reward':None if not proof_count else
+                    group_metrics['mean_verified_proof_reward'],
+                'mean_verified_proof_actions':None if not proof_count else
+                    group_metrics['mean_verified_proof_actions'],
+                'length_penalty':length_penalty,**group_metrics}
+    reward_metrics = (group_metrics if group_relative else
+                      {'mean_verified_proof_reward':reward_sum/proof_count,
+                       'mean_verified_proof_actions':successful_action_sum/proof_count,
+                       'length_penalty':length_penalty})
     optimizer.zero_grad(set_to_none=True)
     denominator = sum(r['attempts'] for r in results); total_loss = 0.
     device = next(policy.parameters()).device
