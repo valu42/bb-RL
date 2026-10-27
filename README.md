@@ -150,11 +150,11 @@ readable policy traces remain available.
 
 This changes the objective and exploration schedule: **start a fresh
 training run** rather than resuming a 100-attempt REINFORCE experiment.
-Keep a control run with the same 12,500 machines, eight attempts, and
-`--length-penalty 0.3` but without `--group-relative` if you want to
-isolate the effect of relative advantages. Compare by equal proof-game
-actions or wall time, not only epochs; the new objective may perform
-worse on rare, hard proofs.
+The older balanced REINFORCE mode stops after its first success,
+so simply removing `--group-relative` does **not** produce a
+matched-eight-attempt control. Compare by total proof-game actions or
+wall time, not only epochs, and interpret algorithmic comparisons
+accordingly. The new objective may perform worse on rare, hard proofs.
 
 Tests:
 
