@@ -131,12 +131,17 @@ def init_worker(model_config, share_action_cache=False):
 
 def execute_machine(selected, seed, attempts, budget, version, stop_on_success, sampler,
                     exploration_epsilon=0., balanced_initial_answers=False,
-                    trace_diagnostics=False, profile_enabled=False, group_relative=False):
+                    trace_diagnostics=False, profile_enabled=False, group_relative=False,
+                    branch_rounds=0):
     """Execute a machine with either a CPU policy or the central GPU sampler."""
     machine = Machine(selected['machine']['rows']); rng = random.Random(seed)
     successes = []; statuses = Counter(); actions = 0; start = time.monotonic()
     group_trajectories = [] if group_relative else None
-    if balanced_initial_answers and attempts % 2:
+    if branch_rounds and (not group_relative or not balanced_initial_answers):
+        raise ValueError('branch rounds require group-relative balanced training')
+    if branch_rounds and (type(branch_rounds) is not int or branch_rounds < 1):
+        raise ValueError('invalid branch round count')
+    if balanced_initial_answers and not branch_rounds and attempts % 2:
         raise ValueError('balanced initial answers require an even number of attempts')
     # Balanced training is an upper bound of 50/50 attempts, not a requirement
     # to keep trying after either branch has produced a verified certificate.
@@ -144,10 +149,25 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
         stop_on_success = True
     if group_relative and stop_on_success:
         raise ValueError('group-relative rollouts must collect all attempts')
-    schedule = (['HALT'] * (attempts//2) + ['NONHALT'] * (attempts//2)
-                if balanced_initial_answers else [None] * attempts)
-    if balanced_initial_answers:
-        random.Random(seed ^ 0xA5A5F00D).shuffle(schedule)
+    # In branch-race mode, attempts is the group size PER branch, PER round.
+    # Interleave branches in seeded random order to avoid an order bias.
+    schedule = []
+    if branch_rounds:
+        order_rng = random.Random(seed ^ 0xA5A5F00D)
+        for round_number in range(1,branch_rounds+1):
+            round_answers = ['HALT']*attempts + ['NONHALT']*attempts
+            order_rng.shuffle(round_answers)
+            schedule.extend((round_number,answer) for answer in round_answers)
+    else:
+        answers = (['HALT'] * (attempts//2) + ['NONHALT'] * (attempts//2)
+                   if balanced_initial_answers else [None] * attempts)
+        if balanced_initial_answers:
+            random.Random(seed ^ 0xA5A5F00D).shuffle(answers)
+        schedule = [(None,answer) for answer in answers]
+    first_proof_round = None
+    first_proof_answer = None
+    rounds_completed = 0
+    round_groups = {'HALT':[],'NONHALT':[]}
     first_success_trace = None
     last_failed_trace = None
     profile = ({'observation_seconds':0.,'inference_seconds':0.,
@@ -164,18 +184,21 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
             for answer in ('HALT','NONHALT'):
                 policy_sums[answer]+=raw[answer]
                 behavior_sums[answer]+=mixed[answer]
-    for i in range(attempts):
+    for i,(round_number,answer) in enumerate(schedule):
         detail = [] if trace_diagnostics else None
         cert, trace, status = attempt(sampler, machine, rng, budget,
                                       exploration_epsilon=exploration_epsilon,
                                       on_initial_choice=record_initial,
-                                      forced_initial_answer=schedule[i],
+                                      forced_initial_answer=answer,
                                       diagnostic_steps=detail, profile=profile)
         actions += len(trace); statuses[status] += 1
         if group_relative:
-            group_trajectories.append({'attempt':i+1,'actions':trace,
-                                       'status':status,
-                                       'certificate':cert})
+            trajectory = {'attempt':i+1,'actions':trace,
+                          'status':status,'certificate':cert}
+            if branch_rounds:
+                round_groups[answer].append(trajectory)
+            else:
+                group_trajectories.append(trajectory)
         if trace_diagnostics:
             sample = {'attempt':i+1, 'status':status, 'steps':detail,
                       'certificate':cert if cert else None}
@@ -194,8 +217,29 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
                     last_failed_trace=sample
         if cert:
             successes.append({'attempt':i+1, 'actions':trace, 'certificate':cert})
+            if branch_rounds:
+                if cert['answer'] != answer:
+                    raise RuntimeError('verified proof contradicts forced initial answer')
+                if first_proof_round is None:
+                    first_proof_round = round_number
+                    first_proof_answer = answer
+                elif first_proof_round == round_number and first_proof_answer != answer:
+                    raise RuntimeError('both HALT and NONHALT proved for the same machine')
             if stop_on_success:
                 break
+        if branch_rounds and (i+1) % (2*attempts) == 0:
+            rounds_completed = round_number
+            if first_proof_round is not None:
+                winning = round_groups[first_proof_answer]
+                if len(winning) != attempts:
+                    raise RuntimeError('winning branch group was not completed')
+                # Local indices are contiguous; global attempt indices remain
+                # in successes for first-proof diagnostics.
+                group_trajectories = [
+                    {**trajectory,'attempt':j+1}
+                    for j,trajectory in enumerate(winning)]
+                break
+            round_groups = {'HALT':[],'NONHALT':[]}
     return {**selected, 'action_seed':seed, 'policy_version':version,
             'attempts':sum(statuses.values()), 'actions':actions, 'statuses':dict(statuses),
             'successes':successes, 'seconds':time.monotonic()-start,
@@ -205,8 +249,16 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
             'initial_policy_probability_sums':policy_sums,
             'initial_behavior_probability_sums':behavior_sums,
             'scheduled_initial_answer_counts':dict(Counter(
-                f'choose:{answer}' for answer in schedule[:sum(statuses.values())]
+                f'choose:{answer}' for _,answer in schedule[:sum(statuses.values())]
                 if answer is not None)),
+            **({'first_proof_round':first_proof_round,
+                'first_proof_answer':first_proof_answer,
+                'rounds_completed':rounds_completed,
+                'attempts_by_branch':{
+                    'HALT':sum(answer=='HALT' for _,answer in schedule[:sum(statuses.values())]),
+                    'NONHALT':sum(answer=='NONHALT' for _,answer in schedule[:sum(statuses.values())])},
+                'winning_group_attempts':len(group_trajectories)}
+               if branch_rounds else {}),
             **({'diagnostic_traces':{'success':first_success_trace,
                                     'failure':last_failed_trace}}
                if trace_diagnostics else {}),
@@ -216,9 +268,9 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
 
 def run_machine(task):
     global _worker_policy_version, _worker_action_features
-    if len(task) == 11:
-        task = (*task, False)  # Existing direct-worker callers.
-    selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon, balanced, diagnostics, profiling, group_relative = task
+    if len(task) < 13:
+        task = (*task,)+(False,)*(13-len(task))
+    selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon, balanced, diagnostics, profiling, group_relative, branch_rounds = task
     if profiling:
         started = time.perf_counter()
     saved = torch.load(weights_file, map_location='cpu', weights_only=True)
@@ -235,7 +287,8 @@ def run_machine(task):
     if profiling:
         load_seconds = time.perf_counter() - started
     result = execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler,
-                             epsilon,balanced,diagnostics,profiling,group_relative)
+                             epsilon,balanced,diagnostics,profiling,group_relative,
+                             branch_rounds)
     if profiling:
         result['profile']['worker_model_load_seconds'] = load_seconds
         result['profile']['cache_hits'] = sampler.hits
