@@ -230,6 +230,50 @@ class SpeedLabTests(unittest.TestCase):
         model.structural_encoder.enable_input_cache(relation_cache_mb=0)
         self.assertIsNone(model.structural_encoder._input_cache)
 
+    def test_focused_speed_v2_benchmark_reports_matching_rollouts(self):
+        from proofgame.benchmark_speed_v2 import benchmark
+        from proofgame.unfiltered_dataset import build_dataset
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run = root / 'previous'
+            run.mkdir()
+            dataset = build_dataset(4, 2, 6, 28)
+            (run / 'dataset.json').write_text(json.dumps(dataset))
+            model, _ = self.example()
+            torch.save({
+                'config': model.config, 'state_dict': model.state_dict(),
+            }, run / 'model_epoch_01.pt')
+            config = {
+                'model': model.config, 'seed': 28,
+                'attempts_per_machine': 2, 'budget': 6,
+                'lr': 3e-4, 'workers': 2,
+                'group_relative': False, 'branch_rounds': 0,
+                'train_exploration_epsilon': 0.,
+            }
+            (run / 'config.json').write_text(json.dumps(config))
+            profile_dir = run / 'profiling'
+            profile_dir.mkdir()
+            (profile_dir / 'epoch_01_train_batch_0001.json').write_text(
+                json.dumps({'batch_number': 1, 'machines': 2,
+                            'stage_wall_seconds': {
+                                'rollout': 2., 'learn': 3., 'checkpoint': .1}}))
+            (profile_dir / 'epoch_01_eval_summary.json').write_text(
+                json.dumps({'stage_wall_seconds_sum': {'rollout': 1.}}))
+            output = root / 'speed_v2.json'
+            report = benchmark(
+                run, 1, machines=2, source='random', workers=2,
+                barrier=2, cache_mb=1, include_shared=False,
+                repeats=1, learn_repeats=0, gradient_device='cpu',
+                context_batch_size=2, seed=7, out=output,
+                target_minutes=30.)
+            self.assertEqual(report['status'], 'complete')
+            self.assertEqual(len(report['results']), 2)
+            self.assertTrue(report['rollout_summary'][
+                'topology-cache-local-cpu']['same_action_trajectories'])
+            self.assertTrue(output.is_file())
+            self.assertIsNone(report['epoch_projection'])
+            self.assertGreater(report['results'][1]['topology_cache_hits'], 0)
+
     def test_rollout_frozen_version_barrier_changes_without_trajectory_drift(self):
         model, _ = self.example()
         data = build_dataset(4, 1, 4, 23)
