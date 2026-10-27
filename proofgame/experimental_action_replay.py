@@ -112,10 +112,29 @@ def replay_unique_action_gradients(
     order = list(range(len(samples)))
     if bucketed_contexts:
         order.sort(key=lambda i: (samples[i]['tokens'], i))
+    # Guard padded attention memory for contexts as well as distinct actions.
+    # Token lengths include all action descriptions, a conservative bound on
+    # context length and safe even for heterogeneous unbucketed input.
+    context_chunks = []
+    position = 0
+    while position < len(order):
+        ids = []
+        longest = 0
+        while position < len(order) and len(ids) < context_batch_size:
+            index = order[position]
+            future = max(longest, samples[index]['tokens'])
+            if (ids and (len(ids) + 1) * policy.config['heads'] * future**2
+                    > max_attention_elements):
+                break
+            if not ids and policy.config['heads'] * future**2 > max_attention_elements:
+                raise ValueError('single context exceeds attention element limit')
+            ids.append(index)
+            longest = future
+            position += 1
+        context_chunks.append(ids)
     total_loss = 0.
     t_context = time.perf_counter()
-    for offset in range(0, len(order), context_batch_size):
-        ids = order[offset:offset + context_batch_size]
+    for ids in context_chunks:
         batch = [samples[i] for i in ids]
         # Only contexts are encoded during the full group-relative replay.
         contexts = [encode_json({k: v for k, v in row['observation'].items()
