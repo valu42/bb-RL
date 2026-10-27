@@ -82,6 +82,62 @@ These example numbers are illustrative. The trace probabilities are
 action-selection probabilities, **not** probabilities that a proof claim is
 mathematically true. No new CLI flag is required.
 
+## Experimental CPU inference optimizations (benchmark first)
+
+The CPU rollout path now offers two **opt-in**, mutually exclusive
+performance modes. The default runner and reward/optimizer are unchanged.
+
+1. `--cpu-shared-action-cache`: each CPU worker retains up to 4,096
+   encoded action features across machines **only while the frozen policy
+   version is unchanged**. On a policy update, the cache is cleared
+   before loading the new weights. Observation probabilities are still
+   cached per machine. This mainly helps evaluation or training batches
+   that do not update the policy; when each worker sees just one machine
+   per policy version, the benefit may be small.
+2. `--cpu-central-inference`: reuses the existing central batched
+   inference engine on **CPU**, collecting simultaneous observations
+   from workers, encoding identical action descriptions only once
+   per policy version, and batching context embeddings. This can help
+   across machines in the same batch, but queues/IPC can make it
+   slower on small networks. Use `--gpu-inference-batch-size` to set
+   the central CPU batch size (default 8); the historical flag name
+   is retained for compatibility.
+
+First benchmark all three paths against the **same frozen checkpoint**,
+machines, and random seeds, without modifying the training run:
+
+```bash
+python -m unittest discover -s tests -p 'test_cpu_inference_optimizations.py' -v
+
+python -m proofgame.benchmark_cpu_inference \
+  --dataset runs/unfiltered_1000_100/dataset.json \
+  --model runs/ast_masked_actions/state.pt \
+  --machines 24 --attempts 10 --workers 8 \
+  --batch-size 8 --inference-batch-size 8 \
+  --out runs/cpu_inference_benchmark.json
+```
+
+The benchmark prints each mode's actions/second, proof counts, attempt
+counts, and speed relative to baseline. It excludes worker startup from
+the measured rollout wall time, but includes queue and inference work.
+Stochastic trajectories can differ slightly because batched numerical
+operations are not guaranteed bitwise identical; compare both throughput
+and work counts. Run multiple times and prefer the **measured** winner.
+
+To run a new CPU training experiment with the winner, add exactly one
+of these flags to your existing `epoch_train` command:
+
+```text
+--cpu-shared-action-cache
+--cpu-central-inference --gpu-inference-batch-size 8
+```
+
+The selected mode is saved in `config.json`; use a **new output
+directory** to compare it with an existing experiment. Do not enable
+a different inference mode partway through a resumed run. Neither
+optimization changes proof verification, training rewards, or model
+architecture. Existing MPS behavior remains unchanged.
+
 ## Profile training before optimizing
 
 Pass `--profile` to `proofgame.epoch_train` to measure where time goes,

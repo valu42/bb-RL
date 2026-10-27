@@ -9,7 +9,7 @@ in the dataset. Checkpoints commit after every rollout batch.
 import argparse
 import copy
 import csv
-from collections import Counter
+from collections import Counter, OrderedDict
 import hashlib
 import json
 import math
@@ -112,12 +112,19 @@ def task_seed(seed, phase, epoch, machine_id):
 
 
 _worker_policy = None
+_worker_policy_version = None
+_worker_action_features = None
+_worker_share_action_cache = False
 
 
-def init_worker(model_config):
-    global _worker_policy
+def init_worker(model_config, share_action_cache=False):
+    global _worker_policy, _worker_policy_version, _worker_action_features
+    global _worker_share_action_cache
     torch.set_num_threads(1)
     _worker_policy = Policy(**model_config).eval()
+    _worker_policy_version = None
+    _worker_action_features = OrderedDict()
+    _worker_share_action_cache = share_action_cache
 
 
 def execute_machine(selected, seed, attempts, budget, version, stop_on_success, sampler,
@@ -198,13 +205,21 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
 
 
 def run_machine(task):
+    global _worker_policy_version, _worker_action_features
     selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon, balanced, diagnostics, profiling = task
     if profiling:
         started = time.perf_counter()
     saved = torch.load(weights_file, map_location='cpu', weights_only=True)
     if saved['version'] != version: raise RuntimeError('rollout policy version changed')
+    # Invalidate cached action embeddings on every frozen policy version change.
+    if _worker_share_action_cache and _worker_policy_version != version:
+        _worker_action_features.clear()
     _worker_policy.load_state_dict(saved['state_dict'])
-    sampler = FrozenSampler(_worker_policy, capacity=10000)
+    _worker_policy_version = version
+    sampler = FrozenSampler(
+        _worker_policy, capacity=10000,
+        shared_action_features=_worker_action_features if _worker_share_action_cache else None,
+        action_cache_capacity=4096 if _worker_share_action_cache else None)
     if profiling:
         load_seconds = time.perf_counter() - started
     result = execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler,
@@ -213,6 +228,8 @@ def run_machine(task):
         result['profile']['worker_model_load_seconds'] = load_seconds
         result['profile']['cache_hits'] = sampler.hits
         result['profile']['cache_misses'] = sampler.misses
+        result['profile']['action_feature_hits'] = sampler.action_feature_hits
+        result['profile']['action_feature_misses'] = sampler.action_feature_misses
     return result
 
 
@@ -486,7 +503,12 @@ def main():
                         help='byte-level JSON or AST-aware tokens and learnable structural attention')
     parser.add_argument('--device',choices=('cpu','mps'),default='cpu',
                         help='MPS uses centralized batched GPU inference with CPU proof workers')
-    parser.add_argument('--gpu-inference-batch-size',type=int,default=8)
+    parser.add_argument('--gpu-inference-batch-size',type=int,default=8,
+                        help='central inference batch size (MPS or --cpu-central-inference)')
+    parser.add_argument('--cpu-central-inference',action='store_true',
+                        help='experimental: batch CPU neural inference across proof workers')
+    parser.add_argument('--cpu-shared-action-cache',action='store_true',
+                        help='experimental: reuse frozen action embeddings across CPU worker tasks')
     parser.add_argument('--gpu-inference-wait-ms',type=float,default=2.)
     parser.add_argument('--gpu-max-attention-elements',type=int,default=8000000)
     parser.add_argument('--gpu-gradient-batch-size',type=int,default=4)
@@ -513,6 +535,10 @@ def main():
         parser.error('train-exploration-epsilon must be in [0,1)')
     if not math.isfinite(args.gpu_inference_wait_ms) or args.gpu_inference_wait_ms<0:
         parser.error('invalid GPU batching wait')
+    if args.device=='mps' and (args.cpu_central_inference or args.cpu_shared_action_cache):
+        parser.error('CPU inference options require --device cpu')
+    if args.cpu_central_inference and args.cpu_shared_action_cache:
+        parser.error('choose either --cpu-central-inference or --cpu-shared-action-cache')
     if args.device=='mps' and not torch.backends.mps.is_available():
         parser.error('MPS is not available in this PyTorch/macOS environment')
     try:
@@ -577,6 +603,14 @@ def main():
                           if dataset_format==UNFILTERED_FORMAT
                           else 'fixed filtered test set; fixed sampling seeds; no updates'),
             'selector_proofs_supplied':0,'initial_archive':0}
+    if args.cpu_central_inference or args.cpu_shared_action_cache:
+        config['cpu_inference'] = ('central-batched' if args.cpu_central_inference
+                                   else 'worker-shared-action-cache')
+        if args.cpu_central_inference:
+            config['cpu_central_batching'] = {
+                'batch_size':args.gpu_inference_batch_size,
+                'wait_ms':args.gpu_inference_wait_ms,
+                'max_attention_elements':args.gpu_max_attention_elements}
     if args.device=='mps':
         config['device']='mps'
         config['gpu_inference']={'batch_size':args.gpu_inference_batch_size,
@@ -585,6 +619,11 @@ def main():
                                  'gradient_batch_size':args.gpu_gradient_batch_size}
     if args.resume:
         old=json.loads((args.out/'config.json').read_text())
+        # Check both directions: switching an optimized run back to baseline
+        # must not silently change its inference strategy on resume.
+        for option in ('cpu_inference','cpu_central_batching'):
+            if old.get(option) != config.get(option):
+                parser.error('resume configuration changed: '+option)
         changing_strategy = False
         for k in config:
             if k!='epochs_requested' and config[k]!=old.get(
@@ -633,17 +672,19 @@ def main():
     if state['phase'] != 'done':
         atomic_json(args.out/'report.json',{'complete':False,'epochs_completed':state['completed_epochs'],'epochs_requested':args.epochs})
     weights_file=(args.out/'workers_policy.pt').resolve()
-    if args.device=='mps':
+    central_inference = args.device=='mps' or args.cpu_central_inference
+    if central_inference:
         from .gpu_runtime import CentralRolloutPool
         runner=CentralRolloutPool(policy,workers=args.workers,
                                  inference_batch_size=args.gpu_inference_batch_size,
                                  wait_ms=args.gpu_inference_wait_ms,
                                  max_attention_elements=args.gpu_max_attention_elements)
-        print(json.dumps({'device':'mps','inference':'centralized-batched',
-                          'workers':args.workers,'gpu_batch_size':args.gpu_inference_batch_size}),flush=True)
+        print(json.dumps({'device':args.device,'inference':'centralized-batched',
+                          'workers':args.workers,
+                          'inference_batch_size':args.gpu_inference_batch_size}),flush=True)
     else:
         runner=mp.get_context('spawn').Pool(args.workers,initializer=init_worker,
-                                           initargs=(policy.config,),maxtasksperchild=50)
+                                           initargs=(policy.config,args.cpu_shared_action_cache),maxtasksperchild=50)
     with runner as pool:
         while state['phase']!='done':
             phase=state['phase'];epoch=state['epoch']
@@ -659,8 +700,8 @@ def main():
                 if args.profile:
                     profile_stages = {}
                     profile_t = time.perf_counter()
-                    gpu_before = pool.inference.stats() if args.device=='mps' else None
-                if args.device=='mps':
+                    gpu_before = pool.inference.stats() if central_inference else None
+                if central_inference:
                     tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
                             args.attempts,dataset['action_budget'],state['updates'],
                             training and args.stop_after_first_train_proof,
@@ -683,7 +724,7 @@ def main():
                     results=pool.map(run_machine,tasks,chunksize=1)
                 if args.profile:
                     profile_stages['rollout']=time.perf_counter()-profile_t
-                    gpu_after = pool.inference.stats() if args.device=='mps' else None
+                    gpu_after = pool.inference.stats() if central_inference else None
                     profile_t=time.perf_counter()
                 update=learn_batch(policy,optimizer,results,dataset['action_budget'],
                                    gpu_gradient_batch_size=args.gpu_gradient_batch_size,
@@ -748,8 +789,8 @@ def main():
                           'last_batch_machines_proved_by_answer':batch_outcomes['machines_proved_by_answer'],
                           'last_batch_successful_attempts_by_answer':batch_outcomes['successful_attempts_by_answer'],
                           'active_seconds':state['active_seconds']}
-                if args.device=='mps':
-                    progress['gpu_inference']=pool.inference.stats()
+                if central_inference:
+                    progress['gpu_inference' if args.device=='mps' else 'cpu_inference'] = pool.inference.stats()
                 atomic_json(args.out/'progress.json',progress);print(json.dumps(progress),flush=True)
                 continue
             if args.profile:
@@ -804,7 +845,7 @@ def main():
                     benchmark_rows, make_benchmark_report, write_benchmark_report
                 )
                 challenge_rows = benchmark_rows()
-                if args.device=='mps':
+                if central_inference:
                     challenge_tasks=[
                         (row,task_seed(args.seed,'eval',0,row['machine_id']),
                          args.attempts,dataset['action_budget'],state['updates'],True,0.,False,False,False)

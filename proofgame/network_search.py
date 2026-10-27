@@ -26,11 +26,19 @@ def encode_json(value):
 
 
 class FrozenSampler:
-    def __init__(self, policy, capacity=50000):
+    def __init__(self, policy, capacity=50000, shared_action_features=None,
+                 action_cache_capacity=None):
         self.policy = policy.eval()
         self.capacity = capacity
         self.cache = OrderedDict()
-        self.action_features = {}
+        # A worker can share only action embeddings between machines under
+        # the same *frozen* policy version. Observation caches remain per-machine.
+        self.action_features = (shared_action_features if shared_action_features is not None
+                                else OrderedDict())
+        self.action_cache_capacity = action_cache_capacity
+        if action_cache_capacity is not None and action_cache_capacity < 1:
+            raise ValueError('action cache capacity must be positive')
+        self.action_feature_hits = self.action_feature_misses = 0
         self.hits = self.misses = 0
 
     @torch.inference_mode()
@@ -43,7 +51,10 @@ class FrozenSampler:
             return result
         self.misses += 1
         actions = [encode_json(a) for a in observation["actions"]]
-        missing = list(dict.fromkeys(a for a in actions if a not in self.action_features))
+        unique_actions = list(dict.fromkeys(actions))
+        missing = [a for a in unique_actions if a not in self.action_features]
+        self.action_feature_hits += len(unique_actions) - len(missing)
+        self.action_feature_misses += len(missing)
         if missing:
             embeddings = self.policy.encode(missing)
             keys = self.policy.key(embeddings)
@@ -54,6 +65,12 @@ class FrozenSampler:
         h = self.policy.encode([encode_json(context)])[0]
         keys = torch.stack([self.action_features[a][0] for a in actions])
         biases = torch.stack([self.action_features[a][1] for a in actions])
+        # Do not evict any features until the current action menu is scored.
+        if self.action_cache_capacity is not None:
+            for a in unique_actions:
+                self.action_features.move_to_end(a)
+            while len(self.action_features) > self.action_cache_capacity:
+                self.action_features.popitem(last=False)
         logits = (keys * self.policy.query(h)).sum(-1) / h.shape[-1] ** 0.5 + biases
         if not bool(torch.isfinite(logits).all()):
             raise RuntimeError(
