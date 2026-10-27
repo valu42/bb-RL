@@ -1040,7 +1040,10 @@ def main():
             if args.profile:
                 from .profiling import summarize_epoch_profiles
                 summarize_epoch_profiles(args.out,epoch,phase)
-            metrics=summarize(sorted(folder.glob('batch_*.json')))
+            batch_paths=sorted(folder.glob('batch_*.json'))
+            metrics=summarize(batch_paths)
+            if training and args.group_relative:
+                metrics['group_relative_stats']=summarize_group_updates(batch_paths)
             metrics.update(epoch=epoch,phase=phase,policy_updates=state['updates'],active_seconds=state['active_seconds'])
             atomic_json(args.out/f'epoch_{epoch:02d}_{"training" if training else "evaluation"}.json',metrics)
             print(json.dumps({'event':'epoch_summary','phase':phase,'epoch':epoch,
