@@ -35,8 +35,21 @@ def build_dataset(train_count=1000, test_count=100, action_budget=100, seed=2026
                 len(set(fixed_test_ranks)) != test_count):
             raise ValueError('invalid fixed held-out machine ranks')
         excluded = set(fixed_test_ranks)
+        # Keep the two separately reported challenge machines out of the
+        # larger training sample too, otherwise 12,500 / 20,736 sampling
+        # would frequently leak the parity trap or Busy Beaver benchmark.
+        from itertools import product
+        from .special_benchmarks import BENCHMARKS
+        options = tuple(product(('q0','q1','qH'),('b0','b1'),('L','R')))
+        digits = {row:i for i,row in enumerate(options)}
+        benchmark_ranks = [
+            sum(digits[tuple(row)] * (12**j) for j,row in enumerate(item['rows']))
+            for item in BENCHMARKS
+        ]
+        excluded.update(benchmark_ranks)
+        if train_count > POPULATION - len(excluded):
+            raise ValueError('not enough machines outside held-out and benchmark sets')
         # Uniformly sample distinct training machines from the complement.
-        # Never expose a held-out machine to training.
         candidates = [r for r in range(POPULATION) if r not in excluded]
         train_ranks = random.Random(seed).sample(candidates, train_count)
         test_ranks = list(fixed_test_ranks)
@@ -50,12 +63,14 @@ def build_dataset(train_count=1000, test_count=100, action_budget=100, seed=2026
         "population": POPULATION,
         "sampling": ("uniform_without_replacement_over_all_labelled_two_state_machines"
                      if fixed_test_ranks is None else
-                     "uniform_without_replacement_excluding_fixed_test"),
+                     "uniform_without_replacement_excluding_fixed_test_and_benchmarks"),
         "sampling_seed": seed,
         "action_budget": action_budget,
         "train": [row(r) for r in train_ranks],
         "test": [row(r) for r in test_ranks],
-        **({"fixed_test_ranks":test_ranks} if fixed_test_ranks is not None else {}),
+        **({"fixed_test_ranks":test_ranks,
+            "excluded_benchmark_ranks":benchmark_ranks}
+           if fixed_test_ranks is not None else {}),
     }
 
 
