@@ -30,6 +30,8 @@ import torch
 from .epoch_train import (execute_machine, prepare_group_relative_gradients,
                           task_seed)
 from .experimental_structural_cache import cached_structural_forward
+from .experimental_action_replay import (replay_unique_action_gradients,
+                                         two_pass_probability_disagreement)
 from .exploration import behavior_log_probs
 from .gpu_runtime import token_count
 from .model import Policy
@@ -298,6 +300,9 @@ def benchmark_gradients(run, epoch, *, devices, cpu_threads, batch_sizes,
                     variants.append(('score_many', size, bucket, False))
                     if frozen.representation == 'ast':
                         variants.append(('score_many', size, bucket, True))
+                variants.append(('two-pass', size, True, False))
+                if frozen.representation == 'ast':
+                    variants.append(('two-pass', size, True, True))
             reference = None
             baseline_seconds = None
             for mode, size, bucketed, cache_enabled in variants:
@@ -306,7 +311,7 @@ def benchmark_gradients(run, epoch, *, devices, cpu_threads, batch_sizes,
                         'length_bucketed': bucketed,
                         'structural_cache': cache_enabled,
                         'status': 'ok'}
-                if mode != 'serial' and frozen.representation == 'ast':
+                if mode == 'score_many' and frozen.representation == 'ast':
                     cost = attention_elements(samples, size, bucketed,
                                               frozen.config['heads'])
                     case['max_attention_elements_estimate'] = cost
@@ -319,30 +324,50 @@ def benchmark_gradients(run, epoch, *, devices, cpu_threads, batch_sizes,
                     if cache_enabled else nullcontext(None))
                 with context as cache:
                     try:
-                        # Full workload warmup for recurrent action descriptions.
-                        gradient_trial(
-                            frozen, samples, mode=mode, batch_size=size,
-                            bucketed=bucketed, denominator=denominator,
-                            epsilon=epsilon)
-                        trials = []
-                        grad = None
-                        for _ in range(repeats):
-                            grad, stats = gradient_trial(
+                        def run_this_variant():
+                            if mode == 'two-pass':
+                                return replay_unique_action_gradients(
+                                    frozen, samples, context_batch_size=size,
+                                    action_batch_size=16,
+                                    bucketed_contexts=bucketed,
+                                    denominator=denominator, epsilon=epsilon,
+                                    max_attention_elements=max_attention_elements)
+                            return gradient_trial(
                                 frozen, samples, mode=mode, batch_size=size,
                                 bucketed=bucketed, denominator=denominator,
                                 epsilon=epsilon)
+
+                        # Warm up every input shape, including the global
+                        # action cache's two encoder passes.
+                        run_this_variant()
+                        trials = []
+                        grad = None
+                        for _ in range(repeats):
+                            grad, stats = run_this_variant()
                             trials.append(stats)
                         case.update({
                             'median_wall_seconds': statistics.median(
                                 row['wall_seconds'] for row in trials),
-                            'median_forward_dispatch_seconds': statistics.median(
-                                row['forward_dispatch_seconds'] for row in trials),
-                            'median_backward_dispatch_seconds': statistics.median(
-                                row['backward_dispatch_seconds'] for row in trials),
                             'loss': statistics.median(row['loss'] for row in trials),
                             'trial_wall_seconds': [round(row['wall_seconds'], 6)
                                                    for row in trials],
                         })
+                        if mode == 'two-pass':
+                            case['two_pass_stages_median_seconds'] = {
+                                key: statistics.median(row[key] for row in trials)
+                                for key in ('action_feature_no_grad_seconds',
+                                            'context_and_loss_backward_seconds',
+                                            'action_gradient_replay_seconds')
+                            }
+                            case['action_reuse_factor'] = trials[0]['action_reuse_factor']
+                            case['globally_unique_actions'] = trials[0]['unique_actions']
+                            case['total_action_references'] = trials[0]['action_references']
+                            case['cached_action_feature_bytes'] = trials[0]['feature_leaf_bytes']
+                        else:
+                            case['median_forward_dispatch_seconds'] = statistics.median(
+                                row['forward_dispatch_seconds'] for row in trials)
+                            case['median_backward_dispatch_seconds'] = statistics.median(
+                                row['backward_dispatch_seconds'] for row in trials)
                         if mode == 'serial':
                             reference = grad
                             baseline_seconds = case['median_wall_seconds']
@@ -359,8 +384,12 @@ def benchmark_gradients(run, epoch, *, devices, cpu_threads, batch_sizes,
                                 delta.abs().max())
                         case['speedup_vs_same_device_serial'] = (
                             baseline_seconds / case['median_wall_seconds'])
-                        error, compared = probability_disagreement(
-                            frozen, samples, mode, size, bucketed, epsilon)
+                        if mode == 'two-pass':
+                            error, compared = two_pass_probability_disagreement(
+                                frozen, samples, epsilon)
+                        else:
+                            error, compared = probability_disagreement(
+                                frozen, samples, mode, size, bucketed, epsilon)
                         case['max_sampled_probability_absolute_error'] = error
                         case['sampled_probabilities_checked'] = compared
                         case['passes_numerical_tolerance'] = (
