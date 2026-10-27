@@ -33,6 +33,7 @@ from .experimental_structural_cache import cached_structural_forward
 from .experimental_action_replay import (replay_unique_action_gradients,
                                          two_pass_probability_disagreement)
 from .exploration import behavior_log_probs
+from .experimental_packed_batch import packed_score_many
 from .gpu_runtime import token_count
 from .model import Policy
 from .network_search import FrozenSampler, encode_json
@@ -178,19 +179,28 @@ def finish_device(device):
 
 
 def gradient_trial(policy, items, *, mode, batch_size, bucketed,
-                   denominator, epsilon):
+                   denominator, epsilon, defer_checks=False,
+                   packed_action_batch_size=8, max_attention_elements=8000000):
     ordered = (sorted(items, key=lambda r: r['tokens']) if bucketed else items)
     policy.zero_grad(set_to_none=True)
     finish_device(next(policy.parameters()).device)
     started = time.perf_counter()
     forward = backward = total_loss = 0.
+    deferred_losses = []
     for start in range(0, len(ordered), batch_size):
         chunk = ordered[start:start + batch_size]
         tick = time.perf_counter()
         if mode == 'serial':
             logits_batch = [policy(row['observation'])[0] for row in chunk]
-        else:
+        elif mode == 'packed-score-many':
+            logits_batch = packed_score_many(
+                policy, [row['observation'] for row in chunk],
+                max_action_batch_size=packed_action_batch_size,
+                max_attention_elements=max_attention_elements)
+        elif mode == 'score_many':
             logits_batch = policy.score_many([row['observation'] for row in chunk])
+        else:
+            raise ValueError(f'unknown gradient trial mode: {mode}')
         losses = []
         for row, logits in zip(chunk, logits_batch):
             logps = behavior_log_probs(logits, row['observation'], epsilon)
@@ -198,14 +208,24 @@ def gradient_trial(policy, items, *, mode, batch_size, bucketed,
                                   device=logps.device)
             losses.append(-(logps * counts).sum() / denominator)
         loss = torch.stack(losses).sum()
-        if not bool(torch.isfinite(loss).all()):
+        if defer_checks:
+            # Avoid synchronizing MPS for every microbatch's finite check and
+            # scalar .item(). These detached tensors have no autograd graph.
+            deferred_losses.append(loss.detach())
+        elif not bool(torch.isfinite(loss).all()):
             raise ValueError('nonfinite loss')
         forward += time.perf_counter() - tick
         tick = time.perf_counter()
         loss.backward()
         backward += time.perf_counter() - tick
-        total_loss += float(loss.detach())
+        if not defer_checks:
+            total_loss += float(loss.detach())
     finish_device(next(policy.parameters()).device)
+    if defer_checks:
+        aggregate = torch.stack(deferred_losses).sum()
+        if not bool(torch.isfinite(aggregate).all()):
+            raise ValueError('nonfinite deferred loss')
+        total_loss = float(aggregate.detach())
     elapsed = time.perf_counter() - started
     gradient = torch.cat([
         p.grad.detach().cpu().reshape(-1).to(torch.float64)
@@ -220,7 +240,9 @@ def gradient_trial(policy, items, *, mode, batch_size, bucketed,
     }
 
 
-def probability_disagreement(policy, samples, mode, batch_size, bucketed, epsilon):
+def probability_disagreement(policy, samples, mode, batch_size, bucketed, epsilon,
+                             packed_action_batch_size=8,
+                             max_attention_elements=8000000):
     """Not included in runtime: separate on-policy sampling agreement check."""
     rows = sorted(samples, key=lambda r: r['tokens']) if bucketed else samples
     max_error = 0.
@@ -228,9 +250,15 @@ def probability_disagreement(policy, samples, mode, batch_size, bucketed, epsilo
     with torch.no_grad():
         for start in range(0, len(rows), batch_size):
             batch = rows[start:start + batch_size]
-            logits = ([policy(row['observation'])[0] for row in batch]
-                      if mode == 'serial' else
-                      policy.score_many([row['observation'] for row in batch]))
+            if mode == 'serial':
+                logits = [policy(row['observation'])[0] for row in batch]
+            elif mode == 'packed-score-many':
+                logits = packed_score_many(
+                    policy, [row['observation'] for row in batch],
+                    max_action_batch_size=packed_action_batch_size,
+                    max_attention_elements=max_attention_elements)
+            else:
+                logits = policy.score_many([row['observation'] for row in batch])
             for row, scores in zip(batch, logits):
                 probs = behavior_log_probs(scores, row['observation'], epsilon).exp()
                 for idx, original in row['expected'].items():
@@ -241,7 +269,9 @@ def probability_disagreement(policy, samples, mode, batch_size, bucketed, epsilo
 
 def benchmark_gradients(run, epoch, *, devices, cpu_threads, batch_sizes,
                         machines, source, cap, seed, repeats,
-                        max_attention_elements, relation_cache_mb, tolerance):
+                        max_attention_elements, relation_cache_mb, tolerance,
+                        methods=('score_many', 'packed-score-many', 'two-pass'),
+                        defer_checks=False, packed_action_batch_size=8):
     model_path = run / f'model_epoch_{epoch:02d}.pt'
     saved = torch.load(model_path, map_location='cpu', weights_only=True)
     policy = Policy(**saved['config']).eval()
@@ -258,6 +288,9 @@ def benchmark_gradients(run, epoch, *, devices, cpu_threads, batch_sizes,
         'run': str(run), 'epoch': epoch, 'checkpoint': str(model_path),
         'frozen_model': policy.config, 'device_options': devices,
         'torch_version': torch.__version__,
+        'methods': list(methods),
+        'deferred_microbatch_checks': defer_checks,
+        'packed_action_batch_size': packed_action_batch_size,
         'workload': {**workload, 'benchmark_states': len(samples),
                      'sampled_positive_coefficients': sum(
                          sum(v > 0 for v in row['counts']) for row in samples),
@@ -297,12 +330,16 @@ def benchmark_gradients(run, epoch, *, devices, cpu_threads, batch_sizes,
             variants = [('serial', 1, False, False)]
             for size in batch_sizes:
                 for bucket in (False, True):
-                    variants.append(('score_many', size, bucket, False))
+                    for method in ('score_many', 'packed-score-many'):
+                        if method not in methods:
+                            continue
+                        variants.append((method, size, bucket, False))
+                        if frozen.representation == 'ast':
+                            variants.append((method, size, bucket, True))
+                if 'two-pass' in methods:
+                    variants.append(('two-pass', size, True, False))
                     if frozen.representation == 'ast':
-                        variants.append(('score_many', size, bucket, True))
-                variants.append(('two-pass', size, True, False))
-                if frozen.representation == 'ast':
-                    variants.append(('two-pass', size, True, True))
+                        variants.append(('two-pass', size, True, True))
             reference = None
             baseline_seconds = None
             for mode, size, bucketed, cache_enabled in variants:
@@ -331,11 +368,14 @@ def benchmark_gradients(run, epoch, *, devices, cpu_threads, batch_sizes,
                                     action_batch_size=16,
                                     bucketed_contexts=bucketed,
                                     denominator=denominator, epsilon=epsilon,
-                                    max_attention_elements=max_attention_elements)
+                                    max_attention_elements=max_attention_elements,
+                                    defer_checks=defer_checks)
                             return gradient_trial(
                                 frozen, samples, mode=mode, batch_size=size,
                                 bucketed=bucketed, denominator=denominator,
-                                epsilon=epsilon)
+                                epsilon=epsilon, defer_checks=defer_checks,
+                                packed_action_batch_size=packed_action_batch_size,
+                                max_attention_elements=max_attention_elements)
 
                         # Warm up every input shape, including the global
                         # action cache's two encoder passes.
@@ -389,7 +429,9 @@ def benchmark_gradients(run, epoch, *, devices, cpu_threads, batch_sizes,
                                 frozen, samples, epsilon)
                         else:
                             error, compared = probability_disagreement(
-                                frozen, samples, mode, size, bucketed, epsilon)
+                                frozen, samples, mode, size, bucketed, epsilon,
+                                packed_action_batch_size=packed_action_batch_size,
+                                max_attention_elements=max_attention_elements)
                         case['max_sampled_probability_absolute_error'] = error
                         case['sampled_probabilities_checked'] = compared
                         case['passes_numerical_tolerance'] = (
@@ -427,6 +469,12 @@ def main():
     p.add_argument('--seed', type=int, default=37)
     p.add_argument('--max-attention-elements', type=int, default=8000000)
     p.add_argument('--relation-cache-mb', type=int, default=128)
+    p.add_argument('--methods', default='score_many,packed-score-many,two-pass',
+                   help='comma-separated experimental methods; serial is always measured')
+    p.add_argument('--packed-action-batch-size', type=int, default=8)
+    p.add_argument('--defer-checks', action='store_true',
+                   help='defer nonfinite loss checks and scalar transfers until '
+                        'all microbatches complete (reduces MPS synchronization)')
     p.add_argument('--tolerance', type=float, default=1e-4)
     p.add_argument('--out', type=Path, required=True)
     args = p.parse_args()
@@ -434,6 +482,13 @@ def main():
             or args.states < 0 or args.relation_cache_mb < 0
             or not math.isfinite(args.tolerance) or args.tolerance <= 0):
         p.error('invalid benchmark size/tolerance')
+    if args.packed_action_batch_size < 1:
+        p.error('--packed-action-batch-size must be positive')
+    methods = list(dict.fromkeys(
+        s.strip() for s in args.methods.split(',') if s.strip()))
+    if not methods or any(mode not in ('score_many', 'packed-score-many', 'two-pass')
+                          for mode in methods):
+        p.error('--methods must contain score_many,packed-score-many,two-pass')
     devices = list(dict.fromkeys(s.strip() for s in args.devices.split(',') if s.strip()))
     if not devices or any(device not in ('cpu', 'mps') for device in devices):
         p.error('--devices requires cpu and/or mps')
@@ -446,7 +501,9 @@ def main():
             cap=args.states, seed=args.seed, repeats=args.repeats,
             max_attention_elements=args.max_attention_elements,
             relation_cache_mb=args.relation_cache_mb,
-            tolerance=args.tolerance)
+            tolerance=args.tolerance, methods=methods,
+            defer_checks=args.defer_checks,
+            packed_action_batch_size=args.packed_action_batch_size)
     except (OSError, ValueError, KeyError) as exc:
         p.error(str(exc))
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -458,7 +515,7 @@ def main():
           'real gradient states:', results['workload']['actual_gradient_groups'],
           'benchmarked:', results['workload']['benchmark_states'])
     for row in sorted(good, key=lambda row: row['median_wall_seconds'])[:10]:
-        print(f"{row['device']:<3} threads={row['threads']} "
+        print(f"{row['device']:<3} method={row['mode']:<17} threads={row['threads']} "
               f"batch={row['microbatch']:<3} bucket={row['length_bucketed']} "
               f"cache={row['structural_cache']} "
               f"{row['median_wall_seconds']:.3f}s "
