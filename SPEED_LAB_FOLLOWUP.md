@@ -74,3 +74,60 @@ occupancy and central GPU inference. Scheduling a larger frozen batch is an
 Please send packed_deferred_512.json and packed_synchronized_512.json, along
 with preprocessing_profile.json if available. Avoid treating a microbenchmark
 speedup as a prediction for the full 89.8-minute epoch.
+
+
+## Rollout matrix follow-up: simulate optimizer-version cache resets
+
+The first seven 64-machine runs revealed a major result: local CPU inference
+with eight workers and shared action features ran in 73.51 seconds
+(3,959 actions/s), while sampled centralized CPU configurations needed
+369-477 seconds and centralized MPS configurations needed 656-1,157 seconds.
+All reported 291,053 actions, but **worker count, attention batch size and
+barrier size also differed**. There is not yet a controlled isolated gain
+attributable solely to sharing action features.
+
+IMPORTANT COMPARABILITY ISSUE: the original matrix uses a single frozen
+version ID 0 for all 64 machines. In production, the training loop changes
+weights and invalidates action embedding caches after EVERY 8-machine SGD
+batch. Thus the impressive 64-machine shared-cache result may benefit from
+reuse across machine boundaries that production cannot retain.
+
+The matrix now has a read-only --simulate-update-barriers flag, which keeps
+weights frozen for apples-to-apples action trajectories but increments the
+frozen version at each configured barrier. Both worker-local feature caches
+and central inference caches must invalidate old versions. It reports
+simulated_update_barriers and frozen_weight_versions. No model updates occur.
+
+**After the ongoing old matrix finishes or is stopped**, perform a focused,
+training-representative CPU comparison (four configurations, NOT 448):
+
+~~~bash
+git pull origin main
+
+python -m proofgame.benchmark_rollout_matrix \
+  --run runs/ast_branch_race_8x6_fixed --epoch 2 \
+  --machines 64 --machine-source duration-stratified \
+  --strategies worker,worker-shared \
+  --workers 8 --barriers 8,64 \
+  --inference-batches 8 --wait-ms 0 --repeats 1 \
+  --simulate-update-barriers \
+  --out runs/ast_branch_race_8x6_fixed/rollout_versions_cpu.json
+~~~
+
+This tests isolated per-machine versus shared action caches under identical
+worker count, with both training-sized and intentionally large barriers.
+The order of four cases is shuffled. The 64-machine barrier is still an
+upper-bound scheduling experiment; the **8-machine** barrier is the more
+relevant production configuration. The cache-version resets at barrier 8
+closely model the per-minibatch invalidation cost but NOT changed action
+probabilities from real gradient updates.
+
+If CPU-local paths remain ahead, a further four-case focused comparison
+should include central-cpu and central-mps at **workers=8, barrier=8,
+inference_batch=8, wait=0**. Do not use cross-configuration speedups
+with different barriers/worker counts to predict full-epoch timing.
+
+Existing rollout_matrix.json remains resumable with its old signature when
+--simulate-update-barriers is omitted. Use a DIFFERENT --out for the new
+matrix, as in the example. The original 448-case Cartesian product is not a
+requirement; --max-cases 12 stops after 12 cases.
