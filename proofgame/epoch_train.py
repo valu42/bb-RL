@@ -832,13 +832,19 @@ def main():
         # must not silently change its inference strategy on resume.
         for option in ('cpu_inference','cpu_central_batching','group_relative',
                        'eval_attempts_per_machine'):
-            if old.get(option) != config.get(option):
+            legacy_default = (False if option=='group_relative' else
+                              old.get('attempts_per_machine') if option=='eval_attempts_per_machine'
+                              else None)
+            if old.get(option,legacy_default) != config.get(option):
                 parser.error('resume configuration changed: '+option)
         changing_strategy = False
         for k in config:
             if k!='epochs_requested' and config[k]!=old.get(
                     k,False if k=='balanced_initial_answers' else
-                    (0. if k in ('train_exploration_epsilon','length_penalty') else None)):
+                    (0. if k in ('train_exploration_epsilon','length_penalty') else
+                     False if k=='group_relative' else
+                     old.get('attempts_per_machine') if k=='eval_attempts_per_machine'
+                     else None)):
                 if (k=='attempts_after_success' and args.stop_after_first_train_proof
                         and old[k]=='continue to exact attempt budget'):
                     changing_strategy = True
@@ -913,11 +919,13 @@ def main():
                     gpu_before = pool.inference.stats() if central_inference else None
                 if central_inference:
                     tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
-                            args.attempts,dataset['action_budget'],state['updates'],
+                            args.attempts if training else args.eval_attempts,
+                            dataset['action_budget'],state['updates'],
                             training and args.stop_after_first_train_proof,
                             args.train_exploration_epsilon if training else 0.,
                             training and args.balanced_initial_answers,
-                            inspect_batch,args.profile) for r in batch]
+                            inspect_batch,args.profile,
+                            training and args.group_relative) for r in batch]
                     results=pool.run(tasks)
                 else:
                     atomic_torch(weights_file,{'version':state['updates'],'config':policy.config,
@@ -926,7 +934,8 @@ def main():
                         profile_stages['worker_snapshot']=time.perf_counter()-profile_t
                         profile_t=time.perf_counter()
                     tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
-                            args.attempts,dataset['action_budget'],str(weights_file),state['updates'],
+                            args.attempts if training else args.eval_attempts,
+                            dataset['action_budget'],str(weights_file),state['updates'],
                             training and args.stop_after_first_train_proof,
                             args.train_exploration_epsilon if training else 0.,
                             training and args.balanced_initial_answers,
@@ -940,7 +949,8 @@ def main():
                                    gpu_gradient_batch_size=args.gpu_gradient_batch_size,
                                    exploration_epsilon=args.train_exploration_epsilon,
                                    balanced_initial_answers=args.balanced_initial_answers,
-                                   length_penalty=args.length_penalty) if training else {'updated':False}
+                                   length_penalty=args.length_penalty,
+                                   group_relative=args.group_relative) if training else {'updated':False}
                 if args.profile:
                     profile_stages['learn']=time.perf_counter()-profile_t
                     profile_t=time.perf_counter()
@@ -964,11 +974,12 @@ def main():
                     # Snapshot profile counters before stripping diagnostics
                     # and writing normal checkpoint-compatible batch records.
                     machine_profiles = [row.get('profile',{}) for row in results]
-                # Diagnostic traces are written separately and never included
-                # in gradient replay or the standard per-batch checkpoint.
+                # Group failures are needed only for gradient replay; avoid
+                # storing huge unsuccessful trajectories in batch checkpoints.
                 for result in results:
                     result.pop('diagnostic_traces',None)
                     result.pop('profile',None)
+                    result.pop('group_trajectories',None)
                 batch_file=folder/f'batch_{start_index:04d}.json'
                 atomic_json(batch_file,{'epoch':epoch,'phase':phase,'start_index':start_index,'machines':results,'update':update})
                 if args.profile:
@@ -1002,6 +1013,10 @@ def main():
                           'last_batch_mean_verified_proof_reward':update.get('mean_verified_proof_reward'),
                           'last_batch_mean_verified_proof_actions':update.get('mean_verified_proof_actions'),
                           'length_penalty':args.length_penalty,
+                          'group_relative':args.group_relative,
+                          'last_batch_groups_informative':update.get('groups_informative'),
+                          'last_batch_groups_all_failed':update.get('groups_all_failed'),
+                          'last_batch_mean_group_reward':update.get('mean_group_reward'),
                           'active_seconds':state['active_seconds']}
                 if central_inference:
                     progress['gpu_inference' if args.device=='mps' else 'cpu_inference'] = pool.inference.stats()
@@ -1040,8 +1055,10 @@ def main():
                 print(f"Balanced initial attempts — epoch {epoch}: "
                       f"HALT={scheduled['choose:HALT']}, "
                       f"NONHALT={scheduled['choose:NONHALT']} "
-                      f"(maximum {args.attempts//2} per branch; "
-                      f"stops after first verified proof)",flush=True)
+                      f"({'exactly' if args.group_relative else 'maximum'} "
+                      f"{args.attempts//2} per branch; "
+                      f"{'full group' if args.group_relative else 'stops after first verified proof'})",
+                      flush=True)
             if raw['HALT'] is not None:
                 print(f"Answer exploration — {phase} epoch {epoch}: "
                       f"first actions HALT={counts['choose:HALT']}, "
@@ -1062,7 +1079,7 @@ def main():
                 if central_inference:
                     challenge_tasks=[
                         (row,task_seed(args.seed,'eval',0,row['machine_id']),
-                         args.attempts,dataset['action_budget'],state['updates'],True,0.,False,False,False)
+                         args.eval_attempts,dataset['action_budget'],state['updates'],True,0.,False,False,False)
                         for row in challenge_rows
                     ]
                     challenge_results=pool.run(challenge_tasks)
@@ -1072,13 +1089,13 @@ def main():
                                                'state_dict':policy.state_dict()})
                     challenge_tasks=[
                         (row,task_seed(args.seed,'eval',0,row['machine_id']),
-                         args.attempts,dataset['action_budget'],
+                         args.eval_attempts,dataset['action_budget'],
                          str(weights_file),state['updates'],True,0.,False,False,False)
                         for row in challenge_rows
                     ]
                     challenge_results=pool.map(run_machine,challenge_tasks,chunksize=1)
                 benchmark_report=make_benchmark_report(
-                    epoch,challenge_results,args.attempts,dataset['action_budget'],
+                    epoch,challenge_results,args.eval_attempts,dataset['action_budget'],
                     trained_ids=(row['machine_id'] for row in dataset['train'])
                 )
                 write_benchmark_report(args.out,benchmark_report)
