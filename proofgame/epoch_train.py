@@ -591,6 +591,21 @@ def count_proofs_by_answer(rows):
     }
 
 
+def summarize_group_updates(paths):
+    """Aggregate small saved batch updates, not discarded failure trajectories."""
+    totals = Counter()
+    for path in paths:
+        update = json.loads(path.read_text())['update']
+        for name in ('groups_total','groups_informative','groups_all_failed',
+                     'groups_all_successful','groups_uniform_reward',
+                     'group_attempts','group_positive_advantage_attempts',
+                     'group_negative_advantage_attempts'):
+            totals[name] += update.get(name,0)
+    total = totals['groups_total']
+    return {**dict(totals),
+            'informative_group_pct':100*totals['groups_informative']/total if total else 0.}
+
+
 def summarize_initial_choices(rows):
     counts=Counter(); scheduled=Counter(); raw={'HALT':0.,'NONHALT':0.}
     behavior={'HALT':0.,'NONHALT':0.}; n=0
