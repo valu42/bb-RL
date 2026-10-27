@@ -1068,7 +1068,9 @@ def main():
                               'mean_initial_policy_probability':metrics['mean_initial_policy_probability'],
                               'mean_initial_behavior_probability':metrics['mean_initial_behavior_probability'],
                               'train_exploration_epsilon':args.train_exploration_epsilon if training else 0.,
-                              'policy_updates':metrics['policy_updates']}),
+                              'policy_updates':metrics['policy_updates'],
+                              **({'group_relative_stats':metrics['group_relative_stats']}
+                                 if training and args.group_relative else {})}),
                   flush=True)
             counts=metrics['first_action_counts']
             raw=metrics['mean_initial_policy_probability']
