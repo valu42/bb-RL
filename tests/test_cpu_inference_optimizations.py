@@ -83,6 +83,36 @@ class CpuInferenceOptimizationTests(unittest.TestCase):
         self.assertEqual(results[0]['proved_machines'],results[1]['proved_machines'])
         self.assertTrue(all(x['throughput_vs_baseline']>0 for x in results))
 
+    def test_central_batched_cpu_probs_remain_on_policy_for_gradients(self):
+        from proofgame.epoch_train import learn_batch
+        from proofgame.gpu_runtime import BatchedPolicyInference
+        from proofgame.network_search import encode_json
+        torch.manual_seed(12)
+        policy=Policy(width=32,layers=1,representation='ast').eval()
+        optimizer=torch.optim.AdamW(policy.parameters(),lr=3e-4)
+        machine=from_rank(8)
+        game=Game(machine,budget=20)
+        other=Game(from_rank(9),budget=20)
+        inference=BatchedPolicyInference(policy,batch_size=2)
+        inference.begin_version(0)
+        actions=['choose:HALT','rule:exI','put:s','put:z',
+                 'commit','rule:refl','submit']
+        trace=[]
+        for action in actions:
+            obs=game.observation()
+            # Include another context to exercise genuinely batched CPU
+            # numerical inference, rather than just a single-context call.
+            reply=inference.infer([encode_json(obs),encode_json(other.observation())])
+            self.assertEqual(reply[0][0],'ok')
+            index=next(i for i,a in enumerate(obs['actions']) if a['id']==action)
+            trace.append({'action':action,'probability':reply[0][1][index]})
+            game.step(action,observe=False)
+        self.assertEqual(game.status,'SOLVED')
+        row={'machine':machine.to_json(),'attempts':1,
+             'successes':[{'actions':trace,'certificate':game.certificate()}]}
+        update=learn_batch(policy,optimizer,[row],20)
+        self.assertTrue(update['updated'])
+
     def test_central_cpu_cli_runs_and_profiles(self):
         with TemporaryDirectory() as tmp:
             root=Path(tmp)
