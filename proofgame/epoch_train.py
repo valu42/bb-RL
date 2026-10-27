@@ -122,7 +122,7 @@ def init_worker(model_config):
 
 def execute_machine(selected, seed, attempts, budget, version, stop_on_success, sampler,
                     exploration_epsilon=0., balanced_initial_answers=False,
-                    trace_diagnostics=False):
+                    trace_diagnostics=False, profile_enabled=False):
     """Execute a machine with either a CPU policy or the central GPU sampler."""
     machine = Machine(selected['machine']['rows']); rng = random.Random(seed)
     successes = []; statuses = Counter(); actions = 0; start = time.monotonic()
@@ -138,6 +138,10 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
         random.Random(seed ^ 0xA5A5F00D).shuffle(schedule)
     first_success_trace = None
     last_failed_trace = None
+    profile = ({'observation_seconds':0.,'inference_seconds':0.,
+                'step_seconds':0.,'verification_seconds':0.,
+                'inference_calls':0,'actions':0}
+               if profile_enabled else None)
     first_actions=Counter(); policy_sums={'HALT':0.,'NONHALT':0.}
     behavior_sums={'HALT':0.,'NONHALT':0.}; initial_observations=0
     def record_initial(action, raw, mixed):
@@ -154,7 +158,7 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
                                       exploration_epsilon=exploration_epsilon,
                                       on_initial_choice=record_initial,
                                       forced_initial_answer=schedule[i],
-                                      diagnostic_steps=detail)
+                                      diagnostic_steps=detail, profile=profile)
         actions += len(trace); statuses[status] += 1
         if trace_diagnostics:
             sample = {'attempt':i+1, 'status':status, 'steps':detail,
@@ -189,17 +193,27 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
                 if answer is not None)),
             **({'diagnostic_traces':{'success':first_success_trace,
                                     'failure':last_failed_trace}}
-               if trace_diagnostics else {})}
+               if trace_diagnostics else {}),
+            **({'profile':profile} if profile_enabled else {})}
 
 
 def run_machine(task):
-    selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon, balanced, diagnostics = task
+    selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon, balanced, diagnostics, profiling = task
+    if profiling:
+        started = time.perf_counter()
     saved = torch.load(weights_file, map_location='cpu', weights_only=True)
     if saved['version'] != version: raise RuntimeError('rollout policy version changed')
     _worker_policy.load_state_dict(saved['state_dict'])
     sampler = FrozenSampler(_worker_policy, capacity=10000)
-    return execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler,
-                           epsilon,balanced,diagnostics)
+    if profiling:
+        load_seconds = time.perf_counter() - started
+    result = execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler,
+                             epsilon,balanced,diagnostics,profiling)
+    if profiling:
+        result['profile']['worker_model_load_seconds'] = load_seconds
+        result['profile']['cache_hits'] = sampler.hits
+        result['profile']['cache_misses'] = sampler.misses
+    return result
 
 
 def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
@@ -477,6 +491,8 @@ def main():
     parser.add_argument('--gpu-max-attention-elements',type=int,default=8000000)
     parser.add_argument('--gpu-gradient-batch-size',type=int,default=4)
     parser.add_argument('--resume',action='store_true')
+    parser.add_argument('--profile',action='store_true',
+                        help='measure rollout, model inference, proof-game, gradient, and checkpoint costs per batch; may be enabled when resuming')
     parser.add_argument('--stop-after-first-train-proof',action='store_true',
                         help='stop each training machine after one verified proof; keep evaluation at the full attempt budget')
     args = parser.parse_args()
