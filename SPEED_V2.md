@@ -56,11 +56,51 @@ python -m proofgame.benchmark_speed_v2 \
   --workers 8 --barrier 8 \
   --cache-mb 32 \
   --repeats 2 \
-  --learn-repeats 2 \
+  --learn-warmups 1 \
+  --learn-repeats 3 \
   --gradient-device mps \
   --context-batch-size 8 \
   --out runs/ast_branch_race_8x6_fixed/speed_v2_ab.json
 ~~~
+
+## Interpret first-use MPS cost separately
+
+The first 369-state optimizer comparison produced CPU 1.539s vs MPS 6.469s;
+a second, identical gradient replay gave CPU 1.479s vs MPS 1.075s. Both
+passed complete gradient parity. The two-run median (0.400x speedup) is
+not representative of a stable steady-state run: MPS first-use costs may
+include Metal initialization, graph/kernel compilation and other setup.
+
+The updated script runs --learn-warmups 1 (default) before collecting
+--learn-repeats 3 timed comparisons. The report records warmup results
+separately, including the cold-start penalty. A warmed optimizer speedup
+and full-epoch projection are reported ONLY if at least three timed trials
+pass numerical parity and remain reasonably stable (max/min duration <=1.5
+for both CPU and accelerator). Otherwise the projection is omitted.
+
+**Important:** warmup repeats identical AST shapes; a real evolving epoch
+may encounter new shapes and pay compilation again. Thus a stable warmed
+speedup describes that *single sampled batch*, not the full epoch.
+A next-stage representative multi-batch training run must measure how
+frequently new-shape overhead occurs.
+
+To reinterpret the PREVIOUS JSON with its 6.469s first trial and 1.075s
+second trial WITHOUT rerunning rollouts:
+
+~~~bash
+python -m proofgame.benchmark_speed_v2 \
+  --inspect-existing runs/ast_branch_race_8x6_fixed/speed_v2_ab.json
+~~~
+
+This prints both per-trial speedups, the numerical status, and a warning
+that the old 152.43-minute projected epoch is unreliable; it does not
+overwrite the original report.
+
+For a shorter warm-start check, reuse the same 8-machine training barrier
+with --machines 8 --repeats 1 --learn-warmups 1 --learn-repeats 3 and
+choose a NEW --out path. That is two rollout variants, one optimizer
+warmup, then three timed optimizer trials. For a more representative
+run, keep 16 or more machines and profile multiple selected batches.
 
 Results are written to the output JSON after *each* completed rollout case.
 The full optimizer A/B uses the exact same frozen-policy trajectories from one
