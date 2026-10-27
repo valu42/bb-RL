@@ -119,11 +119,16 @@ _worker_action_features = None
 _worker_share_action_cache = False
 
 
-def init_worker(model_config, share_action_cache=False):
+def init_worker(model_config, share_action_cache=False, structural_cache_mb=0):
     global _worker_policy, _worker_policy_version, _worker_action_features
     global _worker_share_action_cache
     torch.set_num_threads(1)
     _worker_policy = Policy(**model_config).eval()
+    if structural_cache_mb:
+        if _worker_policy.representation != 'ast':
+            raise ValueError('CPU topology cache requires AST representation')
+        _worker_policy.structural_encoder.enable_input_cache(
+            relation_cache_mb=structural_cache_mb)
     _worker_policy_version = None
     _worker_action_features = OrderedDict()
     _worker_share_action_cache = share_action_cache
@@ -286,6 +291,9 @@ def run_machine(task):
         action_cache_capacity=4096 if _worker_share_action_cache else None)
     if profiling:
         load_seconds = time.perf_counter() - started
+        cache = (_worker_policy.structural_encoder._input_cache
+                 if _worker_policy.representation == 'ast' else None)
+        cache_before = (cache.stats() if cache is not None else None)
     result = execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler,
                              epsilon,balanced,diagnostics,profiling,group_relative,
                              branch_rounds)
@@ -295,6 +303,13 @@ def run_machine(task):
         result['profile']['cache_misses'] = sampler.misses
         result['profile']['action_feature_hits'] = sampler.action_feature_hits
         result['profile']['action_feature_misses'] = sampler.action_feature_misses
+        if cache_before is not None:
+            after = cache.stats()
+            result['profile']['topology_cache_hits'] = (
+                after['hits']['relation'] - cache_before['hits']['relation'])
+            result['profile']['topology_cache_misses'] = (
+                after['misses']['relation'] - cache_before['misses']['relation'])
+            result['profile']['topology_cache_bytes'] = after['relation_cache_bytes']
     return result
 
 
@@ -457,7 +472,9 @@ def prepare_group_relative_gradients(results, budget, length_penalty=0.,
 
 def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
                 exploration_epsilon=0., balanced_initial_answers=False,
-                length_penalty=0., group_relative=False, branch_rounds=0):
+                length_penalty=0., group_relative=False, branch_rounds=0,
+                gradient_backend='serial',
+                gradient_max_attention_elements=12000000):
     """On-policy REINFORCE with optional leave-one-out group advantages.
 
     In standard mode only verified successes contribute positive terminal
@@ -466,6 +483,10 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
     attempt succeeds. Grouping identical observations/actions preserves the
     reward-weighted gradient, normalized by all attempts in the batch.
     """
+    if gradient_backend not in ('serial', 'two-pass'):
+        raise ValueError('gradient backend must be serial or two-pass')
+    if gradient_max_attention_elements < 1 or gpu_gradient_batch_size < 1:
+        raise ValueError('invalid gradient attention budget / batch size')
     if not math.isfinite(length_penalty) or not 0. <= length_penalty < 1.:
         raise ValueError('length penalty must be finite and in [0,1)')
     groups = {}; proof_count = 0; numerical_fallbacks = 0
