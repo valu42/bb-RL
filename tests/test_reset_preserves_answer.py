@@ -3,6 +3,7 @@ import random
 import unittest
 
 from proofgame.environment import Game
+from proofgame.epoch_train import execute_machine
 from proofgame.kernel import check
 from proofgame.logic import Machine
 from proofgame.network_search import attempt
@@ -88,6 +89,47 @@ class ResetPreservesAnswerTests(unittest.TestCase):
                 self.assertEqual(trace[0]['forced_initial_answer'],answer)
                 self.assertFalse(any('forced_initial_answer' in step
                                      for step in trace[1:]))
+
+    def test_real_branch_rounds_with_resets_never_switch_answer(self):
+        class ResettingSampler:
+            hits=misses=0
+
+            def probabilities(self, obs):
+                choices=[a['id'] for a in obs['actions']]
+                if obs['answer'] is None:
+                    desired='choose:HALT'
+                elif obs['answer']=='NONHALT':
+                    desired='reset'
+                else:
+                    desired={19:'reset',18:'rule:exI',17:'put:s',
+                             16:'put:z',15:'commit',14:'rule:refl',
+                             13:'submit'}[obs['actions_left']]
+                if desired not in choices:
+                    raise AssertionError((desired,choices,obs['actions_left']))
+                return tuple(float(action==desired) for action in choices)
+
+        machine=from_rank(8)
+        row={'machine_id':'reset-branch-regression',
+             'machine':machine.to_json()}
+        result=execute_machine(
+            row,seed=7,attempts=2,budget=20,version=0,
+            stop_on_success=False,sampler=ResettingSampler(),
+            balanced_initial_answers=True,group_relative=True,
+            branch_rounds=1)
+        self.assertEqual(result['attempts'],4)
+        self.assertEqual(result['attempts_by_branch'],
+                         {'HALT':2,'NONHALT':2})
+        self.assertEqual(result['first_proof_answer'],'HALT')
+        self.assertEqual(result['first_proof_round'],1)
+        self.assertEqual(len(result['group_trajectories']),2)
+        self.assertTrue(all(
+            trace['actions'][0]['forced_initial_answer']=='HALT'
+            for trace in result['group_trajectories']))
+        self.assertTrue(all(success['certificate']['answer']=='HALT'
+                            for success in result['successes']))
+        self.assertTrue(all(any(step['action']=='reset'
+                                for step in success['actions'])
+                            for success in result['successes']))
 
     def test_new_game_still_allows_other_answer(self):
         first=Game(CLOSED)
