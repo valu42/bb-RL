@@ -181,6 +181,7 @@ class StructuralEncoder(nn.Module):
         torch.backends.mha.set_fastpath_enabled(False)
         self.max_tokens = max_tokens
         self.heads = heads
+        self._input_cache = None  # input-only runtime optimization; not checkpointed
         self.embedding = nn.Embedding(VOCAB_SIZE, width, padding_idx=0)
         self.relationship = nn.Embedding(NUM_RELATIONS, heads)
         nn.init.zeros_(self.relationship.weight)  # Begin without structural preference.
@@ -191,7 +192,27 @@ class StructuralEncoder(nn.Module):
                 if p.dim() > 1:
                     nn.init.xavier_uniform_(p)
 
+    def enable_input_cache(self, relation_cache_mb=32, position_cache_mb=1):
+        """Bounded, model-version-independent structural preprocessing cache.
+
+        Only parent/binder topology and positional constants are cached. The
+        learned relationship embedding remains evaluated on every forward.
+        No cache objects enter state_dict or change numerical model behavior.
+        """
+        if relation_cache_mb < 0 or position_cache_mb < 0:
+            raise ValueError('negative structural cache capacity')
+        if relation_cache_mb == 0:
+            self._input_cache = None
+            return
+        from .experimental_structural_cache import StructuralPreprocessingCache
+        self._input_cache = StructuralPreprocessingCache(
+            relation_cache_mb=relation_cache_mb,
+            position_cache_mb=position_cache_mb,
+            topology_keys=True, compact_relations=True)
+
     def forward(self, texts):
+        if self._input_cache is not None:
+            return self._input_cache.forward(self, texts)
         from .model import ModelLimit
         trees = [cached_tree(text) for text in texts]
         size = max(len(tokens) for tokens, _, _ in trees)
