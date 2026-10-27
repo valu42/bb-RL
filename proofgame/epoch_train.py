@@ -671,6 +671,33 @@ def count_proofs_by_answer(rows):
     }
 
 
+def summarize_first_proof_rounds(rows):
+    """Machine-level first verified proof, separated by answer and round.
+
+    Unsolved machines are counted separately, never assigned a fictitious
+    seventh round. Counts reflect the FIRST success, not later successes
+    from the same winning round.
+    """
+    hist = {'HALT':Counter(),'NONHALT':Counter()}
+    unsolved = 0
+    attempts = {'HALT':0,'NONHALT':0}
+    for row in rows:
+        for answer in ('HALT','NONHALT'):
+            attempts[answer] += row.get('attempts_by_branch',{}).get(answer,0)
+        round_number = row.get('first_proof_round')
+        answer = row.get('first_proof_answer')
+        if round_number is None:
+            unsolved += 1
+        else:
+            if answer not in hist or type(round_number) is not int or round_number < 1:
+                raise ValueError('invalid first proof round metadata')
+            hist[answer][str(round_number)] += 1
+    return {'HALT':dict(sorted(hist['HALT'].items(),key=lambda kv:int(kv[0]))),
+            'NONHALT':dict(sorted(hist['NONHALT'].items(),key=lambda kv:int(kv[0]))),
+            'no_proof':unsolved,
+            'attempts_by_branch':attempts}
+
+
 def summarize_group_updates(paths):
     """Aggregate small saved batch updates, not discarded failure trajectories."""
     totals = Counter()
