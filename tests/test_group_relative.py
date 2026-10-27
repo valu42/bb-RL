@@ -146,6 +146,72 @@ class GroupRelativeTests(unittest.TestCase):
         self.assertTrue(any(any(v<0 for v in counts)
                             for counts,_ in groups.values()))
 
+    def test_production_two_pass_matches_group_relative_optimizer_update(self):
+        torch.manual_seed(2026)
+        baseline = Policy(width=32, layers=1, representation='ast').eval()
+        results = [scripted_group(baseline, successes=1, budget=12)]
+        accelerated = Policy(width=32, layers=1, representation='ast').eval()
+        accelerated.load_state_dict(baseline.state_dict())
+        opt_baseline = torch.optim.AdamW(
+            baseline.parameters(), lr=3e-4, weight_decay=0.)
+        opt_fast = torch.optim.AdamW(
+            accelerated.parameters(), lr=3e-4, weight_decay=0.)
+        old = learn_batch(
+            baseline, opt_baseline, results, 12,
+            balanced_initial_answers=True, length_penalty=.3,
+            group_relative=True)
+        new = learn_batch(
+            accelerated, opt_fast, results, 12,
+            balanced_initial_answers=True, length_penalty=.3,
+            group_relative=True, gradient_backend='two-pass',
+            gpu_gradient_batch_size=2, gradient_max_attention_elements=1000000)
+        self.assertTrue(old['updated'], old)
+        self.assertTrue(new['updated'], new)
+        self.assertEqual(new['gradient_backend'], 'two-pass')
+        self.assertEqual(old['proofs'], new['proofs'])
+        self.assertEqual(old['unique_gradient_observations'],
+                         new['unique_gradient_observations'])
+        self.assertGreater(new['two_pass_sampled_probability_checks'], 0)
+        self.assertGreater(new['two_pass_action_reuse_factor'], 1.)
+        self.assertAlmostEqual(old['loss'], new['loss'], places=5)
+        # AdamW normalizes moment estimates and can amplify tiny float32
+        # accumulation-order differences for near-zero gradients. Bound the
+        # *optimizer result* by one step-sized tolerance, while checking
+        # the complete unclipped gradient itself much more strictly below.
+        max_weight_drift = max(
+            float((tensor - accelerated.state_dict()[name]).abs().max())
+            for name, tensor in baseline.state_dict().items())
+        self.assertLess(max_weight_drift, 2 * 3e-4)
+        reference = torch.cat([p.grad.reshape(-1) for p in baseline.parameters()
+                               if p.grad is not None])
+        actual = torch.cat([p.grad.reshape(-1) for p in accelerated.parameters()
+                            if p.grad is not None])
+        delta = torch.linalg.vector_norm(actual - reference)
+        relative = delta / torch.linalg.vector_norm(reference).clamp_min(1e-12)
+        self.assertLess(float(relative), 1e-4)
+
+    def test_two_pass_rejects_off_policy_probability_before_optimizer_step(self):
+        torch.manual_seed(2027)
+        model = Policy(width=32, layers=1, representation='ast').eval()
+        result = scripted_group(model, successes=1, budget=12)
+        # The successful trajectory's second action is not forced, and the
+        # stored sampled probability must match this exact frozen model.
+        result['group_trajectories'][0]['actions'][1]['probability'] = 0.00001
+        result['successes'][0]['actions'][1]['probability'] = 0.00001
+        original = {k: v.detach().clone()
+                    for k, v in model.state_dict().items()}
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=3e-4, weight_decay=0.)
+        with self.assertRaisesRegex(RuntimeError, 'off-policy'):
+            learn_batch(
+                model, optimizer, [result], 12,
+                balanced_initial_answers=True,
+                group_relative=True, gradient_backend='two-pass',
+                gpu_gradient_batch_size=2)
+        self.assertFalse(optimizer.state)
+        for name, tensor in model.state_dict().items():
+            self.assertTrue(torch.equal(tensor, original[name]))
+
     def test_all_fail_and_equal_reward_groups_have_no_update(self):
         torch.manual_seed(8)
         model=Policy(width=32,layers=1).eval()

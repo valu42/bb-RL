@@ -49,8 +49,8 @@ def _batch_indices(action_texts, representation, width, size, max_attention_elem
             if (chunk and (len(chunk) + 1) * width * next_length**2 >
                     max_attention_elements):
                 break
-            if not chunk and width * next_length**2 > max_attention_elements:
-                raise ValueError('single action exceeds attention element limit')
+            # An individual valid model input can exceed this heuristic.
+            # Never reject an input that the original serial path accepts.
             chunk.append(idx)
             longest = next_length
             at += 1
@@ -61,7 +61,8 @@ def _batch_indices(action_texts, representation, width, size, max_attention_elem
 def replay_unique_action_gradients(
         policy, samples, *, context_batch_size=4, action_batch_size=16,
         bucketed_contexts=True, denominator=1, epsilon=0.,
-        max_attention_elements=12000000, defer_checks=False):
+        max_attention_elements=12000000, defer_checks=False,
+        capture_gradient_vector=True, check_sampled_probabilities=False):
     """Return (full gradient vector, loss, timing/stats), WITHOUT optimizer.step.
 
     Each sample is {'observation': dict, 'counts': list[float], ...}. All
@@ -126,14 +127,16 @@ def replay_unique_action_gradients(
             if (ids and (len(ids) + 1) * policy.config['heads'] * future**2
                     > max_attention_elements):
                 break
-            if not ids and policy.config['heads'] * future**2 > max_attention_elements:
-                raise ValueError('single context exceeds attention element limit')
+            # Never skip a valid long context: size guards only limit
+            # *combined* padding, not the model's real max_tokens limit.
             ids.append(index)
             longest = future
             position += 1
         context_chunks.append(ids)
     total_loss = 0.
     deferred_losses = []
+    sampled_checks = []
+    numerical_fallbacks = 0
     t_context = time.perf_counter()
     for ids in context_chunks:
         batch = [samples[i] for i in ids]
@@ -148,6 +151,19 @@ def replay_unique_action_gradients(
                       / math.sqrt(query.shape[-1])
                       + biases.index_select(0, loc))
             logps = behavior_log_probs(logits, row['observation'], epsilon)
+            if check_sampled_probabilities and row['expected']:
+                indices = torch.tensor(list(row['expected']), device=device,
+                                       dtype=torch.long)
+                reference = torch.tensor(list(row['expected'].values()),
+                                         device=device, dtype=logps.dtype)
+                inferred = logps.detach().index_select(0, indices).exp()
+                # Same strict first-pass tolerances as learn_batch. Defer
+                # the boolean CPU sync until all gradient contexts complete.
+                passes = torch.isclose(
+                    inferred, reference,
+                    rtol=2e-4 if device.type == 'mps' else 2e-5,
+                    atol=2e-6 if device.type == 'mps' else 2e-7)
+                sampled_checks.append((passes, row))
             counts = torch.tensor(row['counts'], device=device, dtype=logps.dtype)
             losses.append(-(logps * counts).sum() / denominator)
         loss = torch.stack(losses).sum()
@@ -164,6 +180,27 @@ def replay_unique_action_gradients(
     context_seconds = time.perf_counter() - t_context
     if keys.grad is None or biases.grad is None:
         raise RuntimeError('cached action feature gradients missing')
+    if sampled_checks:
+        # One batched sync on the common (correct on-policy) path; only rare
+        # mismatches need the original serial-policy fallback check.
+        if not bool(torch.stack([passed.all() for passed, _ in sampled_checks]).all()):
+            for passed, row in sampled_checks:
+                if bool(passed.all()):
+                    continue
+                observation = row['observation']
+                with torch.inference_mode():
+                    logits, _ = policy(observation)
+                    actual = behavior_log_probs(logits, observation, epsilon).exp().tolist()
+                for index, reference in row['expected'].items():
+                    if not math.isclose(
+                            actual[index], reference,
+                            rel_tol=3e-3 if device.type == 'mps' else 2e-4,
+                            abs_tol=3e-5 if device.type == 'mps' else 2e-6):
+                        raise RuntimeError(
+                            'off-policy training trajectory in two-pass gradient: '
+                            f'sampled={reference:.9g}, inference={actual[index]:.9g}, '
+                            f'action={observation["actions"][index]["id"]}')
+                    numerical_fallbacks += 1
 
     t_action = time.perf_counter()
     # Only NOW build and discard a small real action-encoder autograd graph.
@@ -187,13 +224,17 @@ def replay_unique_action_gradients(
             raise RuntimeError('non-finite deferred two-pass loss')
         total_loss = float(aggregate.detach())
 
-    vector = torch.cat([
-        p.grad.detach().cpu().reshape(-1).to(torch.float64)
-        if p.grad is not None else torch.zeros(p.numel(), dtype=torch.float64)
-        for p in policy.parameters()
-    ]).clone()
-    if not bool(torch.isfinite(vector).all()):
-        raise RuntimeError('non-finite two-pass gradients')
+    vector = None
+    if capture_gradient_vector:
+        # Benchmark only. Avoid concatenating/copying every model gradient
+        # onto the CPU during actual training; clip_grad_norm_ checks it.
+        vector = torch.cat([
+            p.grad.detach().cpu().reshape(-1).to(torch.float64)
+            if p.grad is not None else torch.zeros(p.numel(), dtype=torch.float64)
+            for p in policy.parameters()
+        ]).clone()
+        if not bool(torch.isfinite(vector).all()):
+            raise RuntimeError('non-finite two-pass gradients')
     result = {
         'wall_seconds': time.perf_counter() - started,
         'action_feature_no_grad_seconds': feature_seconds,
@@ -206,6 +247,9 @@ def replay_unique_action_gradients(
         'distinct_action_groups': len(chunks),
         'feature_leaf_bytes': sum(t.numel() * t.element_size()
                                   for t in (keys, biases)),
+        'sampled_probability_checks': sum(
+            len(row['expected']) for _, row in sampled_checks),
+        'numerical_fallbacks': numerical_fallbacks,
         'note': 'Full gradient through both the context and action encoders; '
                 'no optimizer step or parameter modification.',
     }
