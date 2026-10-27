@@ -765,6 +765,8 @@ def main():
                         help='held-out and special-benchmark attempts per machine; default --attempts')
     parser.add_argument('--group-relative',action='store_true',
                         help='use full per-machine attempt groups with leave-one-out advantages')
+    parser.add_argument('--branch-rounds',type=int,default=0,
+                        help='sample --attempts per branch per round, stop after first proof round')
     parser.add_argument('--batch-size',type=int,default=8)
     parser.add_argument('--workers',type=int,default=8)
     parser.add_argument('--seed',type=int,default=7)
@@ -809,6 +811,10 @@ def main():
         if args.train_exploration_epsilon != 0.2:
             parser.error('balanced initial answers replaces epsilon exploration; omit --train-exploration-epsilon')
         args.train_exploration_epsilon=0.
+    if args.branch_rounds < 0:
+        parser.error('--branch-rounds must be nonnegative')
+    if args.branch_rounds and (not args.group_relative or not args.balanced_initial_answers):
+        parser.error('--branch-rounds requires --group-relative and --balanced-initial-answers')
     if args.group_relative:
         if args.attempts < 2:
             parser.error('--group-relative requires at least 2 attempts per machine')
@@ -892,6 +898,7 @@ def main():
             'attempts_per_machine':args.attempts,'budget':dataset['action_budget'],
             'eval_attempts_per_machine':args.eval_attempts,
             'group_relative':args.group_relative,
+            'branch_rounds':args.branch_rounds,
             'batch_size':args.batch_size,'seed':args.seed,'lr':args.lr,'model':policy.config,
             'parameters':sum(p.numel() for p in policy.parameters()),'epochs_requested':args.epochs,
             'algorithm':('leave-one-out group-relative on-policy REINFORCE'
@@ -901,6 +908,8 @@ def main():
             'length_penalty':args.length_penalty,
             'balanced_initial_answers':args.balanced_initial_answers,
             'attempts_after_success':(
+                'training: complete first successful branch round, then stop; evaluation: full attempt budget'
+                if args.branch_rounds else
                 'training: all group attempts, including after success; evaluation: full attempt budget'
                 if args.group_relative else
                 ('training: stop after first verified proof; evaluation: full attempt budget'
@@ -928,8 +937,9 @@ def main():
         # Check both directions: switching an optimized run back to baseline
         # must not silently change its inference strategy on resume.
         for option in ('cpu_inference','cpu_central_batching','group_relative',
-                       'eval_attempts_per_machine'):
+                       'eval_attempts_per_machine','branch_rounds'):
             legacy_default = (False if option=='group_relative' else
+                              0 if option=='branch_rounds' else
                               old.get('attempts_per_machine') if option=='eval_attempts_per_machine'
                               else None)
             if old.get(option,legacy_default) != config.get(option):
@@ -1022,7 +1032,8 @@ def main():
                             args.train_exploration_epsilon if training else 0.,
                             training and args.balanced_initial_answers,
                             inspect_batch,args.profile,
-                            training and args.group_relative) for r in batch]
+                            training and args.group_relative,
+                            args.branch_rounds if training else 0) for r in batch]
                     results=pool.run(tasks)
                 else:
                     atomic_torch(weights_file,{'version':state['updates'],'config':policy.config,
@@ -1048,7 +1059,8 @@ def main():
                                    exploration_epsilon=args.train_exploration_epsilon,
                                    balanced_initial_answers=args.balanced_initial_answers,
                                    length_penalty=args.length_penalty,
-                                   group_relative=args.group_relative) if training else {'updated':False}
+                                   group_relative=args.group_relative,
+                                   branch_rounds=args.branch_rounds) if training else {'updated':False}
                 if args.profile:
                     profile_stages['learn']=time.perf_counter()-profile_t
                     profile_t=time.perf_counter()
@@ -1115,6 +1127,8 @@ def main():
                           'last_batch_groups_informative':update.get('groups_informative'),
                           'last_batch_groups_all_failed':update.get('groups_all_failed'),
                           'last_batch_mean_group_reward':update.get('mean_group_reward'),
+                          'last_batch_first_proof_round_by_answer':summarize_first_proof_rounds(results)
+                          if args.branch_rounds and training else None,
                           'active_seconds':state['active_seconds']}
                 if central_inference:
                     progress['gpu_inference' if args.device=='mps' else 'cpu_inference'] = pool.inference.stats()
@@ -1127,6 +1141,10 @@ def main():
             metrics=summarize(batch_paths)
             if training and args.group_relative:
                 metrics['group_relative_stats']=summarize_group_updates(batch_paths)
+            if training and args.branch_rounds:
+                metrics['first_proof_round_by_answer']=summarize_first_proof_rounds(
+                    [row for p in batch_paths
+                     for row in json.loads(p.read_text())['machines']])
             metrics.update(epoch=epoch,phase=phase,policy_updates=state['updates'],active_seconds=state['active_seconds'])
             atomic_json(args.out/f'epoch_{epoch:02d}_{"training" if training else "evaluation"}.json',metrics)
             print(json.dumps({'event':'epoch_summary','phase':phase,'epoch':epoch,
@@ -1148,7 +1166,9 @@ def main():
                               'train_exploration_epsilon':args.train_exploration_epsilon if training else 0.,
                               'policy_updates':metrics['policy_updates'],
                               **({'group_relative_stats':metrics['group_relative_stats']}
-                                 if training and args.group_relative else {})}),
+                                 if training and args.group_relative else {}),
+                              **({'first_proof_round_by_answer':metrics['first_proof_round_by_answer']}
+                                 if training and args.branch_rounds else {})}),
                   flush=True)
             counts=metrics['first_action_counts']
             raw=metrics['mean_initial_policy_probability']
