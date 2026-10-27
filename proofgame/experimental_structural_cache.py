@@ -22,6 +22,9 @@ class StructuralPreprocessingCache:
             raise ValueError('cache sizes must be nonnegative')
         self.topology_keys = topology_keys
         self.compact_relations = compact_relations
+        # Dict keys are Python tuples and are not counted in tensor nbytes.
+        # Bound entry count as well as tensor bytes to cap bookkeeping memory.
+        self.relation_entry_limit = 8192 if topology_keys else None
         self.relation_limit = int(relation_cache_mb * 1024 * 1024)
         self.position_limit = int(position_cache_mb * 1024 * 1024)
         self.relations = OrderedDict()
@@ -52,7 +55,9 @@ class StructuralPreprocessingCache:
         entries[key] = value
         current = self.relation_bytes if kind == 'relation' else self.position_bytes
         current += size
-        while current > limit:
+        while (current > limit or
+               (kind == 'relation' and self.relation_entry_limit is not None
+                and len(entries) > self.relation_entry_limit)):
             _, old = entries.popitem(last=False)
             current -= self._bytes(old)
         if kind == 'relation':
@@ -133,6 +138,7 @@ class StructuralPreprocessingCache:
             'relation_cache_bytes': self.relation_bytes,
             'topology_keys': self.topology_keys,
             'compact_relations': self.compact_relations,
+            'relation_entry_limit': self.relation_entry_limit,
             'position_cache_bytes': self.position_bytes,
             'relation_entries': len(self.relations),
             'position_entries': len(self.positions),
