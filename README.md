@@ -82,6 +82,56 @@ These example numbers are illustrative. The trace probabilities are
 action-selection probabilities, **not** probabilities that a proof claim is
 mathematically true. No new CLI flag is required.
 
+## Profile training before optimizing
+
+Pass `--profile` to `proofgame.epoch_train` to measure where time goes,
+without changing the policy, reward, action sampling, or optimizer.
+This is optional and can be enabled when **resuming an existing run**
+with `--resume`, using all the same training arguments:
+
+```bash
+python -m proofgame.epoch_train \
+  --dataset runs/unfiltered_1000_100/dataset.json \
+  --out runs/ast_masked_actions --resume \
+  --epochs 100 --attempts 100 --batch-size 8 --workers 8 \
+  --representation ast --device cpu --balanced-initial-answers --profile
+```
+
+A new process is needed to pick up code changes. The existing process
+cannot enable profiling without a restart. Do not run two processes
+against the same output directory.
+
+Each batch prints a `batch_profile` JSON event and saves detailed data
+under `<run>/profiling/epoch_01_train_batch_0010.json`. Each phase also
+writes an `epoch_01_train_summary.json`. Baseline files use phase
+`baseline`, and evaluation files use `eval`.
+
+- **Stage wall time:** worker model snapshot, rollout, gradient learning,
+  policy-trace output, batch JSON, and checkpoint writing.
+- **Worker sum time:** constructing observations, waiting for model
+  inference, executing proof actions, verifying successful certificates,
+  and loading the CPU worker's policy.
+- **Throughput:** actual proof-game actions, attempts, and machines per
+  rollout wall-clock second.
+- **MPS only:** changes in centralized inference requests, cache hits,
+  network batches, and central inference wall time.
+
+Important interpretation: worker time is **summed across parallel
+machines**, so it may exceed the batch's rollout wall time. On MPS,
+`worker_inference_seconds_sum` includes queue/IPC waiting, while
+`central_inference_delta.inference_wall_seconds` measures the main
+process's inference path. Do not add these to the wall-clock totals.
+GPU execution can be asynchronous; the central inference path includes
+its existing transfer/synchronization, but this is **not a device kernel
+profiler**.
+
+Profiling adds a small amount of overhead from per-action timers and
+file writes. Compare throughput with the flag enabled under consistent
+workloads, and use the timings to choose which optimization to attempt
+next. It does not alter existing training batch JSON files or checkpoint
+formats. CPU workers currently reload frozen model weights for each
+machine; the `worker_model_load_seconds` counter helps quantify this.
+
 ## State-based masking of redundant proof checks
 
 The proof game prevents repeated failed verification of an **unchanged**

@@ -122,7 +122,7 @@ def init_worker(model_config):
 
 def execute_machine(selected, seed, attempts, budget, version, stop_on_success, sampler,
                     exploration_epsilon=0., balanced_initial_answers=False,
-                    trace_diagnostics=False):
+                    trace_diagnostics=False, profile_enabled=False):
     """Execute a machine with either a CPU policy or the central GPU sampler."""
     machine = Machine(selected['machine']['rows']); rng = random.Random(seed)
     successes = []; statuses = Counter(); actions = 0; start = time.monotonic()
@@ -138,6 +138,10 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
         random.Random(seed ^ 0xA5A5F00D).shuffle(schedule)
     first_success_trace = None
     last_failed_trace = None
+    profile = ({'observation_seconds':0.,'inference_seconds':0.,
+                'step_seconds':0.,'verification_seconds':0.,
+                'inference_calls':0,'actions':0}
+               if profile_enabled else None)
     first_actions=Counter(); policy_sums={'HALT':0.,'NONHALT':0.}
     behavior_sums={'HALT':0.,'NONHALT':0.}; initial_observations=0
     def record_initial(action, raw, mixed):
@@ -154,7 +158,7 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
                                       exploration_epsilon=exploration_epsilon,
                                       on_initial_choice=record_initial,
                                       forced_initial_answer=schedule[i],
-                                      diagnostic_steps=detail)
+                                      diagnostic_steps=detail, profile=profile)
         actions += len(trace); statuses[status] += 1
         if trace_diagnostics:
             sample = {'attempt':i+1, 'status':status, 'steps':detail,
@@ -189,17 +193,27 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
                 if answer is not None)),
             **({'diagnostic_traces':{'success':first_success_trace,
                                     'failure':last_failed_trace}}
-               if trace_diagnostics else {})}
+               if trace_diagnostics else {}),
+            **({'profile':profile} if profile_enabled else {})}
 
 
 def run_machine(task):
-    selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon, balanced, diagnostics = task
+    selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon, balanced, diagnostics, profiling = task
+    if profiling:
+        started = time.perf_counter()
     saved = torch.load(weights_file, map_location='cpu', weights_only=True)
     if saved['version'] != version: raise RuntimeError('rollout policy version changed')
     _worker_policy.load_state_dict(saved['state_dict'])
     sampler = FrozenSampler(_worker_policy, capacity=10000)
-    return execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler,
-                           epsilon,balanced,diagnostics)
+    if profiling:
+        load_seconds = time.perf_counter() - started
+    result = execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler,
+                             epsilon,balanced,diagnostics,profiling)
+    if profiling:
+        result['profile']['worker_model_load_seconds'] = load_seconds
+        result['profile']['cache_hits'] = sampler.hits
+        result['profile']['cache_misses'] = sampler.misses
+    return result
 
 
 def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
@@ -477,6 +491,8 @@ def main():
     parser.add_argument('--gpu-max-attention-elements',type=int,default=8000000)
     parser.add_argument('--gpu-gradient-batch-size',type=int,default=4)
     parser.add_argument('--resume',action='store_true')
+    parser.add_argument('--profile',action='store_true',
+                        help='measure rollout, model inference, proof-game, gradient, and checkpoint costs per batch; may be enabled when resuming')
     parser.add_argument('--stop-after-first-train-proof',action='store_true',
                         help='stop each training machine after one verified proof; keep evaluation at the full attempt budget')
     args = parser.parse_args()
@@ -640,28 +656,42 @@ def main():
                 batch=rows[start_index:start_index+args.batch_size]
                 batch_number=start_index//args.batch_size+1
                 inspect_batch=(batch_number % 10 == 0)
+                if args.profile:
+                    profile_stages = {}
+                    profile_t = time.perf_counter()
+                    gpu_before = pool.inference.stats() if args.device=='mps' else None
                 if args.device=='mps':
                     tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
                             args.attempts,dataset['action_budget'],state['updates'],
                             training and args.stop_after_first_train_proof,
                             args.train_exploration_epsilon if training else 0.,
                             training and args.balanced_initial_answers,
-                            inspect_batch) for r in batch]
+                            inspect_batch,args.profile) for r in batch]
                     results=pool.run(tasks)
                 else:
                     atomic_torch(weights_file,{'version':state['updates'],'config':policy.config,
                                                'state_dict':policy.state_dict()})
+                    if args.profile:
+                        profile_stages['worker_snapshot']=time.perf_counter()-profile_t
+                        profile_t=time.perf_counter()
                     tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
                             args.attempts,dataset['action_budget'],str(weights_file),state['updates'],
                             training and args.stop_after_first_train_proof,
                             args.train_exploration_epsilon if training else 0.,
                             training and args.balanced_initial_answers,
-                            inspect_batch) for r in batch]
+                            inspect_batch,args.profile) for r in batch]
                     results=pool.map(run_machine,tasks,chunksize=1)
+                if args.profile:
+                    profile_stages['rollout']=time.perf_counter()-profile_t
+                    gpu_after = pool.inference.stats() if args.device=='mps' else None
+                    profile_t=time.perf_counter()
                 update=learn_batch(policy,optimizer,results,dataset['action_budget'],
                                    gpu_gradient_batch_size=args.gpu_gradient_batch_size,
                                    exploration_epsilon=args.train_exploration_epsilon,
                                    balanced_initial_answers=args.balanced_initial_answers) if training else {'updated':False}
+                if args.profile:
+                    profile_stages['learn']=time.perf_counter()-profile_t
+                    profile_t=time.perf_counter()
                 state['updates']+=int(update['updated'])
                 if update.get('rejected_update'):
                     state['rejected_updates']=state.get('rejected_updates',0)+1
@@ -675,13 +705,35 @@ def main():
                     trace_path=write_trace_report(args.out,trace_report)
                     print(json.dumps({'event':'policy_trace_saved',
                                       'path':str(trace_path)}),flush=True)
+                if args.profile:
+                    profile_stages['trace']=time.perf_counter()-profile_t
+                    profile_t=time.perf_counter()
+                    from .profiling import make_batch_profile,save_batch_profile
+                    # Snapshot profile counters before stripping diagnostics
+                    # and writing normal checkpoint-compatible batch records.
+                    machine_profiles = [row.get('profile',{}) for row in results]
                 # Diagnostic traces are written separately and never included
                 # in gradient replay or the standard per-batch checkpoint.
                 for result in results:
                     result.pop('diagnostic_traces',None)
+                    result.pop('profile',None)
                 batch_file=folder/f'batch_{start_index:04d}.json'
                 atomic_json(batch_file,{'epoch':epoch,'phase':phase,'start_index':start_index,'machines':results,'update':update})
+                if args.profile:
+                    profile_stages['batch_json']=time.perf_counter()-profile_t
+                    profile_t=time.perf_counter()
                 state['next_index']+=len(batch);save_state()
+                if args.profile:
+                    profile_stages['checkpoint']=time.perf_counter()-profile_t
+                    # Avoid altering saved training records. Only the separate
+                    # diagnostic report contains per-machine profiling counters.
+                    profiled_rows=[{**row,'profile':p}
+                                   for row,p in zip(results,machine_profiles)]
+                    report=make_batch_profile(
+                        phase=phase,epoch=epoch,batch_number=batch_number,
+                        results=profiled_rows,stages=profile_stages,device=args.device,
+                        gpu_before=gpu_before,gpu_after=gpu_after)
+                    save_batch_profile(args.out,report)
                 batch_outcomes=count_proofs_by_answer(results)
                 batch_choices=summarize_initial_choices(results)
                 progress={'phase':phase,'epoch':epoch,'target_epochs':args.epochs,'machines_done':state['next_index'],
@@ -700,6 +752,9 @@ def main():
                     progress['gpu_inference']=pool.inference.stats()
                 atomic_json(args.out/'progress.json',progress);print(json.dumps(progress),flush=True)
                 continue
+            if args.profile:
+                from .profiling import summarize_epoch_profiles
+                summarize_epoch_profiles(args.out,epoch,phase)
             metrics=summarize(sorted(folder.glob('batch_*.json')))
             metrics.update(epoch=epoch,phase=phase,policy_updates=state['updates'],active_seconds=state['active_seconds'])
             atomic_json(args.out/f'epoch_{epoch:02d}_{"training" if training else "evaluation"}.json',metrics)
@@ -752,7 +807,7 @@ def main():
                 if args.device=='mps':
                     challenge_tasks=[
                         (row,task_seed(args.seed,'eval',0,row['machine_id']),
-                         args.attempts,dataset['action_budget'],state['updates'],True,0.,False,False)
+                         args.attempts,dataset['action_budget'],state['updates'],True,0.,False,False,False)
                         for row in challenge_rows
                     ]
                     challenge_results=pool.run(challenge_tasks)
@@ -763,7 +818,7 @@ def main():
                     challenge_tasks=[
                         (row,task_seed(args.seed,'eval',0,row['machine_id']),
                          args.attempts,dataset['action_budget'],
-                         str(weights_file),state['updates'],True,0.,False,False)
+                         str(weights_file),state['updates'],True,0.,False,False,False)
                         for row in challenge_rows
                     ]
                     challenge_results=pool.map(run_machine,challenge_tasks,chunksize=1)

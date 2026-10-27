@@ -78,14 +78,29 @@ class CentralGPUInferenceTests(unittest.TestCase):
         policy=Policy(width=32,layers=1).eval()
         machine=from_rank(8)
         row={'rank':8,'machine_id':key(machine),'machine':machine.to_json()}
-        tasks=[(row,12345,2,9,0,True,0.,False,False),(row,54321,2,9,0,True,0.2,False,False)]
+        tasks=[(row,12345,2,9,0,True,0.,False,False,False),(row,54321,2,9,0,True,0.2,False,False,False)]
         expected=[execute_machine(r,seed,attempts,budget,version,stop,FrozenSampler(policy),epsilon)
-                  for r,seed,attempts,budget,version,stop,epsilon,balanced,diagnostics in tasks]
+                  for r,seed,attempts,budget,version,stop,epsilon,balanced,diagnostics,profiling in tasks]
         with CentralRolloutPool(policy,workers=2,inference_batch_size=2,wait_ms=1.) as pool:
             actual=pool.run(tasks)
         for left,right in zip(actual,expected):
             for field in ('attempts','actions','statuses','successes','policy_version'):
                 self.assertEqual(left[field],right[field])
+
+    def test_central_worker_profiling_is_reported(self):
+        torch.manual_seed(7)
+        policy=Policy(width=32,layers=1).eval()
+        machine=from_rank(8)
+        row={'rank':8,'machine_id':key(machine),'machine':machine.to_json()}
+        task=(row,12345,2,9,0,True,0.,False,False,True)
+        with CentralRolloutPool(policy,workers=1,inference_batch_size=2,wait_ms=1.) as pool:
+            result=pool.run([task])[0]
+        profile=result['profile']
+        self.assertEqual(profile['actions'],result['actions'])
+        self.assertGreater(profile['inference_seconds'],0)
+        self.assertEqual(profile['inference_calls'],result['actions'])
+        self.assertIn('cache_hits',profile)
+        self.assertIn('cache_misses',profile)
 
     @unittest.skipUnless(torch is not None and torch.backends.mps.is_available(),'requires Apple Silicon Metal GPU')
     def test_mps_inference_and_policy_gradient(self):
