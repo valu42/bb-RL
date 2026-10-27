@@ -82,6 +82,60 @@ These example numbers are illustrative. The trace probabilities are
 action-selection probabilities, **not** probabilities that a proof claim is
 mathematically true. No new CLI flag is required.
 
+## Reward shorter verified proof trajectories
+
+The epoch trainer supports an optional terminal-only length penalty:
+
+```text
+--length-penalty 0.3
+```
+
+For a verified proof with `L` actions and a per-attempt action budget
+`B`, the **training** reward is `1 - 0.3 * L / B`.
+Unsuccessful attempts still receive **zero** reward. For a budget of 100,
+a five-action verified proof receives 0.985 and a 90-action proof
+receives 0.73. The formal checker remains the sole source of proof
+validity; there are no intermediate rewards, hand-written demonstrations,
+or changes to proof search. The action count is the **whole trajectory**
+including detours, resets, and failed checks, not the final certificate
+tree size.
+
+This scales each successful trajectory's on-policy REINFORCE log-probability
+contribution by its own reward. Shared observations are aggregated using
+reward-weighted counts, and the loss remains normalized by the number of
+attempts. Forced balanced first actions continue to contribute zero
+gradient. The coefficient must be finite and in `[0,1)`; default
+`--length-penalty 0` preserves the original reward and optimizer.
+The selected value is stored in `config.json`, and changing it on
+resume is refused to keep experiments comparable.
+
+To combine the previously measured faster CPU inference mode with a
+shorter-proof incentive, **start a new run**:
+
+```bash
+python -m proofgame.epoch_train \
+  --dataset runs/unfiltered_1000_100/dataset.json \
+  --out runs/ast_short_reward_cache \
+  --epochs 100 --attempts 100 --batch-size 8 --workers 8 \
+  --representation ast --device cpu --balanced-initial-answers \
+  --cpu-shared-action-cache --length-penalty 0.3 --profile
+```
+
+Training batch JSON and progress logs include
+`mean_verified_proof_actions` and `mean_verified_proof_reward`
+for verified training successes; evaluation coverage remains measured
+using the unchanged verifier. Compare this new run against a
+`--length-penalty 0` control with the same dataset, seed, and inference
+mode. Shorter proofs are encouraged, **not guaranteed**; coverage on
+harder machines could decrease if the coefficient is too strong.
+
+Tests:
+
+```bash
+python -m unittest discover -s tests -p 'test_short_proof_reward.py' -v
+python -m unittest discover -s tests -v
+```
+
 ## Experimental CPU inference optimizations (benchmark first)
 
 The CPU rollout path now offers two **opt-in**, mutually exclusive
