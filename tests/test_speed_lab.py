@@ -9,7 +9,8 @@ import torch
 from proofgame.benchmark_real_gradients import (
     attention_elements, gradient_trial, make_samples, probability_disagreement,
     select_machines)
-from proofgame.benchmark_rollout_matrix import build_cases
+from proofgame.benchmark_rollout_matrix import (
+    build_cases, run_case, task_for, worker_task_for)
 from proofgame.experimental_packed_batch import packed_score_many
 from proofgame.experimental_action_replay import (
     replay_unique_action_gradients, two_pass_probability_disagreement)
@@ -19,6 +20,7 @@ from proofgame.environment import Game
 from proofgame.model import Policy
 from proofgame.network_search import encode_json
 from proofgame.population_sample import from_rank
+from proofgame.unfiltered_dataset import build_dataset
 
 
 class SpeedLabTests(unittest.TestCase):
@@ -191,6 +193,43 @@ class SpeedLabTests(unittest.TestCase):
             packed_action_batch_size=2, max_attention_elements=1000000)
         self.assertEqual(checked, 2)
         self.assertLess(max_error, 1e-5)
+
+    def test_rollout_frozen_version_barrier_changes_without_trajectory_drift(self):
+        model, _ = self.example()
+        data = build_dataset(4, 1, 4, 23)
+        rows = data['train'][:4]
+        config = {
+            'seed': 23, 'benchmark_epoch': 1,
+            'attempts_per_machine': 2, 'budget': 4,
+            'train_exploration_epsilon': 0., 'group_relative': False,
+            'balanced_initial_answers': False, 'branch_rounds': 0,
+        }
+        sample = task_for(rows[0], config, 1, central=True, version=5)
+        self.assertEqual(sample[4], 5)
+        remote = worker_task_for(rows[0], config, 1, '/tmp/model.pt', version=7)
+        self.assertEqual(remote[5], 7)
+        case = {
+            'strategy': 'worker-shared', 'workers': 2, 'barrier': 2,
+            'inference_batch': None, 'wait_ms': None, 'repeat': 0,
+        }
+        with TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / 'weights.pt'
+            torch.save({'config': model.config, 'state_dict': model.state_dict()},
+                       checkpoint)
+            frozen = run_case(
+                case, config, rows, checkpoint,
+                simulate_update_barriers=False)
+            versioned = run_case(
+                case, config, rows, checkpoint,
+                simulate_update_barriers=True)
+        self.assertEqual(frozen['status'], 'ok')
+        self.assertEqual(versioned['status'], 'ok')
+        self.assertEqual(frozen['frozen_weight_versions'], 1)
+        self.assertEqual(versioned['frozen_weight_versions'], 2)
+        self.assertEqual(frozen['trajectory_hash_by_machine'],
+                         versioned['trajectory_hash_by_machine'])
+        self.assertEqual(frozen['actions'], versioned['actions'])
+        self.assertEqual(frozen['attempts'], versioned['attempts'])
 
     def test_rollout_matrix_cases_and_selection_are_deterministic(self):
         cases = build_cases(
