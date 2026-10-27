@@ -10,6 +10,8 @@ from proofgame.benchmark_real_gradients import (
     attention_elements, gradient_trial, make_samples, probability_disagreement,
     select_machines)
 from proofgame.benchmark_rollout_matrix import build_cases
+from proofgame.experimental_action_replay import (
+    replay_unique_action_gradients, two_pass_probability_disagreement)
 from proofgame.experimental_structural_cache import (
     StructuralPreprocessingCache, cached_structural_forward)
 from proofgame.environment import Game
@@ -102,6 +104,42 @@ class SpeedLabTests(unittest.TestCase):
         relative = float(torch.linalg.vector_norm(ref-other) /
                          torch.linalg.vector_norm(ref).clamp_min(1e-12))
         self.assertLess(relative, 1e-4)
+
+    def test_two_pass_global_action_cache_preserves_complete_gradients(self):
+        model, first = self.example()
+        game = Game(from_rank(8), budget=12)
+        game.step('choose:HALT', observe=False)
+        second = game.observation()
+        samples = []
+        for observation in (first, second):
+            with torch.inference_mode():
+                logits = model(observation)[0]
+                probs = logits.softmax(-1).tolist()
+            coefficients = [0.] * len(observation['actions'])
+            coefficients[0] = 1.5
+            coefficients[-1] = -0.4
+            groups = {encode_json(observation): (
+                coefficients, {0: probs[0], len(probs)-1: probs[-1]})}
+            samples += make_samples(groups, model, 0, 19)
+        reference, reference_stats = gradient_trial(
+            model, samples, mode='serial', batch_size=1, bucketed=False,
+            denominator=8, epsilon=0.)
+        two_pass, stats = replay_unique_action_gradients(
+            model, samples, context_batch_size=2, action_batch_size=4,
+            denominator=8, epsilon=0.)
+        relative = float(torch.linalg.vector_norm(reference-two_pass) /
+                         torch.linalg.vector_norm(reference).clamp_min(1e-12))
+        self.assertLess(relative, 1e-4)
+        self.assertAlmostEqual(reference_stats['loss'], stats['loss'], places=5)
+        self.assertGreater(stats['action_references'], stats['unique_actions'])
+        max_error, checked = two_pass_probability_disagreement(model, samples, 0.)
+        self.assertLess(max_error, 1e-4)
+        self.assertEqual(checked, 4)
+        with cached_structural_forward(model, relation_cache_mb=4):
+            cached, _ = replay_unique_action_gradients(
+                model, samples, context_batch_size=2, action_batch_size=4,
+                denominator=8, epsilon=0.)
+        torch.testing.assert_close(two_pass, cached, rtol=0, atol=0)
 
     def test_rollout_matrix_cases_and_selection_are_deterministic(self):
         cases = build_cases(
