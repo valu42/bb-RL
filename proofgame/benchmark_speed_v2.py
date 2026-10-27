@@ -181,6 +181,8 @@ def summarize_learning_trials(trials, *, warmups=(), min_steady_trials=3,
     })
     if not valid or not updated:
         reported['stability_status'] = 'numerical_or_optimizer_mismatch'
+    elif not warmups:
+        reported['stability_status'] = 'missing_explicit_warmup'
     elif len(trials) < min_steady_trials:
         reported['stability_status'] = 'too_few_timed_trials'
     elif cpu_spread > max_duration_spread or accelerated_spread > max_duration_spread:
