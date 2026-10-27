@@ -671,7 +671,7 @@ def count_proofs_by_answer(rows):
     }
 
 
-def summarize_first_proof_rounds(rows):
+def summarize_first_proof_rounds(rows, max_rounds=None):
     """Machine-level first verified proof, separated by answer and round.
 
     Unsolved machines are counted separately, never assigned a fictitious
@@ -692,6 +692,10 @@ def summarize_first_proof_rounds(rows):
             if answer not in hist or type(round_number) is not int or round_number < 1:
                 raise ValueError('invalid first proof round metadata')
             hist[answer][str(round_number)] += 1
+    if max_rounds is not None:
+        for round_number in range(1,max_rounds+1):
+            for answer in ('HALT','NONHALT'):
+                hist[answer].setdefault(str(round_number),0)
     return {'HALT':dict(sorted(hist['HALT'].items(),key=lambda kv:int(kv[0]))),
             'NONHALT':dict(sorted(hist['NONHALT'].items(),key=lambda kv:int(kv[0]))),
             'no_proof':unsolved,
@@ -1154,7 +1158,8 @@ def main():
                           'last_batch_groups_informative':update.get('groups_informative'),
                           'last_batch_groups_all_failed':update.get('groups_all_failed'),
                           'last_batch_mean_group_reward':update.get('mean_group_reward'),
-                          'last_batch_first_proof_round_by_answer':summarize_first_proof_rounds(results)
+                          'last_batch_first_proof_round_by_answer':summarize_first_proof_rounds(
+                              results,args.branch_rounds)
                           if args.branch_rounds and training else None,
                           'active_seconds':state['active_seconds']}
                 if central_inference:
@@ -1171,7 +1176,8 @@ def main():
             if training and args.branch_rounds:
                 metrics['first_proof_round_by_answer']=summarize_first_proof_rounds(
                     [row for p in batch_paths
-                     for row in json.loads(p.read_text())['machines']])
+                     for row in json.loads(p.read_text())['machines']],
+                    args.branch_rounds)
             metrics.update(epoch=epoch,phase=phase,policy_updates=state['updates'],active_seconds=state['active_seconds'])
             atomic_json(args.out/f'epoch_{epoch:02d}_{"training" if training else "evaluation"}.json',metrics)
             print(json.dumps({'event':'epoch_summary','phase':phase,'epoch':epoch,
@@ -1217,6 +1223,15 @@ def main():
                       f"P(NONHALT)={raw['NONHALT']:.3f}; "
                       f"sampling P(HALT)={behavior['HALT']:.3f}, "
                       f"P(NONHALT)={behavior['NONHALT']:.3f}",flush=True)
+            if training and args.branch_rounds:
+                round_hist=metrics['first_proof_round_by_answer']
+                round_lines=[
+                    f"round {n}: HALT={round_hist['HALT'][str(n)]}, "
+                    f"NONHALT={round_hist['NONHALT'][str(n)]}"
+                    for n in range(1,args.branch_rounds+1)]
+                print(f"First verified proof round — train epoch {epoch}: "
+                      + "; ".join(round_lines)
+                      + f"; no proof={round_hist['no_proof']}",flush=True)
             if not training:
                 print(evaluation_line(metrics),flush=True)
                 write_evaluation_csv(args.out)
