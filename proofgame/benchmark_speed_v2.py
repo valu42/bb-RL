@@ -146,6 +146,9 @@ def summarize_learning_trials(trials, *, warmups=(), min_steady_trials=3,
         'initial_accelerated_seconds': all_trials[0]['two_pass_seconds'],
         'warmup_trials': len(warmups),
         'timed_trials': len(trials),
+        'per_timed_trial_speedups': [
+            float(row['cpu_serial_seconds']) / float(row['two_pass_seconds'])
+            for row in trials],
         'all_updates_numerically_equivalent': valid,
         'all_updates_applied': updated,
         'speedup_vs_cpu_serial': None,
@@ -374,7 +377,9 @@ def benchmark(run, epoch, *, machines, source, workers, barrier, cache_mb,
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--run', type=Path, required=True)
+    p.add_argument('--inspect-existing', type=Path,
+                   help='inspect an already-saved v2 JSON without any new rollouts')
+    p.add_argument('--run', type=Path)
     p.add_argument('--epoch', type=int, default=2)
     p.add_argument('--machines', type=int, default=16)
     p.add_argument('--machine-source', choices=('saved-success',
@@ -395,8 +400,29 @@ def main():
     p.add_argument('--context-batch-size', type=int, default=8)
     p.add_argument('--seed', type=int, default=37)
     p.add_argument('--target-minutes', type=float, default=30.)
-    p.add_argument('--out', type=Path, required=True)
+    p.add_argument('--out', type=Path)
     args = p.parse_args()
+    if args.inspect_existing is not None:
+        try:
+            recorded = json.loads(args.inspect_existing.read_text())
+            warmups = recorded.get('learning_warmup_trials', [])
+            trials = recorded.get('learning_trials', [])
+            summary = summarize_learning_trials(trials, warmups=warmups)
+        except (OSError, ValueError, KeyError, ZeroDivisionError) as exc:
+            p.error(str(exc))
+        if summary is None:
+            p.error('existing report has no optimizer trials')
+        print(json.dumps({
+            'optimizer_reevaluation': summary,
+            'previous_epoch_projection': recorded.get('epoch_projection'),
+            'previous_projection_warning': (
+                'Historical projection was computed before startup/steady-state '
+                'separation; do not treat it as measured performance.'
+                if not warmups else None),
+        }, indent=2))
+        return
+    if args.run is None or args.out is None:
+        p.error('--run and --out are required unless --inspect-existing is used')
     try:
         results = benchmark(
             args.run, args.epoch, machines=args.machines,
