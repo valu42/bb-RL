@@ -1079,7 +1079,7 @@ def main():
                               0 if option in ('branch_rounds','cpu_topology_cache_mb') else
                               old.get('attempts_per_machine') if option=='eval_attempts_per_machine'
                               else None)
-            if old.get(option,legacy_default) != config.get(option):
+            if old.get(option,legacy_default) != config.get(option,legacy_default):
                 parser.error('resume configuration changed: '+option)
         changing_strategy = False
         for k in config:
