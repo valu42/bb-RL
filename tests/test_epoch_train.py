@@ -83,13 +83,13 @@ class EpochTests(unittest.TestCase):
              patch.object(et,'attempt',side_effect=fake_attempt) as run:
             sampler.return_value.misses=0
             sampler.return_value.hits=0
-            task=(selected,7,100,20,'unused',0,True,0.,False,False)
+            task=(selected,7,100,20,'unused',0,True,0.,False,False,False)
             training=et.run_machine(task)
             self.assertEqual(training['attempts'],1)
             self.assertEqual(len(training['successes']),1)
             self.assertEqual(run.call_count,1)
             run.reset_mock()
-            evaluation=et.run_machine((*task[:-4],False,0.,False,False))
+            evaluation=et.run_machine((*task[:-5],False,0.,False,False,False))
             self.assertEqual(evaluation['attempts'],100)
             self.assertEqual(len(evaluation['successes']),100)
             self.assertEqual(run.call_count,100)
