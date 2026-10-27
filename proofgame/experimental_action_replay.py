@@ -61,7 +61,7 @@ def _batch_indices(action_texts, representation, width, size, max_attention_elem
 def replay_unique_action_gradients(
         policy, samples, *, context_batch_size=4, action_batch_size=16,
         bucketed_contexts=True, denominator=1, epsilon=0.,
-        max_attention_elements=12000000):
+        max_attention_elements=12000000, defer_checks=False):
     """Return (full gradient vector, loss, timing/stats), WITHOUT optimizer.step.
 
     Each sample is {'observation': dict, 'counts': list[float], ...}. All
@@ -133,6 +133,7 @@ def replay_unique_action_gradients(
             position += 1
         context_chunks.append(ids)
     total_loss = 0.
+    deferred_losses = []
     t_context = time.perf_counter()
     for ids in context_chunks:
         batch = [samples[i] for i in ids]
@@ -150,10 +151,15 @@ def replay_unique_action_gradients(
             counts = torch.tensor(row['counts'], device=device, dtype=logps.dtype)
             losses.append(-(logps * counts).sum() / denominator)
         loss = torch.stack(losses).sum()
-        if not bool(torch.isfinite(loss)):
+        if defer_checks:
+            # Scalar loss values on MPS are synchronized only after the full
+            # gradient replay, instead of once per context microbatch.
+            deferred_losses.append(loss.detach())
+        elif not bool(torch.isfinite(loss)):
             raise RuntimeError('non-finite two-pass loss')
         loss.backward()
-        total_loss += float(loss.detach())
+        if not defer_checks:
+            total_loss += float(loss.detach())
     _sync(device)
     context_seconds = time.perf_counter() - t_context
     if keys.grad is None or biases.grad is None:
@@ -175,6 +181,11 @@ def replay_unique_action_gradients(
                  biases.grad.index_select(0, loc)))
     _sync(device)
     action_seconds = time.perf_counter() - t_action
+    if defer_checks:
+        aggregate = torch.stack(deferred_losses).sum()
+        if not bool(torch.isfinite(aggregate)):
+            raise RuntimeError('non-finite deferred two-pass loss')
+        total_loss = float(aggregate.detach())
 
     vector = torch.cat([
         p.grad.detach().cpu().reshape(-1).to(torch.float64)
