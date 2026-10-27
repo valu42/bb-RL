@@ -194,6 +194,42 @@ class SpeedLabTests(unittest.TestCase):
         self.assertEqual(checked, 2)
         self.assertLess(max_error, 1e-5)
 
+    def test_topology_cache_reuses_structure_with_changed_token_values(self):
+        model, first = self.example()
+        # Two distinct observations whose JSON numeric values differ, but
+        # whose AST parent/binder structure is identical.
+        second = {**first, 'actions_left': first['actions_left'] - 1}
+        first_context = encode_json({k: v for k, v in first.items()
+                                     if k != 'actions'})
+        second_context = encode_json({k: v for k, v in second.items()
+                                      if k != 'actions'})
+        self.assertNotEqual(first_context, second_context)
+        texts = [first_context, second_context]
+        model.zero_grad(set_to_none=True)
+        expected = model.encode(texts)
+        expected.sum().backward()
+        original = [p.grad.detach().clone() if p.grad is not None else None
+                    for p in model.parameters()]
+        state_keys = list(model.state_dict())
+        model.structural_encoder.enable_input_cache(
+            relation_cache_mb=1, position_cache_mb=1)
+        model.zero_grad(set_to_none=True)
+        actual = model.encode(texts)
+        actual.sum().backward()
+        torch.testing.assert_close(expected, actual, rtol=0, atol=0)
+        self.assertEqual(state_keys, list(model.state_dict()))
+        for prior, p in zip(original, model.parameters()):
+            if prior is not None:
+                torch.testing.assert_close(prior, p.grad, rtol=0, atol=0)
+        stats = model.structural_encoder._input_cache.stats()
+        self.assertTrue(stats['topology_keys'])
+        self.assertTrue(stats['compact_relations'])
+        self.assertEqual(stats['relation_entries'], 1)
+        self.assertGreaterEqual(stats['hits']['relation'], 1)
+        self.assertLessEqual(stats['relation_cache_bytes'], 1024**2)
+        model.structural_encoder.enable_input_cache(relation_cache_mb=0)
+        self.assertIsNone(model.structural_encoder._input_cache)
+
     def test_rollout_frozen_version_barrier_changes_without_trajectory_drift(self):
         model, _ = self.example()
         data = build_dataset(4, 1, 4, 23)
