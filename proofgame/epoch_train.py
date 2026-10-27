@@ -233,15 +233,31 @@ def run_machine(task):
     return result
 
 
+def verified_proof_reward(actions, budget, length_penalty=0.):
+    """Terminal reward only for independently verified successful trajectories."""
+    if not math.isfinite(length_penalty) or not 0. <= length_penalty < 1.:
+        raise ValueError('length penalty must be finite and in [0,1)')
+    if type(budget) is not int or budget < 1:
+        raise ValueError('proof action budget must be a positive integer')
+    if type(actions) is not int or not 1 <= actions <= budget:
+        raise ValueError('verified proof trajectory must fit within its action budget')
+    return 1. - length_penalty * (actions / budget)
+
+
 def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
-                exploration_epsilon=0., balanced_initial_answers=False):
+                exploration_epsilon=0., balanced_initial_answers=False,
+                length_penalty=0.):
     """Zero-reward episodes contribute zero; identical state gradients combine.
 
     Every success is on-policy under the same frozen batch weights. Grouping
     identical observations/actions is algebraically the same as summing their
     individual log-probability gradients, divided by all attempts in the batch.
     """
+    if not math.isfinite(length_penalty) or not 0. <= length_penalty < 1.:
+        raise ValueError('length penalty must be finite and in [0,1)')
     groups = {}; proof_count = 0; numerical_fallbacks = 0
+    reward_sum = 0.
+    successful_action_sum = 0
     for result in results:
         machine = Machine(result['machine']['rows'])
         for proof_number, success in enumerate(result['successes']):
@@ -250,6 +266,9 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
             use_for_learning = not balanced_initial_answers or proof_number == 0
             if use_for_learning:
                 proof_count += 1
+                reward = verified_proof_reward(len(success['actions']),budget,length_penalty)
+                reward_sum += reward
+                successful_action_sum += len(success['actions'])
             for step_number, step in enumerate(success['actions']):
                 obs = replay.observation(); encoded = encode_json(obs)
                 index = next(i for i,a in enumerate(obs['actions']) if a['id']==step['action'])
@@ -266,7 +285,7 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
                 if use_for_learning and forced is None:
                     if encoded not in groups:
                         groups[encoded] = ([0]*len(obs['actions']), {})
-                    counts, expected = groups[encoded]; counts[index] += 1
+                    counts, expected = groups[encoded]; counts[index] += reward
                     if index in expected and not math.isclose(expected[index],step['probability'],rel_tol=1e-5,abs_tol=1e-7):
                         raise RuntimeError('inconsistent sampled probabilities')
                     expected[index] = step['probability']
@@ -274,7 +293,12 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
             if replay.status != 'SOLVED' or json.loads(json.dumps(replay.certificate())) != json.loads(json.dumps(success['certificate'])):
                 raise ValueError('incomplete or mismatched training proof')
     if not proof_count:
-        return {'updated':False, 'proofs':0, 'unique_gradient_observations':0, 'loss':0.}
+        return {'updated':False, 'proofs':0, 'unique_gradient_observations':0, 'loss':0.,
+                'mean_verified_proof_reward':None,'mean_verified_proof_actions':None,
+                'length_penalty':length_penalty}
+    reward_metrics = {'mean_verified_proof_reward':reward_sum/proof_count,
+                      'mean_verified_proof_actions':successful_action_sum/proof_count,
+                      'length_penalty':length_penalty}
     optimizer.zero_grad(set_to_none=True)
     denominator = sum(r['attempts'] for r in results); total_loss = 0.
     device = next(policy.parameters()).device
@@ -327,7 +351,8 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
         optimizer.zero_grad(set_to_none=True)
         return {'updated':False, 'proofs':proof_count,
                 'unique_gradient_observations':len(groups),
-                'loss':total_loss, 'rejected_update':'nonfinite_gradient_norm'}
+                'loss':total_loss, 'rejected_update':'nonfinite_gradient_norm',
+                **reward_metrics}
     if not policy_is_finite(policy):
         raise RuntimeError('non-finite policy parameters before optimizer step')
     old_weights=[p.detach().clone() for p in policy.parameters()]
@@ -378,10 +403,12 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
                 'numerical_health':{'weights_finite':weights_ok,
                                     'optimizer_finite':optimizer_ok,
                                     'probe_logits_finite':logits_ok,
-                                    'probe_grad_mode_logits_finite':grad_mode_logits_ok}}
+                                    'probe_grad_mode_logits_finite':grad_mode_logits_ok},
+                **reward_metrics}
     return {'updated':True, 'proofs':proof_count, 'unique_gradient_observations':len(groups),
             'loss':total_loss, 'gradient_norm':float(norm),
-            'inference_gradient_probability_differences':numerical_fallbacks}
+            'inference_gradient_probability_differences':numerical_fallbacks,
+            **reward_metrics}
 
 
 def count_proofs_by_answer(rows):
@@ -495,6 +522,8 @@ def main():
     parser.add_argument('--workers',type=int,default=8)
     parser.add_argument('--seed',type=int,default=7)
     parser.add_argument('--lr',type=float,default=3e-4)
+    parser.add_argument('--length-penalty',type=float,default=0.,
+                        help='verified reward = 1 - penalty * actions / budget; default 0')
     parser.add_argument('--balanced-initial-answers',action='store_true',
                         help='alternate balanced HALT/NONHALT first attempts (50/50 over 100 max), stopping immediately after the first verified proof')
     parser.add_argument('--train-exploration-epsilon',type=float,default=0.2,
@@ -522,6 +551,8 @@ def main():
            args.gpu_inference_batch_size,args.gpu_max_attention_elements,
            args.gpu_gradient_batch_size)<1:
         parser.error('positive counts required')
+    if not math.isfinite(args.length_penalty) or not 0. <= args.length_penalty < 1.:
+        parser.error('--length-penalty must be finite and in [0,1)')
     if args.balanced_initial_answers:
         if args.attempts % 2:
             parser.error('--balanced-initial-answers requires an even --attempts')
@@ -596,6 +627,7 @@ def main():
             'parameters':sum(p.numel() for p in policy.parameters()),'epochs_requested':args.epochs,
             'algorithm':'on-policy REINFORCE batches; zero baseline; mean gradient over all attempts',
             'train_exploration_epsilon':args.train_exploration_epsilon,
+            'length_penalty':args.length_penalty,
             'balanced_initial_answers':args.balanced_initial_answers,
             'attempts_after_success':('training: stop after first verified proof; evaluation: full attempt budget'
                                        if args.stop_after_first_train_proof else 'continue to exact attempt budget'),
@@ -628,7 +660,7 @@ def main():
         for k in config:
             if k!='epochs_requested' and config[k]!=old.get(
                     k,False if k=='balanced_initial_answers' else
-                    (0. if k=='train_exploration_epsilon' else None)):
+                    (0. if k in ('train_exploration_epsilon','length_penalty') else None)):
                 if (k=='attempts_after_success' and args.stop_after_first_train_proof
                         and old[k]=='continue to exact attempt budget'):
                     changing_strategy = True
@@ -729,7 +761,8 @@ def main():
                 update=learn_batch(policy,optimizer,results,dataset['action_budget'],
                                    gpu_gradient_batch_size=args.gpu_gradient_batch_size,
                                    exploration_epsilon=args.train_exploration_epsilon,
-                                   balanced_initial_answers=args.balanced_initial_answers) if training else {'updated':False}
+                                   balanced_initial_answers=args.balanced_initial_answers,
+                                   length_penalty=args.length_penalty) if training else {'updated':False}
                 if args.profile:
                     profile_stages['learn']=time.perf_counter()-profile_t
                     profile_t=time.perf_counter()
@@ -788,6 +821,9 @@ def main():
                           'last_batch_mean_initial_behavior_probability':batch_choices['mean_initial_behavior_probability'],
                           'last_batch_machines_proved_by_answer':batch_outcomes['machines_proved_by_answer'],
                           'last_batch_successful_attempts_by_answer':batch_outcomes['successful_attempts_by_answer'],
+                          'last_batch_mean_verified_proof_reward':update.get('mean_verified_proof_reward'),
+                          'last_batch_mean_verified_proof_actions':update.get('mean_verified_proof_actions'),
+                          'length_penalty':args.length_penalty,
                           'active_seconds':state['active_seconds']}
                 if central_inference:
                     progress['gpu_inference' if args.device=='mps' else 'cpu_inference'] = pool.inference.stats()
