@@ -82,6 +82,72 @@ These example numbers are illustrative. The trace probabilities are
 action-selection probabilities, **not** probabilities that a proof claim is
 mathematically true. No new CLI flag is required.
 
+## Branch-race group-relative training: up to 48 attempts per answer
+
+The optional `--branch-rounds 6` mode addresses sparse HALT discoveries
+in the eight-attempt group-relative experiment. On **each machine**:
+
+1. In each round, sample **8 HALT-directed** and **8 NONHALT-directed**
+   attempts, interleaved in a seeded shuffled order (no fixed HALT-first
+   bias). Each initial answer is forced, so it receives no gradient.
+2. Complete both groups of eight for that round. If either branch has a
+   **kernel-verified** proof, stop after that round. If neither does,
+   try the next round, for up to six rounds (48 attempts per branch).
+3. Choose the branch whose verified proof was **first encountered in the
+   shuffled round**, and train with leave-one-out relative advantages
+   across its eight attempts only. Earlier unsuccessful rounds and the
+   other branch are used for exploration but **not** in the gradient.
+   If neither branch proves anything after six rounds, no update is made.
+   If the verifier accepts both HALT and NONHALT for the same machine,
+   abort with an error rather than silently training on a contradiction.
+
+This keeps the 0.3 length penalty, shared-action-cache CPU inference,
+unchanged proof checker, and full 100-attempt held-out evaluation.
+The new mode does **not** directly train the initial HALT/NONHALT choice:
+both branches are forced during exploration. It does not guarantee
+balanced *learning signals*; easier-to-prove branches can still win
+more often. Compare HALT/NONHALT coverage and per-round histograms.
+
+Start a **new run** with the original 1,000/100 dataset:
+
+```bash
+python -m proofgame.epoch_train \
+  --dataset runs/unfiltered_1000_100/dataset.json \
+  --out runs/ast_branch_race_8x6 \
+  --epochs 100 --attempts 8 --branch-rounds 6 --eval-attempts 100 \
+  --batch-size 8 --workers 8 \
+  --representation ast --device cpu \
+  --balanced-initial-answers --group-relative \
+  --cpu-shared-action-cache --length-penalty 0.3 --profile
+```
+
+Each training batch emits `last_batch_first_proof_round_by_answer`.
+Each completed training epoch saves
+`first_proof_round_by_answer` in `epoch_XX_training.json`:
+
+```json
+{
+  "HALT": {"1": 3, "4": 2},
+  "NONHALT": {"1": 6, "2": 1},
+  "no_proof": 5,
+  "attempts_by_branch": {"HALT": 96, "NONHALT": 96}
+}
+```
+
+The numbers above are illustrative, not measured results. A machine is
+counted **once**, in the round and answer of its *first* verified proof.
+Unsolved machines appear only in `no_proof`. The per-machine batch JSON
+also stores `first_proof_round`, `first_proof_answer`,
+`rounds_completed`, and `attempts_by_branch`. Full unsuccessful
+trajectories are discarded after gradient replay.
+
+Run the focused regression tests before launching a long experiment:
+
+```bash
+python -m unittest discover -s tests -p 'test_branch_rounds.py' -v
+python -m unittest discover -s tests -v
+```
+
 ## Eight-attempt group-relative learning across 12,500 machines
 
 This is an **opt-in experimental learning algorithm**. Each machine gets a
