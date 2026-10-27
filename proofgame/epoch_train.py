@@ -131,12 +131,17 @@ def init_worker(model_config, share_action_cache=False):
 
 def execute_machine(selected, seed, attempts, budget, version, stop_on_success, sampler,
                     exploration_epsilon=0., balanced_initial_answers=False,
-                    trace_diagnostics=False, profile_enabled=False, group_relative=False):
+                    trace_diagnostics=False, profile_enabled=False, group_relative=False,
+                    branch_rounds=0):
     """Execute a machine with either a CPU policy or the central GPU sampler."""
     machine = Machine(selected['machine']['rows']); rng = random.Random(seed)
     successes = []; statuses = Counter(); actions = 0; start = time.monotonic()
     group_trajectories = [] if group_relative else None
-    if balanced_initial_answers and attempts % 2:
+    if branch_rounds and (not group_relative or not balanced_initial_answers):
+        raise ValueError('branch rounds require group-relative balanced training')
+    if branch_rounds and (type(branch_rounds) is not int or branch_rounds < 1):
+        raise ValueError('invalid branch round count')
+    if balanced_initial_answers and not branch_rounds and attempts % 2:
         raise ValueError('balanced initial answers require an even number of attempts')
     # Balanced training is an upper bound of 50/50 attempts, not a requirement
     # to keep trying after either branch has produced a verified certificate.
@@ -144,10 +149,25 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
         stop_on_success = True
     if group_relative and stop_on_success:
         raise ValueError('group-relative rollouts must collect all attempts')
-    schedule = (['HALT'] * (attempts//2) + ['NONHALT'] * (attempts//2)
-                if balanced_initial_answers else [None] * attempts)
-    if balanced_initial_answers:
-        random.Random(seed ^ 0xA5A5F00D).shuffle(schedule)
+    # In branch-race mode, attempts is the group size PER branch, PER round.
+    # Interleave branches in seeded random order to avoid an order bias.
+    schedule = []
+    if branch_rounds:
+        order_rng = random.Random(seed ^ 0xA5A5F00D)
+        for round_number in range(1,branch_rounds+1):
+            round_answers = ['HALT']*attempts + ['NONHALT']*attempts
+            order_rng.shuffle(round_answers)
+            schedule.extend((round_number,answer) for answer in round_answers)
+    else:
+        answers = (['HALT'] * (attempts//2) + ['NONHALT'] * (attempts//2)
+                   if balanced_initial_answers else [None] * attempts)
+        if balanced_initial_answers:
+            random.Random(seed ^ 0xA5A5F00D).shuffle(answers)
+        schedule = [(None,answer) for answer in answers]
+    first_proof_round = None
+    first_proof_answer = None
+    rounds_completed = 0
+    round_groups = {'HALT':[],'NONHALT':[]}
     first_success_trace = None
     last_failed_trace = None
     profile = ({'observation_seconds':0.,'inference_seconds':0.,
@@ -164,18 +184,21 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
             for answer in ('HALT','NONHALT'):
                 policy_sums[answer]+=raw[answer]
                 behavior_sums[answer]+=mixed[answer]
-    for i in range(attempts):
+    for i,(round_number,answer) in enumerate(schedule):
         detail = [] if trace_diagnostics else None
         cert, trace, status = attempt(sampler, machine, rng, budget,
                                       exploration_epsilon=exploration_epsilon,
                                       on_initial_choice=record_initial,
-                                      forced_initial_answer=schedule[i],
+                                      forced_initial_answer=answer,
                                       diagnostic_steps=detail, profile=profile)
         actions += len(trace); statuses[status] += 1
         if group_relative:
-            group_trajectories.append({'attempt':i+1,'actions':trace,
-                                       'status':status,
-                                       'certificate':cert})
+            trajectory = {'attempt':i+1,'actions':trace,
+                          'status':status,'certificate':cert}
+            if branch_rounds:
+                round_groups[answer].append(trajectory)
+            else:
+                group_trajectories.append(trajectory)
         if trace_diagnostics:
             sample = {'attempt':i+1, 'status':status, 'steps':detail,
                       'certificate':cert if cert else None}
@@ -194,8 +217,29 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
                     last_failed_trace=sample
         if cert:
             successes.append({'attempt':i+1, 'actions':trace, 'certificate':cert})
+            if branch_rounds:
+                if cert['answer'] != answer:
+                    raise RuntimeError('verified proof contradicts forced initial answer')
+                if first_proof_round is None:
+                    first_proof_round = round_number
+                    first_proof_answer = answer
+                elif first_proof_round == round_number and first_proof_answer != answer:
+                    raise RuntimeError('both HALT and NONHALT proved for the same machine')
             if stop_on_success:
                 break
+        if branch_rounds and (i+1) % (2*attempts) == 0:
+            rounds_completed = round_number
+            if first_proof_round is not None:
+                winning = round_groups[first_proof_answer]
+                if len(winning) != attempts:
+                    raise RuntimeError('winning branch group was not completed')
+                # Local indices are contiguous; global attempt indices remain
+                # in successes for first-proof diagnostics.
+                group_trajectories = [
+                    {**trajectory,'attempt':j+1}
+                    for j,trajectory in enumerate(winning)]
+                break
+            round_groups = {'HALT':[],'NONHALT':[]}
     return {**selected, 'action_seed':seed, 'policy_version':version,
             'attempts':sum(statuses.values()), 'actions':actions, 'statuses':dict(statuses),
             'successes':successes, 'seconds':time.monotonic()-start,
@@ -205,8 +249,16 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
             'initial_policy_probability_sums':policy_sums,
             'initial_behavior_probability_sums':behavior_sums,
             'scheduled_initial_answer_counts':dict(Counter(
-                f'choose:{answer}' for answer in schedule[:sum(statuses.values())]
+                f'choose:{answer}' for _,answer in schedule[:sum(statuses.values())]
                 if answer is not None)),
+            **({'first_proof_round':first_proof_round,
+                'first_proof_answer':first_proof_answer,
+                'rounds_completed':rounds_completed,
+                'attempts_by_branch':{
+                    'HALT':sum(answer=='HALT' for _,answer in schedule[:sum(statuses.values())]),
+                    'NONHALT':sum(answer=='NONHALT' for _,answer in schedule[:sum(statuses.values())])},
+                'winning_group_attempts':len(group_trajectories)}
+               if branch_rounds else {}),
             **({'diagnostic_traces':{'success':first_success_trace,
                                     'failure':last_failed_trace}}
                if trace_diagnostics else {}),
@@ -216,9 +268,9 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
 
 def run_machine(task):
     global _worker_policy_version, _worker_action_features
-    if len(task) == 11:
-        task = (*task, False)  # Existing direct-worker callers.
-    selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon, balanced, diagnostics, profiling, group_relative = task
+    if len(task) < 13:
+        task = (*task,)+(False,)*(13-len(task))
+    selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon, balanced, diagnostics, profiling, group_relative, branch_rounds = task
     if profiling:
         started = time.perf_counter()
     saved = torch.load(weights_file, map_location='cpu', weights_only=True)
@@ -235,7 +287,8 @@ def run_machine(task):
     if profiling:
         load_seconds = time.perf_counter() - started
     result = execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler,
-                             epsilon,balanced,diagnostics,profiling,group_relative)
+                             epsilon,balanced,diagnostics,profiling,group_relative,
+                             branch_rounds)
     if profiling:
         result['profile']['worker_model_load_seconds'] = load_seconds
         result['profile']['cache_hits'] = sampler.hits
@@ -257,7 +310,7 @@ def verified_proof_reward(actions, budget, length_penalty=0.):
 
 
 def prepare_group_relative_gradients(results, budget, length_penalty=0.,
-                                     balanced_initial_answers=False):
+                                     balanced_initial_answers=False, branch_rounds=0):
     """Leave-one-out REINFORCE advantages within each machine's full group.
 
     No PPO clipping, extra optimization epochs, value network, or proof labels.
@@ -277,15 +330,27 @@ def prepare_group_relative_gradients(results, budget, length_penalty=0.,
     attempts_total = 0
     for result in results:
         trajectories = result.get('group_trajectories')
-        size = result['attempts']
-        if size < 2 or trajectories is None or len(trajectories) != size:
-            raise ValueError('group-relative learning requires every attempt in a group')
+        if branch_rounds and result.get('first_proof_round') is None:
+            if trajectories or result['successes']:
+                raise ValueError('unsolved branch race cannot have a winning group')
+            all_failed += 1
+            continue
+        size = len(trajectories) if trajectories is not None else 0
+        if size < 2 or (not branch_rounds and size != result['attempts']):
+            raise ValueError('group-relative learning requires a complete attempt group')
         attempts_total += size
         if balanced_initial_answers:
             first = Counter(
                 t['actions'][0].get('forced_initial_answer')
                 if t['actions'] else None for t in trajectories)
-            if size % 2 or first != {'HALT':size//2,'NONHALT':size//2}:
+            if branch_rounds:
+                winner = result.get('first_proof_answer')
+                if first != {winner:size} or result['attempts'] != (
+                        2*size*result['rounds_completed']):
+                    raise ValueError('winning group or round accounting is inconsistent')
+                if result['first_proof_round'] != result['rounds_completed']:
+                    raise ValueError('winning proof must occur in the final sampled round')
+            elif size % 2 or first != {'HALT':size//2,'NONHALT':size//2}:
                 raise ValueError('group must contain exactly balanced forced initial answers')
         rewards = []
         for i, trajectory in enumerate(trajectories):
@@ -308,7 +373,12 @@ def prepare_group_relative_gradients(results, budget, length_penalty=0.,
                     raise ValueError('solved attempt has no verified certificate')
                 reward = 0.
             rewards.append(reward)
-        if len([t for t in trajectories if t['certificate']]) != len(result['successes']):
+        if branch_rounds:
+            selected_successes = [t for t in result['successes']
+                                  if t['certificate']['answer']==result['first_proof_answer']]
+            if len([t for t in trajectories if t['certificate']]) != len(selected_successes):
+                raise ValueError('winning branch proof count mismatch')
+        elif len([t for t in trajectories if t['certificate']]) != len(result['successes']):
             raise ValueError('group proof count does not match verified successes')
         if not any(rewards):
             all_failed += 1
@@ -371,6 +441,8 @@ def prepare_group_relative_gradients(results, budget, length_penalty=0.,
         'groups_all_successful':all_successful,
         'groups_uniform_reward':len(results)-informative,
         'group_attempts':attempts_total,
+        'branch_rounds':branch_rounds,
+        'exploration_attempts':sum(r['attempts'] for r in results),
         'group_positive_advantage_attempts':positive,
         'group_negative_advantage_attempts':negative,
         'mean_absolute_group_advantage':(
@@ -385,7 +457,7 @@ def prepare_group_relative_gradients(results, budget, length_penalty=0.,
 
 def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
                 exploration_epsilon=0., balanced_initial_answers=False,
-                length_penalty=0., group_relative=False):
+                length_penalty=0., group_relative=False, branch_rounds=0):
     """On-policy REINFORCE with optional leave-one-out group advantages.
 
     In standard mode only verified successes contribute positive terminal
@@ -402,7 +474,7 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
     group_metrics = {}
     if group_relative:
         groups,proof_count,group_metrics = prepare_group_relative_gradients(
-            results,budget,length_penalty,balanced_initial_answers)
+            results,budget,length_penalty,balanced_initial_answers,branch_rounds)
     else:
         for result in results:
             machine = Machine(result['machine']['rows'])
@@ -451,7 +523,11 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
                        'mean_verified_proof_actions':successful_action_sum/proof_count,
                        'length_penalty':length_penalty})
     optimizer.zero_grad(set_to_none=True)
-    denominator = sum(r['attempts'] for r in results); total_loss = 0.
+    # Only the selected winning groups contribute gradients. Unsuccessful
+    # exploratory rounds do not dilute the policy-gradient normalization.
+    denominator = (group_metrics['group_attempts'] if branch_rounds else
+                   sum(r['attempts'] for r in results))
+    total_loss = 0.
     device = next(policy.parameters()).device
     is_mps = device.type == 'mps'
     observations = list(groups.items())
@@ -595,6 +671,37 @@ def count_proofs_by_answer(rows):
     }
 
 
+def summarize_first_proof_rounds(rows, max_rounds=None):
+    """Machine-level first verified proof, separated by answer and round.
+
+    Unsolved machines are counted separately, never assigned a fictitious
+    seventh round. Counts reflect the FIRST success, not later successes
+    from the same winning round.
+    """
+    hist = {'HALT':Counter(),'NONHALT':Counter()}
+    unsolved = 0
+    attempts = {'HALT':0,'NONHALT':0}
+    for row in rows:
+        for answer in ('HALT','NONHALT'):
+            attempts[answer] += row.get('attempts_by_branch',{}).get(answer,0)
+        round_number = row.get('first_proof_round')
+        answer = row.get('first_proof_answer')
+        if round_number is None:
+            unsolved += 1
+        else:
+            if answer not in hist or type(round_number) is not int or round_number < 1:
+                raise ValueError('invalid first proof round metadata')
+            hist[answer][str(round_number)] += 1
+    if max_rounds is not None:
+        for round_number in range(1,max_rounds+1):
+            for answer in ('HALT','NONHALT'):
+                hist[answer].setdefault(str(round_number),0)
+    return {'HALT':dict(sorted(hist['HALT'].items(),key=lambda kv:int(kv[0]))),
+            'NONHALT':dict(sorted(hist['NONHALT'].items(),key=lambda kv:int(kv[0]))),
+            'no_proof':unsolved,
+            'attempts_by_branch':attempts}
+
+
 def summarize_group_updates(paths):
     """Aggregate small saved batch updates, not discarded failure trajectories."""
     totals = Counter()
@@ -689,6 +796,8 @@ def main():
                         help='held-out and special-benchmark attempts per machine; default --attempts')
     parser.add_argument('--group-relative',action='store_true',
                         help='use full per-machine attempt groups with leave-one-out advantages')
+    parser.add_argument('--branch-rounds',type=int,default=0,
+                        help='sample --attempts per branch per round, stop after first proof round')
     parser.add_argument('--batch-size',type=int,default=8)
     parser.add_argument('--workers',type=int,default=8)
     parser.add_argument('--seed',type=int,default=7)
@@ -733,6 +842,10 @@ def main():
         if args.train_exploration_epsilon != 0.2:
             parser.error('balanced initial answers replaces epsilon exploration; omit --train-exploration-epsilon')
         args.train_exploration_epsilon=0.
+    if args.branch_rounds < 0:
+        parser.error('--branch-rounds must be nonnegative')
+    if args.branch_rounds and (not args.group_relative or not args.balanced_initial_answers):
+        parser.error('--branch-rounds requires --group-relative and --balanced-initial-answers')
     if args.group_relative:
         if args.attempts < 2:
             parser.error('--group-relative requires at least 2 attempts per machine')
@@ -816,6 +929,7 @@ def main():
             'attempts_per_machine':args.attempts,'budget':dataset['action_budget'],
             'eval_attempts_per_machine':args.eval_attempts,
             'group_relative':args.group_relative,
+            'branch_rounds':args.branch_rounds,
             'batch_size':args.batch_size,'seed':args.seed,'lr':args.lr,'model':policy.config,
             'parameters':sum(p.numel() for p in policy.parameters()),'epochs_requested':args.epochs,
             'algorithm':('leave-one-out group-relative on-policy REINFORCE'
@@ -825,6 +939,8 @@ def main():
             'length_penalty':args.length_penalty,
             'balanced_initial_answers':args.balanced_initial_answers,
             'attempts_after_success':(
+                'training: complete first successful branch round, then stop; evaluation: full attempt budget'
+                if args.branch_rounds else
                 'training: all group attempts, including after success; evaluation: full attempt budget'
                 if args.group_relative else
                 ('training: stop after first verified proof; evaluation: full attempt budget'
@@ -852,8 +968,9 @@ def main():
         # Check both directions: switching an optimized run back to baseline
         # must not silently change its inference strategy on resume.
         for option in ('cpu_inference','cpu_central_batching','group_relative',
-                       'eval_attempts_per_machine'):
+                       'eval_attempts_per_machine','branch_rounds'):
             legacy_default = (False if option=='group_relative' else
+                              0 if option=='branch_rounds' else
                               old.get('attempts_per_machine') if option=='eval_attempts_per_machine'
                               else None)
             if old.get(option,legacy_default) != config.get(option):
@@ -946,7 +1063,8 @@ def main():
                             args.train_exploration_epsilon if training else 0.,
                             training and args.balanced_initial_answers,
                             inspect_batch,args.profile,
-                            training and args.group_relative) for r in batch]
+                            training and args.group_relative,
+                            args.branch_rounds if training else 0) for r in batch]
                     results=pool.run(tasks)
                 else:
                     atomic_torch(weights_file,{'version':state['updates'],'config':policy.config,
@@ -961,7 +1079,8 @@ def main():
                             args.train_exploration_epsilon if training else 0.,
                             training and args.balanced_initial_answers,
                             inspect_batch,args.profile,
-                            training and args.group_relative) for r in batch]
+                            training and args.group_relative,
+                            args.branch_rounds if training else 0) for r in batch]
                     results=pool.map(run_machine,tasks,chunksize=1)
                 if args.profile:
                     profile_stages['rollout']=time.perf_counter()-profile_t
@@ -972,7 +1091,8 @@ def main():
                                    exploration_epsilon=args.train_exploration_epsilon,
                                    balanced_initial_answers=args.balanced_initial_answers,
                                    length_penalty=args.length_penalty,
-                                   group_relative=args.group_relative) if training else {'updated':False}
+                                   group_relative=args.group_relative,
+                                   branch_rounds=args.branch_rounds) if training else {'updated':False}
                 if args.profile:
                     profile_stages['learn']=time.perf_counter()-profile_t
                     profile_t=time.perf_counter()
@@ -1039,6 +1159,9 @@ def main():
                           'last_batch_groups_informative':update.get('groups_informative'),
                           'last_batch_groups_all_failed':update.get('groups_all_failed'),
                           'last_batch_mean_group_reward':update.get('mean_group_reward'),
+                          'last_batch_first_proof_round_by_answer':summarize_first_proof_rounds(
+                              results,args.branch_rounds)
+                          if args.branch_rounds and training else None,
                           'active_seconds':state['active_seconds']}
                 if central_inference:
                     progress['gpu_inference' if args.device=='mps' else 'cpu_inference'] = pool.inference.stats()
@@ -1051,6 +1174,11 @@ def main():
             metrics=summarize(batch_paths)
             if training and args.group_relative:
                 metrics['group_relative_stats']=summarize_group_updates(batch_paths)
+            if training and args.branch_rounds:
+                metrics['first_proof_round_by_answer']=summarize_first_proof_rounds(
+                    [row for p in batch_paths
+                     for row in json.loads(p.read_text())['machines']],
+                    args.branch_rounds)
             metrics.update(epoch=epoch,phase=phase,policy_updates=state['updates'],active_seconds=state['active_seconds'])
             atomic_json(args.out/f'epoch_{epoch:02d}_{"training" if training else "evaluation"}.json',metrics)
             print(json.dumps({'event':'epoch_summary','phase':phase,'epoch':epoch,
@@ -1072,7 +1200,9 @@ def main():
                               'train_exploration_epsilon':args.train_exploration_epsilon if training else 0.,
                               'policy_updates':metrics['policy_updates'],
                               **({'group_relative_stats':metrics['group_relative_stats']}
-                                 if training and args.group_relative else {})}),
+                                 if training and args.group_relative else {}),
+                              **({'first_proof_round_by_answer':metrics['first_proof_round_by_answer']}
+                                 if training and args.branch_rounds else {})}),
                   flush=True)
             counts=metrics['first_action_counts']
             raw=metrics['mean_initial_policy_probability']
@@ -1094,6 +1224,15 @@ def main():
                       f"P(NONHALT)={raw['NONHALT']:.3f}; "
                       f"sampling P(HALT)={behavior['HALT']:.3f}, "
                       f"P(NONHALT)={behavior['NONHALT']:.3f}",flush=True)
+            if training and args.branch_rounds:
+                round_hist=metrics['first_proof_round_by_answer']
+                round_lines=[
+                    f"round {n}: HALT={round_hist['HALT'][str(n)]}, "
+                    f"NONHALT={round_hist['NONHALT'][str(n)]}"
+                    for n in range(1,args.branch_rounds+1)]
+                print(f"First verified proof round — train epoch {epoch}: "
+                      + "; ".join(round_lines)
+                      + f"; no proof={round_hist['no_proof']}",flush=True)
             if not training:
                 print(evaluation_line(metrics),flush=True)
                 write_evaluation_csv(args.out)
