@@ -786,19 +786,21 @@ def main():
         sampling = dataset.get('sampling')
         if (type(seed) is not int or dataset.get('population')!=POPULATION or
                 sampling not in ('uniform_without_replacement_over_all_labelled_two_state_machines',
-                                 'uniform_without_replacement_excluding_fixed_test')):
+                                 'uniform_without_replacement_excluding_fixed_test_and_benchmarks')):
             parser.error('invalid unfiltered sampling metadata')
         fixed = dataset.get('fixed_test_ranks')
-        if sampling == 'uniform_without_replacement_excluding_fixed_test':
+        if sampling == 'uniform_without_replacement_excluding_fixed_test_and_benchmarks':
             if not isinstance(fixed,list):
                 parser.error('missing fixed held-out machine ranks')
-        elif fixed is not None:
-            parser.error('unexpected fixed held-out machine ranks')
+        elif fixed is not None or 'excluded_benchmark_ranks' in dataset:
+            parser.error('unexpected fixed held-out/benchmark ranks')
         try:
             expected=build_dataset(len(dataset['train']),len(dataset['test']),
                                    dataset['action_budget'],seed,fixed_test_ranks=fixed)
         except ValueError as exc:
             parser.error(str(exc))
+        if dataset.get('excluded_benchmark_ranks') != expected.get('excluded_benchmark_ranks'):
+            parser.error('benchmark exclusion metadata does not match expected ranks')
         for split in ('train','test'):
             if [row['rank'] for row in dataset[split]] != [row['rank'] for row in expected[split]]:
                 parser.error('unfiltered dataset ranks do not match the claimed seed')
