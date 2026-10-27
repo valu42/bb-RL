@@ -1,9 +1,9 @@
-"""Experimental, read-only structural encoding caches for speed benchmarks.
+"""Input-only structural encoding caches, optionally used in CPU rollout.
 
-Do not use this for training until benchmarked and checked for gradient parity.
-The caches contain only input-dependent integer relations and deterministic
-sinusoidal positions; no learnable parameter/output is cached. They are strictly
-size-bounded to avoid hiding an unbounded-memory speed regression.
+The topology cache key is derived from parent/binder links, NOT observation
+values. Numeric budget changes and other lexical edits can therefore reuse
+the same structural relations. No learned masks, neural features, logits, or
+optimizer-dependent tensors are cached. Cache bytes are explicitly bounded.
 """
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -16,9 +16,12 @@ from .structural_encoding import OTHER, cached_tree, relation_ids
 
 
 class StructuralPreprocessingCache:
-    def __init__(self, relation_cache_mb=128, position_cache_mb=8):
+    def __init__(self, relation_cache_mb=128, position_cache_mb=8,
+                 topology_keys=False, compact_relations=False):
         if relation_cache_mb < 0 or position_cache_mb < 0:
             raise ValueError('cache sizes must be nonnegative')
+        self.topology_keys = topology_keys
+        self.compact_relations = compact_relations
         self.relation_limit = int(relation_cache_mb * 1024 * 1024)
         self.position_limit = int(position_cache_mb * 1024 * 1024)
         self.relations = OrderedDict()
@@ -58,10 +61,17 @@ class StructuralPreprocessingCache:
             self.position_bytes = current
 
     def relation(self, serialized, parents, bindings):
-        value = self._get(self.relations, serialized, 'relation')
+        # Structural relation IDs depend only on tree edges and binder links,
+        # not on lexical tokens, numeric values, or model weights.
+        key = (parents, bindings) if self.topology_keys else serialized
+        value = self._get(self.relations, key, 'relation')
         if value is None:
             value = relation_ids(parents, bindings)
-            self._insert(self.relations, serialized, value, 'relation',
+            if self.compact_relations:
+                # All relation IDs fit in one byte; convert back to int64
+                # before nn.Embedding. Saves up to 8x cache storage.
+                value = value.to(dtype=torch.uint8)
+            self._insert(self.relations, key, value, 'relation',
                          self.relation_limit)
         return value
 
@@ -101,7 +111,8 @@ class StructuralPreprocessingCache:
             tokens, parents, bindings = tree
             n = len(tokens)
             ids[i, :n] = torch.tensor(tokens, dtype=torch.long, device=device)
-            relations[i, :n, :n] = self.relation(text, parents, bindings).to(device)
+            relations[i, :n, :n] = self.relation(text, parents, bindings).to(
+                device=device, dtype=torch.long)
         self.timings['tensor_setup_seconds'] += time.perf_counter() - started
 
         started = time.perf_counter()
@@ -120,6 +131,8 @@ class StructuralPreprocessingCache:
     def stats(self):
         return {
             'relation_cache_bytes': self.relation_bytes,
+            'topology_keys': self.topology_keys,
+            'compact_relations': self.compact_relations,
             'position_cache_bytes': self.position_bytes,
             'relation_entries': len(self.relations),
             'position_entries': len(self.positions),
