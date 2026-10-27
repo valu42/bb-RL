@@ -141,7 +141,8 @@ class GameTests(unittest.TestCase):
     def test_reset_budget_and_invalid_action(self):
         g=Game(self.m,budget=3)
         g.step("choose:HALT"); g.step("reset")
-        self.assertEqual(g.left,1); self.assertIsNone(g.answer)
+        self.assertEqual(g.left,1); self.assertEqual(g.answer,"HALT")
+        self.assertNotIn("choose:NONHALT",g.available_actions())
         _,r,done=g.step("not-an-action")
         self.assertEqual((g.left,r,done,g.status),(0,0,True,"EXHAUSTED"))
         with self.assertRaises(Invalid): g.step("reset")

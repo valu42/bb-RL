@@ -234,7 +234,11 @@ class Game:
         try:
             if action not in self.available_actions(): raise Invalid("action is not in current menu")
             if action=="reset":
-                self.answer=None; self.proof=None; self.focus=(); self.draft=None
+                # Reset only the proof workspace, never the proposition being
+                # proved. In particular a forced HALT/NONHALT rollout cannot
+                # switch branches after a reset and learn from the other answer.
+                # A new Game instance is required to choose a different answer.
+                self.proof=None; self.focus=(); self.draft=None
                 self.candidate=None; self.submit_failed=False; self._cached_goals=None
             elif action.startswith("choose:"):
                 self.answer=action.split(":")[1]; self._cached_goals=None
