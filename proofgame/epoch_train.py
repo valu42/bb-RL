@@ -656,17 +656,24 @@ def main():
                 batch=rows[start_index:start_index+args.batch_size]
                 batch_number=start_index//args.batch_size+1
                 inspect_batch=(batch_number % 10 == 0)
+                if args.profile:
+                    profile_stages = {}
+                    profile_t = time.perf_counter()
+                    gpu_before = pool.inference.stats() if args.device=='mps' else None
                 if args.device=='mps':
                     tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
                             args.attempts,dataset['action_budget'],state['updates'],
                             training and args.stop_after_first_train_proof,
                             args.train_exploration_epsilon if training else 0.,
                             training and args.balanced_initial_answers,
-                            inspect_batch) for r in batch]
+                            inspect_batch,args.profile) for r in batch]
                     results=pool.run(tasks)
                 else:
                     atomic_torch(weights_file,{'version':state['updates'],'config':policy.config,
                                                'state_dict':policy.state_dict()})
+                    if args.profile:
+                        profile_stages['worker_snapshot']=time.perf_counter()-profile_t
+                        profile_t=time.perf_counter()
                     tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
                             args.attempts,dataset['action_budget'],str(weights_file),state['updates'],
                             training and args.stop_after_first_train_proof,
@@ -674,10 +681,17 @@ def main():
                             training and args.balanced_initial_answers,
                             inspect_batch) for r in batch]
                     results=pool.map(run_machine,tasks,chunksize=1)
+                if args.profile:
+                    profile_stages['rollout']=time.perf_counter()-profile_t
+                    gpu_after = pool.inference.stats() if args.device=='mps' else None
+                    profile_t=time.perf_counter()
                 update=learn_batch(policy,optimizer,results,dataset['action_budget'],
                                    gpu_gradient_batch_size=args.gpu_gradient_batch_size,
                                    exploration_epsilon=args.train_exploration_epsilon,
                                    balanced_initial_answers=args.balanced_initial_answers) if training else {'updated':False}
+                if args.profile:
+                    profile_stages['learn']=time.perf_counter()-profile_t
+                    profile_t=time.perf_counter()
                 state['updates']+=int(update['updated'])
                 if update.get('rejected_update'):
                     state['rejected_updates']=state.get('rejected_updates',0)+1
@@ -691,13 +705,35 @@ def main():
                     trace_path=write_trace_report(args.out,trace_report)
                     print(json.dumps({'event':'policy_trace_saved',
                                       'path':str(trace_path)}),flush=True)
+                if args.profile:
+                    profile_stages['trace']=time.perf_counter()-profile_t
+                    profile_t=time.perf_counter()
+                    from .profiling import make_batch_profile,save_batch_profile
+                    # Snapshot profile counters before stripping diagnostics
+                    # and writing normal checkpoint-compatible batch records.
+                    machine_profiles = [row.get('profile',{}) for row in results]
                 # Diagnostic traces are written separately and never included
                 # in gradient replay or the standard per-batch checkpoint.
                 for result in results:
                     result.pop('diagnostic_traces',None)
+                    result.pop('profile',None)
                 batch_file=folder/f'batch_{start_index:04d}.json'
                 atomic_json(batch_file,{'epoch':epoch,'phase':phase,'start_index':start_index,'machines':results,'update':update})
+                if args.profile:
+                    profile_stages['batch_json']=time.perf_counter()-profile_t
+                    profile_t=time.perf_counter()
                 state['next_index']+=len(batch);save_state()
+                if args.profile:
+                    profile_stages['checkpoint']=time.perf_counter()-profile_t
+                    # Avoid altering saved training records. Only the separate
+                    # diagnostic report contains per-machine profiling counters.
+                    profiled_rows=[{**row,'profile':p}
+                                   for row,p in zip(results,machine_profiles)]
+                    report=make_batch_profile(
+                        phase=phase,epoch=epoch,batch_number=batch_number,
+                        results=profiled_rows,stages=profile_stages,device=args.device,
+                        gpu_before=gpu_before,gpu_after=gpu_after)
+                    save_batch_profile(args.out,report)
                 batch_outcomes=count_proofs_by_answer(results)
                 batch_choices=summarize_initial_choices(results)
                 progress={'phase':phase,'epoch':epoch,'target_epochs':args.epochs,'machines_done':state['next_index'],
@@ -716,6 +752,9 @@ def main():
                     progress['gpu_inference']=pool.inference.stats()
                 atomic_json(args.out/'progress.json',progress);print(json.dumps(progress),flush=True)
                 continue
+            if args.profile:
+                from .profiling import summarize_epoch_profiles
+                summarize_epoch_profiles(args.out,epoch,phase)
             metrics=summarize(sorted(folder.glob('batch_*.json')))
             metrics.update(epoch=epoch,phase=phase,policy_updates=state['updates'],active_seconds=state['active_seconds'])
             atomic_json(args.out/f'epoch_{epoch:02d}_{"training" if training else "evaluation"}.json',metrics)
