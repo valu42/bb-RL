@@ -161,6 +161,38 @@ class GroupRelativeTests(unittest.TestCase):
         for k,v in model.state_dict().items():
             self.assertTrue(torch.equal(v,original[k]))
 
+    def test_uniform_success_rewards_produce_no_relative_gradient(self):
+        torch.manual_seed(15)
+        model=Policy(width=32,layers=1).eval()
+        optimizer=torch.optim.AdamW(model.parameters(),lr=3e-4)
+        base=scripted_group(model,successes=1,budget=12)
+        successful=base['group_trajectories'][0]
+        # Same valid proof eight times, no forced answer balancing.
+        copied=[]
+        for i in range(8):
+            actions=[{k:v for k,v in step.items()
+                      if k!='forced_initial_answer'}
+                     for step in successful['actions']]
+            # The first action was forced in the original fixture; restore
+            # its true on-policy probability for unforced group training.
+            game=Game(from_rank(8),budget=12)
+            actions[0]['probability']=FrozenSampler(model).probabilities(
+                game.observation())[0]
+            copied.append({'attempt':i+1,'actions':actions,
+                           'status':'SOLVED',
+                           'certificate':successful['certificate']})
+        row={'machine':from_rank(8).to_json(),'attempts':8,
+             'successes':[{'attempt':t['attempt'],'actions':t['actions'],
+                           'certificate':t['certificate']} for t in copied],
+             'group_trajectories':copied}
+        update=learn_batch(model,optimizer,[row],12,
+                           length_penalty=.3,group_relative=True)
+        self.assertFalse(update['updated'])
+        self.assertEqual(update['proofs'],8)
+        self.assertEqual(update['groups_all_successful'],1)
+        self.assertEqual(update['groups_uniform_reward'],1)
+        self.assertFalse(optimizer.state)
+
     def test_full_end_to_end_and_fixed_eval_attempt_count(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)
