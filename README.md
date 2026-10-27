@@ -82,6 +82,87 @@ These example numbers are illustrative. The trace probabilities are
 action-selection probabilities, **not** probabilities that a proof claim is
 mathematically true. No new CLI flag is required.
 
+## Eight-attempt group-relative learning across 12,500 machines
+
+This is an **opt-in experimental learning algorithm**. Each machine gets a
+complete group of eight attempts under the same frozen policy, even if an
+early attempt succeeds. Unlike the old balanced mode, group-relative training
+**does not stop after the first verified proof**. With
+`--balanced-initial-answers`, four attempts are forced to start with HALT
+and four with NONHALT; these forced first actions have no policy gradient.
+
+A verified proof of length `L` gets reward `1 - alpha * L / B`, where
+`B` is the action budget and `alpha` is `--length-penalty`.
+Failures receive reward zero. For a group of `G=8` attempts, each
+trajectory gets the leave-one-out advantage
+
+```text
+advantage_i = reward_i - (sum(rewards) - reward_i) / (G - 1)
+```
+
+Successful trajectories may have positive or negative advantage relative to
+other attempts; failed trajectories in mixed groups have negative advantage.
+The on-policy REINFORCE gradient includes **both successful and failed
+trajectories** with their signed advantages. Groups where every attempt fails
+or all rewards are equal produce no update. There is no PPO clipping,
+learned value function, supervised proof, or curriculum. The trusted
+checker and proof language remain unchanged.
+
+To preserve the **exact same 100 held-out machines** from your previous
+1,000/100 dataset while sampling 12,500 distinct training machines,
+generate a new dataset (the original file is never overwritten):
+
+```bash
+python -m proofgame.unfiltered_dataset \
+  --train 12500 --test 100 --budget 100 --seed 20261026 \
+  --test-from runs/unfiltered_1000_100/dataset.json \
+  --out runs/group_12500_100/dataset.json
+```
+
+Training is eight attempts per machine, but **evaluation remains 100
+unforced attempts per machine** (including parity trap and Busy Beaver):
+
+```bash
+python -m proofgame.epoch_train \
+  --dataset runs/group_12500_100/dataset.json \
+  --out runs/ast_group_relative_8 \
+  --epochs 100 --attempts 8 --eval-attempts 100 \
+  --batch-size 8 --workers 8 \
+  --representation ast --device cpu \
+  --balanced-initial-answers --group-relative \
+  --cpu-shared-action-cache --length-penalty 0.3 --profile
+```
+
+The fixed test machines **and the separate parity-trap and Busy Beaver
+benchmark machines** are excluded from training. The 12,500 train
+machines are sampled uniformly without replacement from the complement.
+The dataset generator stores and the trainer revalidates the held-out
+ranks and deterministic sampling seed. This keeps evaluation directly
+comparable to previous runs without leaking true machine labels.
+
+Every training batch logs the number of informative groups, all-failure
+groups, and mean group reward. The training epoch summary also contains
+`group_relative_stats`, including informative-group percentage and
+positive/negative-advantage attempt counts. Complete failed trajectories
+are used for gradient replay and then **discarded before batch checkpoint
+serialization** to avoid enormous files. The normal 10th-batch human
+readable policy traces remain available.
+
+This changes the objective and exploration schedule: **start a fresh
+training run** rather than resuming a 100-attempt REINFORCE experiment.
+The older balanced REINFORCE mode stops after its first success,
+so simply removing `--group-relative` does **not** produce a
+matched-eight-attempt control. Compare by total proof-game actions or
+wall time, not only epochs, and interpret algorithmic comparisons
+accordingly. The new objective may perform worse on rare, hard proofs.
+
+Tests:
+
+```bash
+python -m unittest discover -s tests -p 'test_group_relative.py' -v
+python -m unittest discover -s tests -v
+```
+
 ## Reward shorter verified proof trajectories
 
 The epoch trainer supports an optional terminal-only length penalty:

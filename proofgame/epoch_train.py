@@ -2,9 +2,11 @@
 
 Evaluation always runs the exact configured number of independent-reset
 attempts per machine. Training can optionally stop on its first verified proof.
-Rollout batches share frozen weights; only training successes supply REINFORCE
-gradients. Evaluation never updates parameters. Selector proofs are not accepted
-in the dataset. Checkpoints commit after every rollout batch.
+Rollout batches share frozen weights. Standard REINFORCE learns from
+verified successes; optional group-relative training also learns from failed
+attempts through leave-one-out advantages. Evaluation never updates parameters.
+Selector proofs are not accepted in the dataset. Checkpoints commit after
+every rollout batch.
 """
 import argparse
 import copy
@@ -129,16 +131,19 @@ def init_worker(model_config, share_action_cache=False):
 
 def execute_machine(selected, seed, attempts, budget, version, stop_on_success, sampler,
                     exploration_epsilon=0., balanced_initial_answers=False,
-                    trace_diagnostics=False, profile_enabled=False):
+                    trace_diagnostics=False, profile_enabled=False, group_relative=False):
     """Execute a machine with either a CPU policy or the central GPU sampler."""
     machine = Machine(selected['machine']['rows']); rng = random.Random(seed)
     successes = []; statuses = Counter(); actions = 0; start = time.monotonic()
+    group_trajectories = [] if group_relative else None
     if balanced_initial_answers and attempts % 2:
         raise ValueError('balanced initial answers require an even number of attempts')
     # Balanced training is an upper bound of 50/50 attempts, not a requirement
     # to keep trying after either branch has produced a verified certificate.
-    if balanced_initial_answers:
+    if balanced_initial_answers and not group_relative:
         stop_on_success = True
+    if group_relative and stop_on_success:
+        raise ValueError('group-relative rollouts must collect all attempts')
     schedule = (['HALT'] * (attempts//2) + ['NONHALT'] * (attempts//2)
                 if balanced_initial_answers else [None] * attempts)
     if balanced_initial_answers:
@@ -167,6 +172,10 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
                                       forced_initial_answer=schedule[i],
                                       diagnostic_steps=detail, profile=profile)
         actions += len(trace); statuses[status] += 1
+        if group_relative:
+            group_trajectories.append({'attempt':i+1,'actions':trace,
+                                       'status':status,
+                                       'certificate':cert})
         if trace_diagnostics:
             sample = {'attempt':i+1, 'status':status, 'steps':detail,
                       'certificate':cert if cert else None}
@@ -201,12 +210,15 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
             **({'diagnostic_traces':{'success':first_success_trace,
                                     'failure':last_failed_trace}}
                if trace_diagnostics else {}),
-            **({'profile':profile} if profile_enabled else {})}
+            **({'profile':profile} if profile_enabled else {}),
+            **({'group_trajectories':group_trajectories} if group_relative else {})}
 
 
 def run_machine(task):
     global _worker_policy_version, _worker_action_features
-    selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon, balanced, diagnostics, profiling = task
+    if len(task) == 11:
+        task = (*task, False)  # Existing direct-worker callers.
+    selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon, balanced, diagnostics, profiling, group_relative = task
     if profiling:
         started = time.perf_counter()
     saved = torch.load(weights_file, map_location='cpu', weights_only=True)
@@ -223,7 +235,7 @@ def run_machine(task):
     if profiling:
         load_seconds = time.perf_counter() - started
     result = execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler,
-                             epsilon,balanced,diagnostics,profiling)
+                             epsilon,balanced,diagnostics,profiling,group_relative)
     if profiling:
         result['profile']['worker_model_load_seconds'] = load_seconds
         result['profile']['cache_hits'] = sampler.hits
@@ -244,61 +256,200 @@ def verified_proof_reward(actions, budget, length_penalty=0.):
     return 1. - length_penalty * (actions / budget)
 
 
+def prepare_group_relative_gradients(results, budget, length_penalty=0.,
+                                     balanced_initial_answers=False):
+    """Leave-one-out REINFORCE advantages within each machine's full group.
+
+    No PPO clipping, extra optimization epochs, value network, or proof labels.
+    Group-relative advantages can be negative: failed trajectories in a mixed
+    group teach the policy to avoid their sampled actions. All-zero and
+    constant-reward groups produce no gradients.
+    """
+    groups = {}
+    proofs = 0
+    reward_sum = 0.
+    proof_action_sum = 0
+    informative = 0
+    all_failed = 0
+    all_successful = 0
+    positive = negative = 0
+    absolute_advantage_sum = 0.
+    attempts_total = 0
+    for result in results:
+        trajectories = result.get('group_trajectories')
+        size = result['attempts']
+        if size < 2 or trajectories is None or len(trajectories) != size:
+            raise ValueError('group-relative learning requires every attempt in a group')
+        attempts_total += size
+        if balanced_initial_answers:
+            first = Counter(
+                t['actions'][0].get('forced_initial_answer')
+                if t['actions'] else None for t in trajectories)
+            if size % 2 or first != {'HALT':size//2,'NONHALT':size//2}:
+                raise ValueError('group must contain exactly balanced forced initial answers')
+        rewards = []
+        for i, trajectory in enumerate(trajectories):
+            if trajectory['attempt'] != i+1:
+                raise ValueError('group attempt indices must be contiguous')
+            steps = trajectory['actions']
+            if len(steps) > budget:
+                raise ValueError('group attempt exceeds proof-game action budget')
+            certificate = trajectory['certificate']
+            if certificate is not None:
+                if trajectory['status'] != 'SOLVED':
+                    raise ValueError('verified certificate has inconsistent status')
+                check(certificate)
+                reward = verified_proof_reward(len(steps),budget,length_penalty)
+                proofs += 1
+                reward_sum += reward
+                proof_action_sum += len(steps)
+            else:
+                if trajectory['status'] == 'SOLVED':
+                    raise ValueError('solved attempt has no verified certificate')
+                reward = 0.
+            rewards.append(reward)
+        if len([t for t in trajectories if t['certificate']]) != len(result['successes']):
+            raise ValueError('group proof count does not match verified successes')
+        if not any(rewards):
+            all_failed += 1
+        if all(rewards):
+            all_successful += 1
+        # Avoid meaningless replay of groups with identical rewards.
+        if max(rewards) == min(rewards):
+            continue
+        informative += 1
+        machine = Machine(result['machine']['rows'])
+        total_reward = sum(rewards)
+        for trajectory, reward in zip(trajectories,rewards):
+            advantage = (size * reward - total_reward) / (size-1)
+            if abs(advantage) < 1e-12:
+                continue
+            if advantage > 0:
+                positive += 1
+            else:
+                negative += 1
+            absolute_advantage_sum += abs(advantage)
+            replay = Game(machine,budget=budget)
+            for step_number,step in enumerate(trajectory['actions']):
+                obs = replay.observation()
+                index = next((i for i,a in enumerate(obs['actions'])
+                              if a['id']==step['action']),None)
+                if index is None:
+                    raise ValueError('group replay action not available')
+                forced = step.get('forced_initial_answer')
+                if forced is not None:
+                    if (not balanced_initial_answers or step_number != 0
+                            or step['action'] != 'choose:'+forced
+                            or step['probability'] != 1.):
+                        raise RuntimeError('invalid forced-answer group trajectory')
+                elif balanced_initial_answers and step_number == 0:
+                    raise RuntimeError('group trajectory missing forced first action')
+                if forced is None:
+                    encoded = encode_json(obs)
+                    if encoded not in groups:
+                        groups[encoded] = ([0.]*len(obs['actions']),{})
+                    counts,expected = groups[encoded]
+                    counts[index] += advantage
+                    if (index in expected and not math.isclose(
+                            expected[index],step['probability'],
+                            rel_tol=1e-5,abs_tol=1e-7)):
+                        raise RuntimeError('inconsistent group sampled probabilities')
+                    expected[index] = step['probability']
+                replay.step(step['action'],observe=False)
+            if trajectory['certificate'] is not None:
+                if (replay.status != 'SOLVED' or
+                        json.loads(json.dumps(replay.certificate())) !=
+                        json.loads(json.dumps(trajectory['certificate']))):
+                    raise ValueError('group replay verified proof mismatch')
+            elif trajectory['status'] != 'MODEL_LIMIT' and replay.status != trajectory['status']:
+                raise ValueError('group replay failure status mismatch')
+    stats = {
+        'group_relative':True,
+        'groups_total':len(results),
+        'groups_informative':informative,
+        'groups_all_failed':all_failed,
+        'groups_all_successful':all_successful,
+        'groups_uniform_reward':len(results)-informative,
+        'group_attempts':attempts_total,
+        'group_positive_advantage_attempts':positive,
+        'group_negative_advantage_attempts':negative,
+        'mean_absolute_group_advantage':(
+            absolute_advantage_sum/(positive+negative) if positive+negative else 0.),
+        'mean_group_reward':reward_sum/attempts_total if attempts_total else 0.,
+        'mean_verified_proof_reward':reward_sum/proofs if proofs else None,
+        'mean_verified_proof_actions':proof_action_sum/proofs if proofs else None,
+        'length_penalty':length_penalty,
+    }
+    return groups, proofs, stats
+
+
 def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
                 exploration_epsilon=0., balanced_initial_answers=False,
-                length_penalty=0.):
-    """Zero-reward episodes contribute zero; identical state gradients combine.
+                length_penalty=0., group_relative=False):
+    """On-policy REINFORCE with optional leave-one-out group advantages.
 
-    Every success is on-policy under the same frozen batch weights. Grouping
-    identical observations/actions is algebraically the same as summing their
-    individual log-probability gradients, divided by all attempts in the batch.
+    In standard mode only verified successes contribute positive terminal
+    rewards. In group mode all eight trajectories are compared per machine,
+    so failed attempts can contribute negative advantages when another
+    attempt succeeds. Grouping identical observations/actions preserves the
+    reward-weighted gradient, normalized by all attempts in the batch.
     """
     if not math.isfinite(length_penalty) or not 0. <= length_penalty < 1.:
         raise ValueError('length penalty must be finite and in [0,1)')
     groups = {}; proof_count = 0; numerical_fallbacks = 0
     reward_sum = 0.
     successful_action_sum = 0
-    for result in results:
-        machine = Machine(result['machine']['rows'])
-        for proof_number, success in enumerate(result['successes']):
-            check(success['certificate'])
-            replay = Game(machine, budget=budget)
-            use_for_learning = not balanced_initial_answers or proof_number == 0
-            if use_for_learning:
-                proof_count += 1
-                reward = verified_proof_reward(len(success['actions']),budget,length_penalty)
-                reward_sum += reward
-                successful_action_sum += len(success['actions'])
-            for step_number, step in enumerate(success['actions']):
-                obs = replay.observation(); encoded = encode_json(obs)
-                index = next(i for i,a in enumerate(obs['actions']) if a['id']==step['action'])
-                forced = step.get('forced_initial_answer')
-                if forced is not None:
-                    if (not balanced_initial_answers or step_number != 0 or
-                            step['action'] != 'choose:' + forced or
-                            step['probability'] != 1.):
-                        raise RuntimeError('invalid forced-answer trajectory')
-                elif balanced_initial_answers and step_number == 0:
-                    raise RuntimeError('balanced training proof lacks forced initial answer')
-                # A scheduled initial decision is deterministic, so its
-                # log probability is log(1)=0 and its gradient is zero.
-                if use_for_learning and forced is None:
-                    if encoded not in groups:
-                        groups[encoded] = ([0]*len(obs['actions']), {})
-                    counts, expected = groups[encoded]; counts[index] += reward
-                    if index in expected and not math.isclose(expected[index],step['probability'],rel_tol=1e-5,abs_tol=1e-7):
-                        raise RuntimeError('inconsistent sampled probabilities')
-                    expected[index] = step['probability']
-                replay.step(step['action'], observe=False)
-            if replay.status != 'SOLVED' or json.loads(json.dumps(replay.certificate())) != json.loads(json.dumps(success['certificate'])):
-                raise ValueError('incomplete or mismatched training proof')
-    if not proof_count:
-        return {'updated':False, 'proofs':0, 'unique_gradient_observations':0, 'loss':0.,
-                'mean_verified_proof_reward':None,'mean_verified_proof_actions':None,
-                'length_penalty':length_penalty}
-    reward_metrics = {'mean_verified_proof_reward':reward_sum/proof_count,
-                      'mean_verified_proof_actions':successful_action_sum/proof_count,
-                      'length_penalty':length_penalty}
+    group_metrics = {}
+    if group_relative:
+        groups,proof_count,group_metrics = prepare_group_relative_gradients(
+            results,budget,length_penalty,balanced_initial_answers)
+    else:
+        for result in results:
+            machine = Machine(result['machine']['rows'])
+            for proof_number, success in enumerate(result['successes']):
+                check(success['certificate'])
+                replay = Game(machine, budget=budget)
+                use_for_learning = not balanced_initial_answers or proof_number == 0
+                if use_for_learning:
+                    proof_count += 1
+                    reward = verified_proof_reward(len(success['actions']),budget,length_penalty)
+                    reward_sum += reward
+                    successful_action_sum += len(success['actions'])
+                for step_number, step in enumerate(success['actions']):
+                    obs = replay.observation(); encoded = encode_json(obs)
+                    index = next(i for i,a in enumerate(obs['actions']) if a['id']==step['action'])
+                    forced = step.get('forced_initial_answer')
+                    if forced is not None:
+                        if (not balanced_initial_answers or step_number != 0 or
+                                step['action'] != 'choose:' + forced or
+                                step['probability'] != 1.):
+                            raise RuntimeError('invalid forced-answer trajectory')
+                    elif balanced_initial_answers and step_number == 0:
+                        raise RuntimeError('balanced training proof lacks forced initial answer')
+                    # A scheduled initial decision is deterministic, so its
+                    # log probability is log(1)=0 and its gradient is zero.
+                    if use_for_learning and forced is None:
+                        if encoded not in groups:
+                            groups[encoded] = ([0]*len(obs['actions']), {})
+                        counts, expected = groups[encoded]; counts[index] += reward
+                        if index in expected and not math.isclose(expected[index],step['probability'],rel_tol=1e-5,abs_tol=1e-7):
+                            raise RuntimeError('inconsistent sampled probabilities')
+                        expected[index] = step['probability']
+                    replay.step(step['action'], observe=False)
+                if replay.status != 'SOLVED' or json.loads(json.dumps(replay.certificate())) != json.loads(json.dumps(success['certificate'])):
+                    raise ValueError('incomplete or mismatched training proof')
+    if not proof_count or (group_relative and not groups):
+        return {'updated':False, 'proofs':proof_count,
+                'unique_gradient_observations':0, 'loss':0.,
+                'mean_verified_proof_reward':None if not proof_count else
+                    group_metrics['mean_verified_proof_reward'],
+                'mean_verified_proof_actions':None if not proof_count else
+                    group_metrics['mean_verified_proof_actions'],
+                'length_penalty':length_penalty,**group_metrics}
+    reward_metrics = (group_metrics if group_relative else
+                      {'mean_verified_proof_reward':reward_sum/proof_count,
+                       'mean_verified_proof_actions':successful_action_sum/proof_count,
+                       'length_penalty':length_penalty})
     optimizer.zero_grad(set_to_none=True)
     denominator = sum(r['attempts'] for r in results); total_loss = 0.
     device = next(policy.parameters()).device
@@ -444,6 +595,21 @@ def count_proofs_by_answer(rows):
     }
 
 
+def summarize_group_updates(paths):
+    """Aggregate small saved batch updates, not discarded failure trajectories."""
+    totals = Counter()
+    for path in paths:
+        update = json.loads(path.read_text())['update']
+        for name in ('groups_total','groups_informative','groups_all_failed',
+                     'groups_all_successful','groups_uniform_reward',
+                     'group_attempts','group_positive_advantage_attempts',
+                     'group_negative_advantage_attempts'):
+            totals[name] += update.get(name,0)
+    total = totals['groups_total']
+    return {**dict(totals),
+            'informative_group_pct':100*totals['groups_informative']/total if total else 0.}
+
+
 def summarize_initial_choices(rows):
     counts=Counter(); scheduled=Counter(); raw={'HALT':0.,'NONHALT':0.}
     behavior={'HALT':0.,'NONHALT':0.}; n=0
@@ -517,7 +683,12 @@ def main():
     parser.add_argument('--dataset',type=Path,required=True)
     parser.add_argument('--out',type=Path,required=True)
     parser.add_argument('--epochs',type=int,default=10)
-    parser.add_argument('--attempts',type=int,default=100)
+    parser.add_argument('--attempts',type=int,default=100,
+                        help='training attempts per machine (8 for group-relative training)')
+    parser.add_argument('--eval-attempts',type=int,
+                        help='held-out and special-benchmark attempts per machine; default --attempts')
+    parser.add_argument('--group-relative',action='store_true',
+                        help='use full per-machine attempt groups with leave-one-out advantages')
     parser.add_argument('--batch-size',type=int,default=8)
     parser.add_argument('--workers',type=int,default=8)
     parser.add_argument('--seed',type=int,default=7)
@@ -525,7 +696,7 @@ def main():
     parser.add_argument('--length-penalty',type=float,default=0.,
                         help='verified reward = 1 - penalty * actions / budget; default 0')
     parser.add_argument('--balanced-initial-answers',action='store_true',
-                        help='alternate balanced HALT/NONHALT first attempts (50/50 over 100 max), stopping immediately after the first verified proof')
+                        help='force half HALT and half NONHALT initial choices; full groups with --group-relative, otherwise stop after first proof')
     parser.add_argument('--train-exploration-epsilon',type=float,default=0.2,
                         help='fraction of initial training decisions sampled uniformly between HALT/NONHALT (default 0.2); evaluation unchanged')
     parser.add_argument('--representation',choices=('bytes','ast'),default='bytes',
@@ -547,7 +718,9 @@ def main():
     parser.add_argument('--stop-after-first-train-proof',action='store_true',
                         help='stop each training machine after one verified proof; keep evaluation at the full attempt budget')
     args = parser.parse_args()
-    if min(args.epochs,args.attempts,args.batch_size,args.workers,
+    if args.eval_attempts is None:
+        args.eval_attempts=args.attempts
+    if min(args.epochs,args.attempts,args.eval_attempts,args.batch_size,args.workers,
            args.gpu_inference_batch_size,args.gpu_max_attention_elements,
            args.gpu_gradient_batch_size)<1:
         parser.error('positive counts required')
@@ -556,11 +729,16 @@ def main():
     if args.balanced_initial_answers:
         if args.attempts % 2:
             parser.error('--balanced-initial-answers requires an even --attempts')
-        # Both flags request the same early-stop behavior in balanced mode.
+        # Forced first choices replace epsilon exploration in both modes.
         if args.train_exploration_epsilon != 0.2:
             parser.error('balanced initial answers replaces epsilon exploration; omit --train-exploration-epsilon')
         args.train_exploration_epsilon=0.
-    if args.balanced_initial_answers:
+    if args.group_relative:
+        if args.attempts < 2:
+            parser.error('--group-relative requires at least 2 attempts per machine')
+        if args.stop_after_first_train_proof:
+            parser.error('--group-relative requires all attempts; omit --stop-after-first-train-proof')
+    elif args.balanced_initial_answers:
         args.stop_after_first_train_proof = True
     if not math.isfinite(args.train_exploration_epsilon) or not 0<=args.train_exploration_epsilon<1:
         parser.error('train-exploration-epsilon must be in [0,1)')
@@ -609,11 +787,24 @@ def main():
     if dataset_format==UNFILTERED_FORMAT:
         from .unfiltered_dataset import build_dataset
         seed=dataset.get('sampling_seed')
-        if (type(seed) is not int or dataset.get('population')!=POPULATION
-                or dataset.get('sampling')!='uniform_without_replacement_over_all_labelled_two_state_machines'):
+        sampling = dataset.get('sampling')
+        if (type(seed) is not int or dataset.get('population')!=POPULATION or
+                sampling not in ('uniform_without_replacement_over_all_labelled_two_state_machines',
+                                 'uniform_without_replacement_excluding_fixed_test_and_benchmarks')):
             parser.error('invalid unfiltered sampling metadata')
-        expected=build_dataset(len(dataset['train']),len(dataset['test']),
-                               dataset['action_budget'],seed)
+        fixed = dataset.get('fixed_test_ranks')
+        if sampling == 'uniform_without_replacement_excluding_fixed_test_and_benchmarks':
+            if not isinstance(fixed,list):
+                parser.error('missing fixed held-out machine ranks')
+        elif fixed is not None or 'excluded_benchmark_ranks' in dataset:
+            parser.error('unexpected fixed held-out/benchmark ranks')
+        try:
+            expected=build_dataset(len(dataset['train']),len(dataset['test']),
+                                   dataset['action_budget'],seed,fixed_test_ranks=fixed)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if dataset.get('excluded_benchmark_ranks') != expected.get('excluded_benchmark_ranks'):
+            parser.error('benchmark exclusion metadata does not match expected ranks')
         for split in ('train','test'):
             if [row['rank'] for row in dataset[split]] != [row['rank'] for row in expected[split]]:
                 parser.error('unfiltered dataset ranks do not match the claimed seed')
@@ -623,14 +814,21 @@ def main():
     config={'dataset_sha256':hashlib.sha256(dataset_bytes).hexdigest(),
             'train_machines':len(dataset['train']),'test_machines':len(dataset['test']),
             'attempts_per_machine':args.attempts,'budget':dataset['action_budget'],
+            'eval_attempts_per_machine':args.eval_attempts,
+            'group_relative':args.group_relative,
             'batch_size':args.batch_size,'seed':args.seed,'lr':args.lr,'model':policy.config,
             'parameters':sum(p.numel() for p in policy.parameters()),'epochs_requested':args.epochs,
-            'algorithm':'on-policy REINFORCE batches; zero baseline; mean gradient over all attempts',
+            'algorithm':('leave-one-out group-relative on-policy REINFORCE'
+                         if args.group_relative else
+                         'on-policy REINFORCE batches; zero baseline; mean gradient over all attempts'),
             'train_exploration_epsilon':args.train_exploration_epsilon,
             'length_penalty':args.length_penalty,
             'balanced_initial_answers':args.balanced_initial_answers,
-            'attempts_after_success':('training: stop after first verified proof; evaluation: full attempt budget'
-                                       if args.stop_after_first_train_proof else 'continue to exact attempt budget'),
+            'attempts_after_success':(
+                'training: all group attempts, including after success; evaluation: full attempt budget'
+                if args.group_relative else
+                ('training: stop after first verified proof; evaluation: full attempt budget'
+                 if args.stop_after_first_train_proof else 'continue to exact attempt budget')),
             'evaluation':('fixed unfiltered test set; fixed sampling seeds; no updates'
                           if dataset_format==UNFILTERED_FORMAT
                           else 'fixed filtered test set; fixed sampling seeds; no updates'),
@@ -653,14 +851,21 @@ def main():
         old=json.loads((args.out/'config.json').read_text())
         # Check both directions: switching an optimized run back to baseline
         # must not silently change its inference strategy on resume.
-        for option in ('cpu_inference','cpu_central_batching'):
-            if old.get(option) != config.get(option):
+        for option in ('cpu_inference','cpu_central_batching','group_relative',
+                       'eval_attempts_per_machine'):
+            legacy_default = (False if option=='group_relative' else
+                              old.get('attempts_per_machine') if option=='eval_attempts_per_machine'
+                              else None)
+            if old.get(option,legacy_default) != config.get(option):
                 parser.error('resume configuration changed: '+option)
         changing_strategy = False
         for k in config:
             if k!='epochs_requested' and config[k]!=old.get(
                     k,False if k=='balanced_initial_answers' else
-                    (0. if k in ('train_exploration_epsilon','length_penalty') else None)):
+                    (0. if k in ('train_exploration_epsilon','length_penalty') else
+                     False if k=='group_relative' else
+                     old.get('attempts_per_machine') if k=='eval_attempts_per_machine'
+                     else None)):
                 if (k=='attempts_after_success' and args.stop_after_first_train_proof
                         and old[k]=='continue to exact attempt budget'):
                     changing_strategy = True
@@ -735,11 +940,13 @@ def main():
                     gpu_before = pool.inference.stats() if central_inference else None
                 if central_inference:
                     tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
-                            args.attempts,dataset['action_budget'],state['updates'],
+                            args.attempts if training else args.eval_attempts,
+                            dataset['action_budget'],state['updates'],
                             training and args.stop_after_first_train_proof,
                             args.train_exploration_epsilon if training else 0.,
                             training and args.balanced_initial_answers,
-                            inspect_batch,args.profile) for r in batch]
+                            inspect_batch,args.profile,
+                            training and args.group_relative) for r in batch]
                     results=pool.run(tasks)
                 else:
                     atomic_torch(weights_file,{'version':state['updates'],'config':policy.config,
@@ -748,11 +955,13 @@ def main():
                         profile_stages['worker_snapshot']=time.perf_counter()-profile_t
                         profile_t=time.perf_counter()
                     tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
-                            args.attempts,dataset['action_budget'],str(weights_file),state['updates'],
+                            args.attempts if training else args.eval_attempts,
+                            dataset['action_budget'],str(weights_file),state['updates'],
                             training and args.stop_after_first_train_proof,
                             args.train_exploration_epsilon if training else 0.,
                             training and args.balanced_initial_answers,
-                            inspect_batch,args.profile) for r in batch]
+                            inspect_batch,args.profile,
+                            training and args.group_relative) for r in batch]
                     results=pool.map(run_machine,tasks,chunksize=1)
                 if args.profile:
                     profile_stages['rollout']=time.perf_counter()-profile_t
@@ -762,7 +971,8 @@ def main():
                                    gpu_gradient_batch_size=args.gpu_gradient_batch_size,
                                    exploration_epsilon=args.train_exploration_epsilon,
                                    balanced_initial_answers=args.balanced_initial_answers,
-                                   length_penalty=args.length_penalty) if training else {'updated':False}
+                                   length_penalty=args.length_penalty,
+                                   group_relative=args.group_relative) if training else {'updated':False}
                 if args.profile:
                     profile_stages['learn']=time.perf_counter()-profile_t
                     profile_t=time.perf_counter()
@@ -786,11 +996,12 @@ def main():
                     # Snapshot profile counters before stripping diagnostics
                     # and writing normal checkpoint-compatible batch records.
                     machine_profiles = [row.get('profile',{}) for row in results]
-                # Diagnostic traces are written separately and never included
-                # in gradient replay or the standard per-batch checkpoint.
+                # Group failures are needed only for gradient replay; avoid
+                # storing huge unsuccessful trajectories in batch checkpoints.
                 for result in results:
                     result.pop('diagnostic_traces',None)
                     result.pop('profile',None)
+                    result.pop('group_trajectories',None)
                 batch_file=folder/f'batch_{start_index:04d}.json'
                 atomic_json(batch_file,{'epoch':epoch,'phase':phase,'start_index':start_index,'machines':results,'update':update})
                 if args.profile:
@@ -824,6 +1035,10 @@ def main():
                           'last_batch_mean_verified_proof_reward':update.get('mean_verified_proof_reward'),
                           'last_batch_mean_verified_proof_actions':update.get('mean_verified_proof_actions'),
                           'length_penalty':args.length_penalty,
+                          'group_relative':args.group_relative,
+                          'last_batch_groups_informative':update.get('groups_informative'),
+                          'last_batch_groups_all_failed':update.get('groups_all_failed'),
+                          'last_batch_mean_group_reward':update.get('mean_group_reward'),
                           'active_seconds':state['active_seconds']}
                 if central_inference:
                     progress['gpu_inference' if args.device=='mps' else 'cpu_inference'] = pool.inference.stats()
@@ -832,7 +1047,10 @@ def main():
             if args.profile:
                 from .profiling import summarize_epoch_profiles
                 summarize_epoch_profiles(args.out,epoch,phase)
-            metrics=summarize(sorted(folder.glob('batch_*.json')))
+            batch_paths=sorted(folder.glob('batch_*.json'))
+            metrics=summarize(batch_paths)
+            if training and args.group_relative:
+                metrics['group_relative_stats']=summarize_group_updates(batch_paths)
             metrics.update(epoch=epoch,phase=phase,policy_updates=state['updates'],active_seconds=state['active_seconds'])
             atomic_json(args.out/f'epoch_{epoch:02d}_{"training" if training else "evaluation"}.json',metrics)
             print(json.dumps({'event':'epoch_summary','phase':phase,'epoch':epoch,
@@ -852,7 +1070,9 @@ def main():
                               'mean_initial_policy_probability':metrics['mean_initial_policy_probability'],
                               'mean_initial_behavior_probability':metrics['mean_initial_behavior_probability'],
                               'train_exploration_epsilon':args.train_exploration_epsilon if training else 0.,
-                              'policy_updates':metrics['policy_updates']}),
+                              'policy_updates':metrics['policy_updates'],
+                              **({'group_relative_stats':metrics['group_relative_stats']}
+                                 if training and args.group_relative else {})}),
                   flush=True)
             counts=metrics['first_action_counts']
             raw=metrics['mean_initial_policy_probability']
@@ -862,8 +1082,10 @@ def main():
                 print(f"Balanced initial attempts — epoch {epoch}: "
                       f"HALT={scheduled['choose:HALT']}, "
                       f"NONHALT={scheduled['choose:NONHALT']} "
-                      f"(maximum {args.attempts//2} per branch; "
-                      f"stops after first verified proof)",flush=True)
+                      f"({'exactly' if args.group_relative else 'maximum'} "
+                      f"{args.attempts//2} per branch; "
+                      f"{'full group' if args.group_relative else 'stops after first verified proof'})",
+                      flush=True)
             if raw['HALT'] is not None:
                 print(f"Answer exploration — {phase} epoch {epoch}: "
                       f"first actions HALT={counts['choose:HALT']}, "
@@ -884,7 +1106,7 @@ def main():
                 if central_inference:
                     challenge_tasks=[
                         (row,task_seed(args.seed,'eval',0,row['machine_id']),
-                         args.attempts,dataset['action_budget'],state['updates'],True,0.,False,False,False)
+                         args.eval_attempts,dataset['action_budget'],state['updates'],True,0.,False,False,False)
                         for row in challenge_rows
                     ]
                     challenge_results=pool.run(challenge_tasks)
@@ -894,13 +1116,13 @@ def main():
                                                'state_dict':policy.state_dict()})
                     challenge_tasks=[
                         (row,task_seed(args.seed,'eval',0,row['machine_id']),
-                         args.attempts,dataset['action_budget'],
+                         args.eval_attempts,dataset['action_budget'],
                          str(weights_file),state['updates'],True,0.,False,False,False)
                         for row in challenge_rows
                     ]
                     challenge_results=pool.map(run_machine,challenge_tasks,chunksize=1)
                 benchmark_report=make_benchmark_report(
-                    epoch,challenge_results,args.attempts,dataset['action_budget'],
+                    epoch,challenge_results,args.eval_attempts,dataset['action_budget'],
                     trained_ids=(row['machine_id'] for row in dataset['train'])
                 )
                 write_benchmark_report(args.out,benchmark_report)
