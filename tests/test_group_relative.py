@@ -71,6 +71,9 @@ class GroupRelativeTests(unittest.TestCase):
         self.assertEqual(len(new['train']),12500)
         self.assertEqual(len(set(r['rank'] for r in new['train'])),12500)
         self.assertTrue(set(r['rank'] for r in new['train']).isdisjoint(ranks))
+        self.assertTrue(set(r['rank'] for r in new['train']).isdisjoint(
+            new['excluded_benchmark_ranks']))
+        self.assertEqual(len(new['excluded_benchmark_ranks']),2)
         self.assertEqual(new,build_dataset(12500,100,100,20261026,
                                            fixed_test_ranks=ranks))
         with self.assertRaises(ValueError):
