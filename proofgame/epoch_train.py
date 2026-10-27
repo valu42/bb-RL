@@ -552,46 +552,89 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
     device = next(policy.parameters()).device
     is_mps = device.type == 'mps'
     observations = list(groups.items())
-    microbatch = gpu_gradient_batch_size if is_mps else 1
-    for start in range(0,len(observations),microbatch):
-        chunk = observations[start:start+microbatch]
-        parsed = [json.loads(encoded) for encoded, _ in chunk]
-        if is_mps:
-            logits_batch = policy.score_many(parsed)
-        else:
-            logits_batch = [policy(obs)[0] for obs in parsed]
-        losses = []
-        for observation, logits, (_, (counts, expected)) in zip(parsed,logits_batch,chunk):
-            logps = behavior_log_probs(logits,observation,exploration_epsilon)
-            inference_probs = None
-            for index, probability in expected.items():
-                grad_probability = float(logps[index].detach().exp())
-                if not math.isclose(grad_probability, probability,
-                                    rel_tol=2e-4 if is_mps else 2e-5,abs_tol=2e-6 if is_mps else 2e-7):
-                    # Batched inference and gradient kernels may give slightly
-                    # different float32 results on Metal. Recheck against the
-                    # same frozen policy, never allow a changed policy version.
-                    if inference_probs is None:
-                        with torch.inference_mode():
-                            inference_logits=policy(observation)[0]
-                            inference_probs=behavior_log_probs(
-                                inference_logits,observation,exploration_epsilon).exp().tolist()
-                    inference_probability = inference_probs[index]
-                    if not math.isclose(inference_probability, probability,
-                                        rel_tol=3e-3 if is_mps else 2e-4,
-                                        abs_tol=3e-5 if is_mps else 2e-6):
-                        raise RuntimeError(
-                            'off-policy training trajectory: '
-                            f'sampled={probability:.9g}, grad={grad_probability:.9g}, '
-                            f'inference={inference_probability:.9g}, action={observation["actions"][index]["id"]}')
-                    numerical_fallbacks += 1
-            loss = -(logps*torch.tensor(counts,dtype=logps.dtype,
-                                        device=logps.device)).sum()/denominator
-            if not torch.isfinite(loss): raise RuntimeError('non-finite loss')
-            losses.append(loss)
-        grouped_loss = torch.stack(losses).sum()
-        grouped_loss.backward()
-        total_loss += float(grouped_loss.detach())
+    gradient_details = {}
+    if gradient_backend == 'two-pass':
+        # Keep production's exact group-relative coefficients and all sampled
+        # on-policy probabilities, including failed attempts. Only execution
+        # order and deduplication of the action-side encoder are different.
+        from .experimental_action_replay import replay_unique_action_gradients
+        from .gpu_runtime import token_count
+        prepared = []
+        for encoded, (counts, expected) in observations:
+            observation = json.loads(encoded)
+            context_text = encode_json({
+                key: value for key, value in observation.items()
+                if key != 'actions'})
+            length = token_count(context_text, policy.representation)
+            for action in observation['actions']:
+                length = max(length, token_count(encode_json(action),
+                                                 policy.representation))
+            prepared.append({
+                'observation': observation, 'counts': counts,
+                'expected': expected, 'tokens': length})
+        _, timing = replay_unique_action_gradients(
+            policy, prepared,
+            context_batch_size=gpu_gradient_batch_size,
+            action_batch_size=16,
+            bucketed_contexts=True,
+            denominator=denominator,
+            epsilon=exploration_epsilon,
+            max_attention_elements=gradient_max_attention_elements,
+            defer_checks=True,
+            capture_gradient_vector=False,
+            check_sampled_probabilities=True)
+        total_loss = timing['loss']
+        numerical_fallbacks = timing['numerical_fallbacks']
+        gradient_details = {
+            'gradient_backend': 'two-pass',
+            'two_pass_action_reuse_factor': timing['action_reuse_factor'],
+            'two_pass_unique_actions': timing['unique_actions'],
+            'two_pass_context_seconds': timing['context_and_loss_backward_seconds'],
+            'two_pass_action_seconds': (timing['action_feature_no_grad_seconds']
+                                        + timing['action_gradient_replay_seconds']),
+            'two_pass_sampled_probability_checks': timing['sampled_probability_checks'],
+        }
+    else:
+        microbatch = gpu_gradient_batch_size if is_mps else 1
+        for start in range(0,len(observations),microbatch):
+            chunk = observations[start:start+microbatch]
+            parsed = [json.loads(encoded) for encoded, _ in chunk]
+            if is_mps:
+                logits_batch = policy.score_many(parsed)
+            else:
+                logits_batch = [policy(obs)[0] for obs in parsed]
+            losses = []
+            for observation, logits, (_, (counts, expected)) in zip(parsed,logits_batch,chunk):
+                logps = behavior_log_probs(logits,observation,exploration_epsilon)
+                inference_probs = None
+                for index, probability in expected.items():
+                    grad_probability = float(logps[index].detach().exp())
+                    if not math.isclose(grad_probability, probability,
+                                        rel_tol=2e-4 if is_mps else 2e-5,abs_tol=2e-6 if is_mps else 2e-7):
+                        # Batched inference and gradient kernels may give slightly
+                        # different float32 results on Metal. Recheck against the
+                        # same frozen policy, never allow a changed policy version.
+                        if inference_probs is None:
+                            with torch.inference_mode():
+                                inference_logits=policy(observation)[0]
+                                inference_probs=behavior_log_probs(
+                                    inference_logits,observation,exploration_epsilon).exp().tolist()
+                        inference_probability = inference_probs[index]
+                        if not math.isclose(inference_probability, probability,
+                                            rel_tol=3e-3 if is_mps else 2e-4,
+                                            abs_tol=3e-5 if is_mps else 2e-6):
+                            raise RuntimeError(
+                                'off-policy training trajectory: '
+                                f'sampled={probability:.9g}, grad={grad_probability:.9g}, '
+                                f'inference={inference_probability:.9g}, action={observation["actions"][index]["id"]}')
+                        numerical_fallbacks += 1
+                loss = -(logps*torch.tensor(counts,dtype=logps.dtype,
+                                            device=logps.device)).sum()/denominator
+                if not torch.isfinite(loss): raise RuntimeError('non-finite loss')
+                losses.append(loss)
+            grouped_loss = torch.stack(losses).sum()
+            grouped_loss.backward()
+            total_loss += float(grouped_loss.detach())
     # A single bad REINFORCE gradient must not poison all future rollouts.
     # Reject the update without changing the policy/optimizer; keep proof logs.
     norm = torch.nn.utils.clip_grad_norm_(policy.parameters(),1.,error_if_nonfinite=False)
@@ -600,7 +643,7 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
         return {'updated':False, 'proofs':proof_count,
                 'unique_gradient_observations':len(groups),
                 'loss':total_loss, 'rejected_update':'nonfinite_gradient_norm',
-                **reward_metrics}
+                **gradient_details, **reward_metrics}
     if not policy_is_finite(policy):
         raise RuntimeError('non-finite policy parameters before optimizer step')
     old_weights=[p.detach().clone() for p in policy.parameters()]
@@ -652,11 +695,11 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
                                     'optimizer_finite':optimizer_ok,
                                     'probe_logits_finite':logits_ok,
                                     'probe_grad_mode_logits_finite':grad_mode_logits_ok},
-                **reward_metrics}
+                **gradient_details, **reward_metrics}
     return {'updated':True, 'proofs':proof_count, 'unique_gradient_observations':len(groups),
             'loss':total_loss, 'gradient_norm':float(norm),
             'inference_gradient_probability_differences':numerical_fallbacks,
-            **reward_metrics}
+            **gradient_details, **reward_metrics}
 
 
 def count_proofs_by_answer(rows):
