@@ -384,11 +384,13 @@ def prepare_group_relative_gradients(results, budget, length_penalty=0.,
 def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
                 exploration_epsilon=0., balanced_initial_answers=False,
                 length_penalty=0., group_relative=False):
-    """Zero-reward episodes contribute zero; identical state gradients combine.
+    """On-policy REINFORCE with optional leave-one-out group advantages.
 
-    Every success is on-policy under the same frozen batch weights. Grouping
-    identical observations/actions is algebraically the same as summing their
-    individual log-probability gradients, divided by all attempts in the batch.
+    In standard mode only verified successes contribute positive terminal
+    rewards. In group mode all eight trajectories are compared per machine,
+    so failed attempts can contribute negative advantages when another
+    attempt succeeds. Grouping identical observations/actions preserves the
+    reward-weighted gradient, normalized by all attempts in the batch.
     """
     if not math.isfinite(length_penalty) or not 0. <= length_penalty < 1.:
         raise ValueError('length penalty must be finite and in [0,1)')
