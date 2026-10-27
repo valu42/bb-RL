@@ -76,13 +76,13 @@ def _worker_loop(worker_id, jobs, events, replies):
                 return
             task_id, task = item
             try:
-                if len(task) == 10:
-                    task = (*task, False)  # Existing central-worker callers.
-                selected, seed, attempts, budget, version, stop_on_success, epsilon, balanced, diagnostics, profiling, group_relative = task
+                if len(task) < 12:
+                    task = (*task,) + (False,)*(12-len(task))
+                selected, seed, attempts, budget, version, stop_on_success, epsilon, balanced, diagnostics, profiling, group_relative, branch_rounds = task
                 sampler = RemoteSampler(worker_id, events, replies)
                 result = execute_machine(selected, seed, attempts, budget,
                                          version, stop_on_success, sampler, epsilon, balanced,
-                                         diagnostics, profiling, group_relative)
+                                         diagnostics, profiling, group_relative, branch_rounds)
                 if profiling:
                     result['profile']['cache_hits'] = sampler.hits
                     result['profile']['cache_misses'] = sampler.misses
