@@ -310,7 +310,7 @@ def verified_proof_reward(actions, budget, length_penalty=0.):
 
 
 def prepare_group_relative_gradients(results, budget, length_penalty=0.,
-                                     balanced_initial_answers=False):
+                                     balanced_initial_answers=False, branch_rounds=0):
     """Leave-one-out REINFORCE advantages within each machine's full group.
 
     No PPO clipping, extra optimization epochs, value network, or proof labels.
@@ -330,15 +330,27 @@ def prepare_group_relative_gradients(results, budget, length_penalty=0.,
     attempts_total = 0
     for result in results:
         trajectories = result.get('group_trajectories')
-        size = result['attempts']
-        if size < 2 or trajectories is None or len(trajectories) != size:
-            raise ValueError('group-relative learning requires every attempt in a group')
+        if branch_rounds and result.get('first_proof_round') is None:
+            if trajectories or result['successes']:
+                raise ValueError('unsolved branch race cannot have a winning group')
+            all_failed += 1
+            continue
+        size = len(trajectories) if trajectories is not None else 0
+        if size < 2 or (not branch_rounds and size != result['attempts']):
+            raise ValueError('group-relative learning requires a complete attempt group')
         attempts_total += size
         if balanced_initial_answers:
             first = Counter(
                 t['actions'][0].get('forced_initial_answer')
                 if t['actions'] else None for t in trajectories)
-            if size % 2 or first != {'HALT':size//2,'NONHALT':size//2}:
+            if branch_rounds:
+                winner = result.get('first_proof_answer')
+                if first != {winner:size} or result['attempts'] != (
+                        2*size*result['rounds_completed']):
+                    raise ValueError('winning group or round accounting is inconsistent')
+                if result['first_proof_round'] != result['rounds_completed']:
+                    raise ValueError('winning proof must occur in the final sampled round')
+            elif size % 2 or first != {'HALT':size//2,'NONHALT':size//2}:
                 raise ValueError('group must contain exactly balanced forced initial answers')
         rewards = []
         for i, trajectory in enumerate(trajectories):
@@ -361,7 +373,12 @@ def prepare_group_relative_gradients(results, budget, length_penalty=0.,
                     raise ValueError('solved attempt has no verified certificate')
                 reward = 0.
             rewards.append(reward)
-        if len([t for t in trajectories if t['certificate']]) != len(result['successes']):
+        if branch_rounds:
+            selected_successes = [t for t in result['successes']
+                                  if t['certificate']['answer']==result['first_proof_answer']]
+            if len([t for t in trajectories if t['certificate']]) != len(selected_successes):
+                raise ValueError('winning branch proof count mismatch')
+        elif len([t for t in trajectories if t['certificate']]) != len(result['successes']):
             raise ValueError('group proof count does not match verified successes')
         if not any(rewards):
             all_failed += 1
@@ -424,6 +441,8 @@ def prepare_group_relative_gradients(results, budget, length_penalty=0.,
         'groups_all_successful':all_successful,
         'groups_uniform_reward':len(results)-informative,
         'group_attempts':attempts_total,
+        'branch_rounds':branch_rounds,
+        'exploration_attempts':sum(r['attempts'] for r in results),
         'group_positive_advantage_attempts':positive,
         'group_negative_advantage_attempts':negative,
         'mean_absolute_group_advantage':(
@@ -438,7 +457,7 @@ def prepare_group_relative_gradients(results, budget, length_penalty=0.,
 
 def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
                 exploration_epsilon=0., balanced_initial_answers=False,
-                length_penalty=0., group_relative=False):
+                length_penalty=0., group_relative=False, branch_rounds=0):
     """On-policy REINFORCE with optional leave-one-out group advantages.
 
     In standard mode only verified successes contribute positive terminal
@@ -455,7 +474,7 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
     group_metrics = {}
     if group_relative:
         groups,proof_count,group_metrics = prepare_group_relative_gradients(
-            results,budget,length_penalty,balanced_initial_answers)
+            results,budget,length_penalty,balanced_initial_answers,branch_rounds)
     else:
         for result in results:
             machine = Machine(result['machine']['rows'])
@@ -504,7 +523,11 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
                        'mean_verified_proof_actions':successful_action_sum/proof_count,
                        'length_penalty':length_penalty})
     optimizer.zero_grad(set_to_none=True)
-    denominator = sum(r['attempts'] for r in results); total_loss = 0.
+    # Only the selected winning groups contribute gradients. Unsuccessful
+    # exploratory rounds do not dilute the policy-gradient normalization.
+    denominator = (group_metrics['group_attempts'] if branch_rounds else
+                   sum(r['attempts'] for r in results))
+    total_loss = 0.
     device = next(policy.parameters()).device
     is_mps = device.type == 'mps'
     observations = list(groups.items())
