@@ -67,6 +67,12 @@ The full optimizer A/B uses the exact same frozen-policy trajectories from one
 complete machine batch. Both CPU serial and optimized MPS paths perform
 group-gradient preparation, the optimizer step, clipping, and numerical checks.
 The full resulting gradients and model parameter values are compared.
+Because AdamW normalizes small moment estimates, tiny floating-point gradient
+differences can produce noticeably larger changes in individual updated
+parameters. The benchmark therefore requires tight full-gradient agreement
+and a learning-rate-scaled bound on parameter drift; it does **not** claim
+bit-for-bit identical optimizer trajectories. Held-out quality still needs
+an actual training/evaluation run.
 
 On a machine without MPS, use --gradient-device cpu to compare CPU serial with
 CPU two-pass. Use --learn-repeats 0 for a rollout-only test.
