@@ -180,3 +180,38 @@ def replay_unique_action_gradients(
                 'no optimizer step or parameter modification.',
     }
     return vector, result
+
+
+def two_pass_probability_disagreement(policy, samples, epsilon):
+    """Numerical agreement with sampled on-policy probabilities (untimed)."""
+    actions = list(dict.fromkeys(
+        encode_json(a) for row in samples for a in row['observation']['actions']))
+    places = {text: i for i, text in enumerate(actions)}
+    device = next(policy.parameters()).device
+    with torch.no_grad():
+        # Small independent encoder groups avoid a huge padded forward.
+        chunks = _batch_indices(
+            actions, policy.representation, policy.config['heads'], 8, 12000000)
+        keys = torch.empty((len(actions), policy.config['width']),
+                           device=device, dtype=next(policy.parameters()).dtype)
+        biases = torch.empty((len(actions),), device=device, dtype=keys.dtype)
+        for group in chunks:
+            vectors = policy.encode([actions[i] for i in group])
+            loc = torch.tensor(group, dtype=torch.long, device=device)
+            keys.index_copy_(0, loc, policy.key(vectors))
+            biases.index_copy_(0, loc, policy.action_bias(vectors).squeeze(-1))
+        max_error = 0.
+        checked = 0
+        for row in samples:
+            observation = row['observation']
+            context = {k: v for k, v in observation.items() if k != 'actions'}
+            query = policy.query(policy.encode([encode_json(context)]))[0]
+            loc = torch.tensor([places[encode_json(a)] for a in observation['actions']],
+                               dtype=torch.long, device=device)
+            logits = ((keys.index_select(0, loc) * query).sum(-1) /
+                      math.sqrt(query.shape[-1]) + biases.index_select(0, loc))
+            probs = behavior_log_probs(logits, observation, epsilon).exp()
+            for idx, expected in row['expected'].items():
+                max_error = max(max_error, abs(float(probs[idx]) - expected))
+                checked += 1
+    return max_error, checked
