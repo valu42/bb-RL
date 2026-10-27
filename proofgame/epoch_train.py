@@ -619,6 +619,11 @@ def main():
                                  'gradient_batch_size':args.gpu_gradient_batch_size}
     if args.resume:
         old=json.loads((args.out/'config.json').read_text())
+        # Check both directions: switching an optimized run back to baseline
+        # must not silently change its inference strategy on resume.
+        for option in ('cpu_inference','cpu_central_batching'):
+            if old.get(option) != config.get(option):
+                parser.error('resume configuration changed: '+option)
         changing_strategy = False
         for k in config:
             if k!='epochs_requested' and config[k]!=old.get(
