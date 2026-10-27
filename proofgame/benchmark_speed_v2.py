@@ -13,7 +13,8 @@ Example:
  python -m proofgame.benchmark_speed_v2 \
     --run runs/ast_branch_race_8x6_fixed --epoch 2 \
     --machines 16 --workers 8 --barrier 8 --cache-mb 32 \
-    --repeats 2 --learn-repeats 2 --gradient-device mps \
+    --repeats 2 --learn-warmups 1 --learn-repeats 3 \
+    --gradient-device mps \
     --out runs/ast_branch_race_8x6_fixed/speed_v2.json
 """
 import argparse
@@ -125,15 +126,80 @@ def _learn_once(snapshot, batch_results, config, budget, *, gpu_device,
     }
 
 
+def summarize_learning_trials(trials, *, warmups=(), min_steady_trials=3,
+                              max_duration_spread=1.5):
+    """Separate one-time setup from reproducible timed optimizer throughput.
+
+    An accelerator compilation spike must not silently turn one warm trial
+    into a claimed end-to-end epoch slowdown. Conversely, excluding the cold
+    run cannot justify an epoch speedup without repeated stable measurements.
+    """
+    if min_steady_trials < 1 or max_duration_spread < 1.:
+        raise ValueError('invalid stability requirements')
+    all_trials = list(warmups) + list(trials)
+    if not all_trials:
+        return None
+    valid = all(row['passes_update_parity'] for row in all_trials)
+    updated = all(row['optimized']['updated'] for row in all_trials)
+    reported = {
+        'initial_cpu_seconds': all_trials[0]['cpu_serial_seconds'],
+        'initial_accelerated_seconds': all_trials[0]['two_pass_seconds'],
+        'warmup_trials': len(warmups),
+        'timed_trials': len(trials),
+        'all_updates_numerically_equivalent': valid,
+        'all_updates_applied': updated,
+        'speedup_vs_cpu_serial': None,
+        'median_ratio_candidate': None,
+        'cpu_timed_median_seconds': None,
+        'accelerated_timed_median_seconds': None,
+        'cpu_timed_max_over_min': None,
+        'accelerated_timed_max_over_min': None,
+        'stability_status': None,
+        'note': ('Initial timings include potential MPS first-use compilation. '
+                 'Only stable timed repeats AFTER explicit warmups can support '
+                 'a warmed-workload speed estimate. Distinct future AST '
+                 'shapes may trigger additional compilation.'),
+    }
+    if not trials:
+        reported['stability_status'] = 'no_timed_trials'
+        return reported
+    cpu = [float(row['cpu_serial_seconds']) for row in trials]
+    fast = [float(row['two_pass_seconds']) for row in trials]
+    if any(not 0. < x < float('inf') for x in cpu + fast):
+        reported['stability_status'] = 'invalid_timing'
+        return reported
+    cpu_median = statistics.median(cpu)
+    accelerated_median = statistics.median(fast)
+    cpu_spread = max(cpu) / min(cpu)
+    accelerated_spread = max(fast) / min(fast)
+    reported.update({
+        'cpu_timed_median_seconds': cpu_median,
+        'accelerated_timed_median_seconds': accelerated_median,
+        'cpu_timed_max_over_min': cpu_spread,
+        'accelerated_timed_max_over_min': accelerated_spread,
+        'median_ratio_candidate': cpu_median / accelerated_median,
+    })
+    if not valid or not updated:
+        reported['stability_status'] = 'numerical_or_optimizer_mismatch'
+    elif len(trials) < min_steady_trials:
+        reported['stability_status'] = 'too_few_timed_trials'
+    elif cpu_spread > max_duration_spread or accelerated_spread > max_duration_spread:
+        reported['stability_status'] = 'timings_unstable'
+    else:
+        reported['stability_status'] = 'stable_warmed_sample'
+        reported['speedup_vs_cpu_serial'] = cpu_median / accelerated_median
+    return reported
+
+
 def benchmark(run, epoch, *, machines, source, workers, barrier, cache_mb,
               include_shared, repeats, learn_repeats, gradient_device,
-              context_batch_size, seed, out, target_minutes):
+              context_batch_size, seed, out, target_minutes, learn_warmups=1):
     if out.exists():
         raise ValueError('output file already exists; choose a new --out')
     if min(epoch, machines, workers, barrier, repeats, context_batch_size) < 1:
         raise ValueError('positive experiment sizes required')
-    if cache_mb < 1 or learn_repeats < 0:
-        raise ValueError('cache must be positive; learn-repeats nonnegative')
+    if cache_mb < 1 or learn_repeats < 0 or learn_warmups < 0:
+        raise ValueError('cache must be positive; learning counts nonnegative')
     if gradient_device == 'mps' and not torch.backends.mps.is_available():
         raise ValueError('MPS is not available; use --gradient-device cpu')
     config = json.loads((run / 'config.json').read_text())
@@ -163,11 +229,12 @@ def benchmark(run, epoch, *, machines, source, workers, barrier, cache_mb,
             'machines': len(rows), 'source': source, 'seed': seed,
             'workers': workers, 'barrier': barrier, 'topology_cache_mb': cache_mb,
             'include_shared_action_cache': include_shared, 'repeats': repeats,
-            'learn_repeats': learn_repeats, 'gradient_device': gradient_device,
+            'learn_repeats': learn_repeats, 'learn_warmups': learn_warmups,
+            'gradient_device': gradient_device,
             'context_batch_size': context_batch_size,
         },
-        'results': [], 'rollout_summary': None,
-        'learning_summary': None, 'epoch_projection': None,
+        'results': [], 'rollout_summary': None, 'learning_warmup_trials': [],
+        'learning_trials': [], 'learning_summary': None, 'epoch_projection': None,
         'caveats': [
             'All rollouts use a single frozen weight tensor, even though '
             'version IDs and action caches change at the training batch barrier.',
@@ -175,6 +242,10 @@ def benchmark(run, epoch, *, machines, source, workers, barrier, cache_mb,
             'it never modifies the saved checkpoint or original run.',
             'Evaluation speed is not assumed to improve automatically.',
             'Model-version cache invalidation is simulated, not actual SGD updates.',
+            'MPS first-use overhead can involve device setup or kernel compilation; '
+            'separate warmup and steady-state timings do not prove full-epoch speed.',
+            'Warmup uses repeated identical batch shapes. Future distinct '
+            'batches can incur new shape-specific setup costs.',
         ],
     }
     _write(out, report)
@@ -244,6 +315,25 @@ def benchmark(run, epoch, *, machines, source, workers, barrier, cache_mb,
         learning_rows = max(candidates, key=lambda group: sum(
             len(row['successes']) for row in group))
         frozen = torch.load(checkpoint, map_location='cpu', weights_only=True)
+        warmups = []
+        for i in range(learn_warmups):
+            print(json.dumps({
+                'event': 'optimizer_ab_warmup_start', 'repeat': i,
+                'machines': len(learning_rows),
+                'gradient_device': gradient_device,
+            }), flush=True)
+            warm = _learn_once(
+                frozen, learning_rows, config, dataset['action_budget'],
+                gpu_device=gradient_device, context_batch_size=context_batch_size)
+            warmups.append(warm)
+            report['learning_warmup_trials'] = warmups
+            _write(out, report)
+            print(json.dumps({
+                'event': 'optimizer_ab_warmup_done', 'repeat': i,
+                'cpu_seconds': warm['cpu_serial_seconds'],
+                'optimized_seconds': warm['two_pass_seconds'],
+                'numerically_equivalent': warm['passes_update_parity'],
+            }), flush=True)
         trials = []
         for i in range(learn_repeats):
             print(json.dumps({'event': 'optimizer_ab_start',
@@ -261,19 +351,9 @@ def benchmark(run, epoch, *, machines, source, workers, barrier, cache_mb,
                 'updated':trials[-1]['optimized']['updated'],
                 'numerically_equivalent':trials[-1]['passes_update_parity'],
             }), flush=True)
-        valid = (all(row['passes_update_parity'] for row in trials)
-                 and all(row['optimized']['updated'] for row in trials))
-        factor = (statistics.median(row['cpu_serial_seconds'] for row in trials)
-                  / statistics.median(row['two_pass_seconds'] for row in trials)
-                  if valid else None)
-        report['learning_summary'] = {
-            'speedup_vs_cpu_serial': factor,
-            'all_updates_numerically_equivalent': all(
-                row['passes_update_parity'] for row in trials),
-            'all_updates_applied':all(row['optimized']['updated'] for row in trials),
-            'sampled_machine_batch':len(learning_rows),
-            'note':'Full optimizer update, including gradient replay and numerical checks.',
-        }
+        report['learning_summary'] = summarize_learning_trials(
+            trials, warmups=warmups)
+        report['learning_summary']['sampled_machine_batch'] = len(learning_rows)
         _write(out, report)
     historical = read_history(run, epoch)
     rollout_factor = rollout_summary['topology-cache-local-cpu']['speedup_vs_baseline']
@@ -304,8 +384,11 @@ def main():
     p.add_argument('--cache-mb', type=int, default=32)
     p.add_argument('--include-shared-action-cache', action='store_true')
     p.add_argument('--repeats', type=int, default=2)
-    p.add_argument('--learn-repeats', type=int, default=2,
-                   help='0 skips complete optimizer-step A/B')
+    p.add_argument('--learn-warmups', type=int, default=1,
+                   help='complete optimizer A/B warmup trials, separately reported')
+    p.add_argument('--learn-repeats', type=int, default=3,
+                   help='timed A/B repeats after warmup; at least 3 needed '
+                        'for a warmed-workload epoch projection; 0 disables A/B')
     p.add_argument('--gradient-device', choices=('cpu','mps'), default='mps')
     p.add_argument('--context-batch-size', type=int, default=8)
     p.add_argument('--seed', type=int, default=37)
@@ -321,7 +404,8 @@ def main():
             repeats=args.repeats, learn_repeats=args.learn_repeats,
             gradient_device=args.gradient_device,
             context_batch_size=args.context_batch_size,
-            seed=args.seed, out=args.out, target_minutes=args.target_minutes)
+            seed=args.seed, out=args.out, target_minutes=args.target_minutes,
+            learn_warmups=args.learn_warmups)
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
         p.error(str(exc))
     print('\nFOCUSED TRAINING-SIZED SPEED V2 BENCHMARK')
@@ -331,12 +415,21 @@ def main():
               f"speedup={item['speedup_vs_baseline']}, "
               f"same trajectories={item['same_action_trajectories']}")
     if results['learning_summary']:
-        print('Full optimizer-step speedup:',
-              results['learning_summary']['speedup_vs_cpu_serial'])
+        summary = results['learning_summary']
+        print('Optimizer first-use:', round(summary['initial_accelerated_seconds'], 3),
+              's MPS/two-pass vs', round(summary['initial_cpu_seconds'], 3), 's CPU')
+        print('Warm optimizer medians:', summary['accelerated_timed_median_seconds'],
+              's accelerated vs', summary['cpu_timed_median_seconds'], 's CPU')
+        print('Warmed sample status:', summary['stability_status'])
+        print('Warmed optimizer speedup (when stable):',
+              summary['speedup_vs_cpu_serial'])
     if results['epoch_projection']:
-        print('Projected full epoch (not measured):',
+        print('Warmed-sample projected epoch (NOT measured or compilation-adjusted):',
               round(results['epoch_projection']['projected_epoch_minutes'], 2),
               'minutes')
+    elif results['learning_summary']:
+        print('No epoch projection: optimizer timing is not yet stable and '
+              'sufficiently repeated.')
     print('Saved:', args.out)
 
 
