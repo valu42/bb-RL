@@ -69,6 +69,7 @@ def compare_modes(dataset, policy, *, machines=24, attempts=10, workers=8,
                                for r in batch]
                         results.extend(pool.map(run_machine,tasks,chunksize=1))
                 elapsed=time.perf_counter()-start
+                central_stats=pool.inference.stats() if mode=='central' else None
             actions=sum(r['actions'] for r in results)
             total_attempts=sum(r['attempts'] for r in results)
             proofs=sum(bool(r['successes']) for r in results)
@@ -80,6 +81,8 @@ def compare_modes(dataset, policy, *, machines=24, attempts=10, workers=8,
                  'attempts_per_second':round(total_attempts/elapsed,2),
                  'action_embedding_cache_hits':hits,
                  'action_embedding_cache_misses':misses}
+            if central_stats is not None:
+                row['central_inference']=central_stats
             report.append(row)
             print(json.dumps({'event':'benchmark_mode',**row}),flush=True)
     baseline=next((r for r in report if r['mode']=='baseline'),None)
