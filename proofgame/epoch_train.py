@@ -664,7 +664,12 @@ def main():
     parser.add_argument('--dataset',type=Path,required=True)
     parser.add_argument('--out',type=Path,required=True)
     parser.add_argument('--epochs',type=int,default=10)
-    parser.add_argument('--attempts',type=int,default=100)
+    parser.add_argument('--attempts',type=int,default=100,
+                        help='training attempts per machine (8 for group-relative training)')
+    parser.add_argument('--eval-attempts',type=int,
+                        help='held-out and special-benchmark attempts per machine; default --attempts')
+    parser.add_argument('--group-relative',action='store_true',
+                        help='use full per-machine attempt groups with leave-one-out advantages')
     parser.add_argument('--batch-size',type=int,default=8)
     parser.add_argument('--workers',type=int,default=8)
     parser.add_argument('--seed',type=int,default=7)
@@ -694,7 +699,9 @@ def main():
     parser.add_argument('--stop-after-first-train-proof',action='store_true',
                         help='stop each training machine after one verified proof; keep evaluation at the full attempt budget')
     args = parser.parse_args()
-    if min(args.epochs,args.attempts,args.batch_size,args.workers,
+    if args.eval_attempts is None:
+        args.eval_attempts=args.attempts
+    if min(args.epochs,args.attempts,args.eval_attempts,args.batch_size,args.workers,
            args.gpu_inference_batch_size,args.gpu_max_attention_elements,
            args.gpu_gradient_batch_size)<1:
         parser.error('positive counts required')
@@ -707,7 +714,12 @@ def main():
         if args.train_exploration_epsilon != 0.2:
             parser.error('balanced initial answers replaces epsilon exploration; omit --train-exploration-epsilon')
         args.train_exploration_epsilon=0.
-    if args.balanced_initial_answers:
+    if args.group_relative:
+        if args.attempts < 2:
+            parser.error('--group-relative requires at least 2 attempts per machine')
+        if args.stop_after_first_train_proof:
+            parser.error('--group-relative requires all attempts; omit --stop-after-first-train-proof')
+    elif args.balanced_initial_answers:
         args.stop_after_first_train_proof = True
     if not math.isfinite(args.train_exploration_epsilon) or not 0<=args.train_exploration_epsilon<1:
         parser.error('train-exploration-epsilon must be in [0,1)')
@@ -756,11 +768,22 @@ def main():
     if dataset_format==UNFILTERED_FORMAT:
         from .unfiltered_dataset import build_dataset
         seed=dataset.get('sampling_seed')
-        if (type(seed) is not int or dataset.get('population')!=POPULATION
-                or dataset.get('sampling')!='uniform_without_replacement_over_all_labelled_two_state_machines'):
+        sampling = dataset.get('sampling')
+        if (type(seed) is not int or dataset.get('population')!=POPULATION or
+                sampling not in ('uniform_without_replacement_over_all_labelled_two_state_machines',
+                                 'uniform_without_replacement_excluding_fixed_test')):
             parser.error('invalid unfiltered sampling metadata')
-        expected=build_dataset(len(dataset['train']),len(dataset['test']),
-                               dataset['action_budget'],seed)
+        fixed = dataset.get('fixed_test_ranks')
+        if sampling == 'uniform_without_replacement_excluding_fixed_test':
+            if not isinstance(fixed,list):
+                parser.error('missing fixed held-out machine ranks')
+        elif fixed is not None:
+            parser.error('unexpected fixed held-out machine ranks')
+        try:
+            expected=build_dataset(len(dataset['train']),len(dataset['test']),
+                                   dataset['action_budget'],seed,fixed_test_ranks=fixed)
+        except ValueError as exc:
+            parser.error(str(exc))
         for split in ('train','test'):
             if [row['rank'] for row in dataset[split]] != [row['rank'] for row in expected[split]]:
                 parser.error('unfiltered dataset ranks do not match the claimed seed')
@@ -770,14 +793,21 @@ def main():
     config={'dataset_sha256':hashlib.sha256(dataset_bytes).hexdigest(),
             'train_machines':len(dataset['train']),'test_machines':len(dataset['test']),
             'attempts_per_machine':args.attempts,'budget':dataset['action_budget'],
+            'eval_attempts_per_machine':args.eval_attempts,
+            'group_relative':args.group_relative,
             'batch_size':args.batch_size,'seed':args.seed,'lr':args.lr,'model':policy.config,
             'parameters':sum(p.numel() for p in policy.parameters()),'epochs_requested':args.epochs,
-            'algorithm':'on-policy REINFORCE batches; zero baseline; mean gradient over all attempts',
+            'algorithm':('leave-one-out group-relative on-policy REINFORCE'
+                         if args.group_relative else
+                         'on-policy REINFORCE batches; zero baseline; mean gradient over all attempts'),
             'train_exploration_epsilon':args.train_exploration_epsilon,
             'length_penalty':args.length_penalty,
             'balanced_initial_answers':args.balanced_initial_answers,
-            'attempts_after_success':('training: stop after first verified proof; evaluation: full attempt budget'
-                                       if args.stop_after_first_train_proof else 'continue to exact attempt budget'),
+            'attempts_after_success':(
+                'training: all group attempts, including after success; evaluation: full attempt budget'
+                if args.group_relative else
+                ('training: stop after first verified proof; evaluation: full attempt budget'
+                 if args.stop_after_first_train_proof else 'continue to exact attempt budget')),
             'evaluation':('fixed unfiltered test set; fixed sampling seeds; no updates'
                           if dataset_format==UNFILTERED_FORMAT
                           else 'fixed filtered test set; fixed sampling seeds; no updates'),
@@ -800,7 +830,8 @@ def main():
         old=json.loads((args.out/'config.json').read_text())
         # Check both directions: switching an optimized run back to baseline
         # must not silently change its inference strategy on resume.
-        for option in ('cpu_inference','cpu_central_batching'):
+        for option in ('cpu_inference','cpu_central_batching','group_relative',
+                       'eval_attempts_per_machine'):
             if old.get(option) != config.get(option):
                 parser.error('resume configuration changed: '+option)
         changing_strategy = False
