@@ -882,9 +882,21 @@ def main():
                         help='experimental: batch CPU neural inference across proof workers')
     parser.add_argument('--cpu-shared-action-cache',action='store_true',
                         help='experimental: reuse frozen action embeddings across CPU worker tasks')
+    parser.add_argument('--cpu-topology-cache-mb',type=int,default=0,
+                        help='opt-in bounded per-worker CPU cache for AST input topology; '
+                             '0 disables, suggested initial test: 32')
+    parser.add_argument('--mps-local-cpu-rollouts',action='store_true',
+                        help='hybrid: keep MPS gradients while rollout inference '
+                             'runs locally in independent CPU workers (not MPS central)')
     parser.add_argument('--gpu-inference-wait-ms',type=float,default=2.)
     parser.add_argument('--gpu-max-attention-elements',type=int,default=8000000)
-    parser.add_argument('--gpu-gradient-batch-size',type=int,default=4)
+    parser.add_argument('--gpu-gradient-batch-size',type=int,default=4,
+                        help='MPS gradient microbatch size; also used by two-pass '
+                             'gradient backend on CPU or MPS')
+    parser.add_argument('--gradient-backend',choices=('serial','two-pass'),default='serial',
+                        help='opt-in exact two-pass action-gradient replay')
+    parser.add_argument('--gradient-max-attention-elements',type=int,default=12000000,
+                        help='attention packing limit for two-pass gradients')
     parser.add_argument('--resume',action='store_true')
     parser.add_argument('--profile',action='store_true',
                         help='measure rollout, model inference, proof-game, gradient, and checkpoint costs per batch; may be enabled when resuming')
@@ -895,7 +907,7 @@ def main():
         args.eval_attempts=args.attempts
     if min(args.epochs,args.attempts,args.eval_attempts,args.batch_size,args.workers,
            args.gpu_inference_batch_size,args.gpu_max_attention_elements,
-           args.gpu_gradient_batch_size)<1:
+           args.gpu_gradient_batch_size,args.gradient_max_attention_elements)<1:
         parser.error('positive counts required')
     if not math.isfinite(args.length_penalty) or not 0. <= args.length_penalty < 1.:
         parser.error('--length-penalty must be finite and in [0,1)')
@@ -921,8 +933,20 @@ def main():
         parser.error('train-exploration-epsilon must be in [0,1)')
     if not math.isfinite(args.gpu_inference_wait_ms) or args.gpu_inference_wait_ms<0:
         parser.error('invalid GPU batching wait')
-    if args.device=='mps' and (args.cpu_central_inference or args.cpu_shared_action_cache):
-        parser.error('CPU inference options require --device cpu')
+    if args.cpu_topology_cache_mb < 0:
+        parser.error('--cpu-topology-cache-mb must be nonnegative')
+    if args.mps_local_cpu_rollouts and args.device != 'mps':
+        parser.error('--mps-local-cpu-rollouts requires --device mps')
+    if args.device=='mps' and args.cpu_central_inference:
+        parser.error('--cpu-central-inference requires --device cpu')
+    if (args.device=='mps' and args.cpu_shared_action_cache
+            and not args.mps_local_cpu_rollouts):
+        parser.error('--cpu-shared-action-cache on MPS requires '
+                     '--mps-local-cpu-rollouts')
+    if args.cpu_topology_cache_mb and (
+            args.representation != 'ast' or args.cpu_central_inference
+            or (args.device == 'mps' and not args.mps_local_cpu_rollouts)):
+        parser.error('--cpu-topology-cache-mb requires local CPU AST rollout workers')
     if args.cpu_central_inference and args.cpu_shared_action_cache:
         parser.error('choose either --cpu-central-inference or --cpu-shared-action-cache')
     if args.device=='mps' and not torch.backends.mps.is_available():
@@ -1021,20 +1045,38 @@ def main():
                 'batch_size':args.gpu_inference_batch_size,
                 'wait_ms':args.gpu_inference_wait_ms,
                 'max_attention_elements':args.gpu_max_attention_elements}
+    if args.cpu_topology_cache_mb:
+        config['cpu_topology_cache_mb'] = args.cpu_topology_cache_mb
+    if args.gradient_backend == 'two-pass':
+        config['gradient_execution'] = {
+            'backend': 'two-pass',
+            'context_batch_size': args.gpu_gradient_batch_size,
+            'action_batch_size': 16,
+            'max_attention_elements': args.gradient_max_attention_elements,
+            'deferred_checks': True}
     if args.device=='mps':
         config['device']='mps'
-        config['gpu_inference']={'batch_size':args.gpu_inference_batch_size,
-                                 'wait_ms':args.gpu_inference_wait_ms,
-                                 'max_attention_elements':args.gpu_max_attention_elements,
-                                 'gradient_batch_size':args.gpu_gradient_batch_size}
+        if args.mps_local_cpu_rollouts:
+            config['mps_local_cpu_rollouts'] = True
+            config['gpu_inference'] = {
+                'rollout': 'local-cpu-workers',
+                'gradient_batch_size': args.gpu_gradient_batch_size}
+        else:
+            config['gpu_inference']={'batch_size':args.gpu_inference_batch_size,
+                                     'wait_ms':args.gpu_inference_wait_ms,
+                                     'max_attention_elements':args.gpu_max_attention_elements,
+                                     'gradient_batch_size':args.gpu_gradient_batch_size}
     if args.resume:
         old=json.loads((args.out/'config.json').read_text())
         # Check both directions: switching an optimized run back to baseline
         # must not silently change its inference strategy on resume.
         for option in ('cpu_inference','cpu_central_batching','group_relative',
-                       'eval_attempts_per_machine','branch_rounds'):
-            legacy_default = (False if option=='group_relative' else
-                              0 if option=='branch_rounds' else
+                       'eval_attempts_per_machine','branch_rounds',
+                       'cpu_topology_cache_mb','gradient_execution',
+                       'mps_local_cpu_rollouts'):
+            legacy_default = (False if option in ('group_relative',
+                                                      'mps_local_cpu_rollouts') else
+                              0 if option in ('branch_rounds','cpu_topology_cache_mb') else
                               old.get('attempts_per_machine') if option=='eval_attempts_per_machine'
                               else None)
             if old.get(option,legacy_default) != config.get(option):
@@ -1090,7 +1132,8 @@ def main():
     if state['phase'] != 'done':
         atomic_json(args.out/'report.json',{'complete':False,'epochs_completed':state['completed_epochs'],'epochs_requested':args.epochs})
     weights_file=(args.out/'workers_policy.pt').resolve()
-    central_inference = args.device=='mps' or args.cpu_central_inference
+    central_inference = ((args.device=='mps' and not args.mps_local_cpu_rollouts)
+                         or args.cpu_central_inference)
     if central_inference:
         from .gpu_runtime import CentralRolloutPool
         runner=CentralRolloutPool(policy,workers=args.workers,
@@ -1101,8 +1144,16 @@ def main():
                           'workers':args.workers,
                           'inference_batch_size':args.gpu_inference_batch_size}),flush=True)
     else:
-        runner=mp.get_context('spawn').Pool(args.workers,initializer=init_worker,
-                                           initargs=(policy.config,args.cpu_shared_action_cache),maxtasksperchild=50)
+        runner=mp.get_context('spawn').Pool(
+            args.workers, initializer=init_worker,
+            initargs=(policy.config,args.cpu_shared_action_cache,
+                      args.cpu_topology_cache_mb), maxtasksperchild=50)
+        print(json.dumps({
+            'device':args.device,
+            'inference':'local-cpu-workers',
+            'gradient_backend':args.gradient_backend,
+            'cpu_topology_cache_mb':args.cpu_topology_cache_mb,
+            'workers':args.workers}),flush=True)
     with runner as pool:
         while state['phase']!='done':
             phase=state['phase'];epoch=state['epoch']
@@ -1156,7 +1207,11 @@ def main():
                                    balanced_initial_answers=args.balanced_initial_answers,
                                    length_penalty=args.length_penalty,
                                    group_relative=args.group_relative,
-                                   branch_rounds=args.branch_rounds) if training else {'updated':False}
+                                   branch_rounds=args.branch_rounds,
+                                   gradient_backend=args.gradient_backend,
+                                   gradient_max_attention_elements=
+                                       args.gradient_max_attention_elements
+                                   ) if training else {'updated':False}
                 if args.profile:
                     profile_stages['learn']=time.perf_counter()-profile_t
                     profile_t=time.perf_counter()
