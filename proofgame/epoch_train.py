@@ -1079,7 +1079,8 @@ def main():
                             args.train_exploration_epsilon if training else 0.,
                             training and args.balanced_initial_answers,
                             inspect_batch,args.profile,
-                            training and args.group_relative) for r in batch]
+                            training and args.group_relative,
+                            args.branch_rounds if training else 0) for r in batch]
                     results=pool.map(run_machine,tasks,chunksize=1)
                 if args.profile:
                     profile_stages['rollout']=time.perf_counter()-profile_t
