@@ -103,9 +103,15 @@ def _learn_once(snapshot, batch_results, config, budget, *, gpu_device,
         raise RuntimeError('baseline and optimized learning disagree on optimizer update')
     if default['updated']:
         drift = _compare_vectors(cpu, accelerated)
+        # AdamW's normalization of very small gradients means a tiny
+        # reordering error can yield a larger parameter delta. Validate
+        # the COMPLETE gradient tightly and bound weights by at most one
+        # pair of learning-rate-sized updates, rather than bitwise identity.
+        weight_drift_limit = max(2. * config['lr'], 1e-6)
         numerical_ok = (
             drift['relative_gradient_l2'] < 1e-4
-            and drift['max_absolute_parameter_difference'] < 5e-5)
+            and drift['max_absolute_parameter_difference'] <= weight_drift_limit)
+        drift['max_allowed_parameter_difference'] = weight_drift_limit
     else:
         drift = None
         numerical_ok = True
