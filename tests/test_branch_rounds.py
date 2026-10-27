@@ -16,7 +16,36 @@ from proofgame.model import Policy
 from proofgame.network_search import FrozenSampler
 from proofgame.population_sample import from_rank
 from proofgame.unfiltered_dataset import build_dataset
-from tests.test_group_relative import scripted_group
+def winning_group(policy, budget=12):
+    machine=from_rank(8)
+    sampler=FrozenSampler(policy)
+    trajectories=[]
+    successes=[]
+    for i in range(8):
+        game=Game(machine,budget=budget)
+        actions=(['choose:HALT','rule:exI','put:s','put:z','commit',
+                  'rule:refl','submit'] if i==0
+                 else ['choose:HALT']+['reset']*(budget-1))
+        trace=[]
+        for j,action in enumerate(actions):
+            obs=game.observation()
+            index=next(k for k,a in enumerate(obs['actions']) if a['id']==action)
+            prob=1. if j==0 else sampler.probabilities(obs)[index]
+            step={'action':action,'probability':prob}
+            if j==0:
+                step['forced_initial_answer']='HALT'
+            trace.append(step)
+            game.step(action,observe=False)
+        cert=game.certificate() if i==0 else None
+        trajectories.append({'attempt':i+1,'actions':trace,
+                             'status':game.status,'certificate':cert})
+        if cert is not None:
+            successes.append({'attempt':i+1,'actions':trace,
+                              'certificate':cert})
+    return {'machine':machine.to_json(),'attempts':64,
+            'rounds_completed':4,'first_proof_round':4,
+            'first_proof_answer':'HALT','group_trajectories':trajectories,
+            'successes':successes}
 
 
 class BranchRoundTests(unittest.TestCase):
@@ -99,16 +128,7 @@ class BranchRoundTests(unittest.TestCase):
         torch.manual_seed(17)
         model=Policy(width=32,layers=1).eval()
         optimizer=torch.optim.AdamW(model.parameters(),lr=0.,weight_decay=0.)
-        group=scripted_group(model,successes=1,budget=12)
-        winning=[dict(t,attempt=i+1) for i,t in
-                 enumerate(group['group_trajectories'][:4])]
-        # Add four further HALT failures with valid on-policy trajectories.
-        winning += [dict(t,attempt=i+5) for i,t in
-                    enumerate(group['group_trajectories'][1:5])]
-        row={**group,'attempts':64,'rounds_completed':4,
-             'first_proof_round':4,'first_proof_answer':'HALT',
-             'group_trajectories':winning,
-             'successes':[group['successes'][0]]}
+        row=winning_group(model,budget=12)
         groups,proofs,stats=et.prepare_group_relative_gradients(
             [row],12,.3,balanced_initial_answers=True,branch_rounds=6)
         self.assertEqual(proofs,1)
