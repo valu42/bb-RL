@@ -2,9 +2,11 @@
 
 Evaluation always runs the exact configured number of independent-reset
 attempts per machine. Training can optionally stop on its first verified proof.
-Rollout batches share frozen weights; only training successes supply REINFORCE
-gradients. Evaluation never updates parameters. Selector proofs are not accepted
-in the dataset. Checkpoints commit after every rollout batch.
+Rollout batches share frozen weights. Standard REINFORCE learns from
+verified successes; optional group-relative training also learns from failed
+attempts through leave-one-out advantages. Evaluation never updates parameters.
+Selector proofs are not accepted in the dataset. Checkpoints commit after
+every rollout batch.
 """
 import argparse
 import copy
