@@ -129,16 +129,19 @@ def init_worker(model_config, share_action_cache=False):
 
 def execute_machine(selected, seed, attempts, budget, version, stop_on_success, sampler,
                     exploration_epsilon=0., balanced_initial_answers=False,
-                    trace_diagnostics=False, profile_enabled=False):
+                    trace_diagnostics=False, profile_enabled=False, group_relative=False):
     """Execute a machine with either a CPU policy or the central GPU sampler."""
     machine = Machine(selected['machine']['rows']); rng = random.Random(seed)
     successes = []; statuses = Counter(); actions = 0; start = time.monotonic()
+    group_trajectories = [] if group_relative else None
     if balanced_initial_answers and attempts % 2:
         raise ValueError('balanced initial answers require an even number of attempts')
     # Balanced training is an upper bound of 50/50 attempts, not a requirement
     # to keep trying after either branch has produced a verified certificate.
-    if balanced_initial_answers:
+    if balanced_initial_answers and not group_relative:
         stop_on_success = True
+    if group_relative and stop_on_success:
+        raise ValueError('group-relative rollouts must collect all attempts')
     schedule = (['HALT'] * (attempts//2) + ['NONHALT'] * (attempts//2)
                 if balanced_initial_answers else [None] * attempts)
     if balanced_initial_answers:
@@ -167,6 +170,10 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
                                       forced_initial_answer=schedule[i],
                                       diagnostic_steps=detail, profile=profile)
         actions += len(trace); statuses[status] += 1
+        if group_relative:
+            group_trajectories.append({'attempt':i+1,'actions':trace,
+                                       'status':status,
+                                       'certificate':cert})
         if trace_diagnostics:
             sample = {'attempt':i+1, 'status':status, 'steps':detail,
                       'certificate':cert if cert else None}
@@ -201,12 +208,15 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
             **({'diagnostic_traces':{'success':first_success_trace,
                                     'failure':last_failed_trace}}
                if trace_diagnostics else {}),
-            **({'profile':profile} if profile_enabled else {})}
+            **({'profile':profile} if profile_enabled else {}),
+            **({'group_trajectories':group_trajectories} if group_relative else {})}
 
 
 def run_machine(task):
     global _worker_policy_version, _worker_action_features
-    selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon, balanced, diagnostics, profiling = task
+    if len(task) == 11:
+        task = (*task, False)  # Existing direct-worker callers.
+    selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon, balanced, diagnostics, profiling, group_relative = task
     if profiling:
         started = time.perf_counter()
     saved = torch.load(weights_file, map_location='cpu', weights_only=True)
@@ -223,7 +233,7 @@ def run_machine(task):
     if profiling:
         load_seconds = time.perf_counter() - started
     result = execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler,
-                             epsilon,balanced,diagnostics,profiling)
+                             epsilon,balanced,diagnostics,profiling,group_relative)
     if profiling:
         result['profile']['worker_model_load_seconds'] = load_seconds
         result['profile']['cache_hits'] = sampler.hits
