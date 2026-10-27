@@ -51,11 +51,11 @@ def build_cases(strategies, workers, barriers, inference_batches, waits, repeats
     return cases
 
 
-def task_for(row, config, epoch, *, central):
+def task_for(row, config, epoch, *, central, version=0):
     common = (
         row,
         task_seed(config['seed'], 'train', epoch, row['machine_id']),
-        config['attempts_per_machine'], config['budget'], 0,
+        config['attempts_per_machine'], config['budget'], version,
         False, config.get('train_exploration_epsilon', 0.),
         config.get('balanced_initial_answers', False),
         False, True, config.get('group_relative', False),
@@ -66,11 +66,11 @@ def task_for(row, config, epoch, *, central):
     raise RuntimeError('worker tasks need a file path')
 
 
-def worker_task_for(row, config, epoch, weights_path):
+def worker_task_for(row, config, epoch, weights_path, version=0):
     seed = task_seed(config['seed'], 'train', epoch, row['machine_id'])
     return (
         row, seed, config['attempts_per_machine'], config['budget'],
-        str(weights_path), 0, False,
+        str(weights_path), version, False,
         config.get('train_exploration_epsilon', 0.),
         config.get('balanced_initial_answers', False),
         False, True, config.get('group_relative', False),
@@ -99,7 +99,7 @@ def digest_results(results):
     return hashes
 
 
-def run_case(case, config, rows, checkpoint):
+def run_case(case, config, rows, checkpoint, *, simulate_update_barriers=False):
     central = case['strategy'] in ('central-cpu', 'central-mps')
     device = 'mps' if case['strategy'] == 'central-mps' else 'cpu'
     if device == 'mps' and not torch.backends.mps.is_available():
@@ -110,10 +110,19 @@ def run_case(case, config, rows, checkpoint):
     policy.load_state_dict(saved['state_dict'])
     infer_batch = case['inference_batch'] if central else None
     with tempfile.TemporaryDirectory(prefix='proofgame-rollout-matrix-') as tmp:
-        snapshot = Path(tmp) / 'policy.pt'
+        # Generate all frozen-weight versioned snapshots before the clock
+        # starts. This measures cache invalidation, not checkpoint write I/O.
+        # Real training also changes weights at each update boundary, which
+        # cannot be reproduced by a frozen-model throughput benchmark.
+        snapshots = {}
         if not central:
-            torch.save({'version': 0, 'config': policy.config,
-                        'state_dict': policy.state_dict()}, snapshot)
+            versions = (range((len(rows) + case['barrier'] - 1) // case['barrier'])
+                        if simulate_update_barriers else (0,))
+            for version in versions:
+                snapshot = Path(tmp) / f'policy_version_{version}.pt'
+                torch.save({'version': version, 'config': policy.config,
+                            'state_dict': policy.state_dict()}, snapshot)
+                snapshots[version] = snapshot
             runner = mp.get_context('spawn').Pool(
                 case['workers'], initializer=init_worker,
                 initargs=(policy.config, case['strategy'] == 'worker-shared'),
@@ -127,13 +136,17 @@ def run_case(case, config, rows, checkpoint):
             start = time.perf_counter()
             for offset in range(0, len(rows), case['barrier']):
                 part = rows[offset:offset + case['barrier']]
+                version = (offset // case['barrier']
+                           if simulate_update_barriers else 0)
                 if central:
                     jobs = [task_for(row, config, config['benchmark_epoch'],
-                                     central=True) for row in part]
+                                     central=True, version=version)
+                            for row in part]
                     result = pool.run(jobs)
                 else:
                     jobs = [worker_task_for(
-                        row, config, config['benchmark_epoch'], snapshot)
+                        row, config, config['benchmark_epoch'],
+                        snapshots[version], version=version)
                         for row in part]
                     result = pool.map(run_machine, jobs, chunksize=1)
                 output.extend(result)
@@ -155,6 +168,10 @@ def run_case(case, config, rows, checkpoint):
         'actions_per_second': total_actions / elapsed,
         'attempts_per_second': total_attempts / elapsed,
         'machine_task_seconds_sum': worker_seconds,
+        'simulated_update_barriers': simulate_update_barriers,
+        'frozen_weight_versions': (
+            (len(rows) + case['barrier'] - 1) // case['barrier']
+            if simulate_update_barriers else 1),
         'elapsed_worker_occupancy': worker_seconds / (case['workers']*elapsed),
         'observation_cache_hits': sum(row.get('cache_hits', 0) for row in output),
         'network_evaluations': sum(row.get('network_evaluations', 0) for row in output),
@@ -174,6 +191,9 @@ def run_case(case, config, rows, checkpoint):
             'Worker elapsed-task occupancy is not hardware CPU utilization.',
             'Different numerical inference may change trajectories even with identical RNG seeds.',
             'This is a frozen-policy benchmark without gradient learning.',
+            'When simulated_update_barriers=true, action/observation caches are '
+            'reset at each barrier with a new version ID, but neural weights '
+            'remain identical; this isolates cache-version overhead.',
             'Barrier values greater than the actual SGD batch size are upper bounds '
             'requiring an algorithm-preserving asynchronous design before training.',
         ],
@@ -183,7 +203,8 @@ def run_case(case, config, rows, checkpoint):
 
 def run_matrix(run, epoch, *, machines, machine_source, strategies,
                workers, barriers, inference_batches, waits, repeats, seed,
-               output, resume=False, max_cases=None):
+               output, resume=False, max_cases=None,
+               simulate_update_barriers=False):
     config = json.loads((run / 'config.json').read_text())
     dataset = json.loads((run / 'dataset.json').read_text())
     selected = select_machines(run, epoch, dataset, machines, machine_source, seed)
@@ -199,6 +220,10 @@ def run_matrix(run, epoch, *, machines, machine_source, strategies,
         'machine_ids': [r['machine_id'] for r in selected],
         'machine_source': machine_source, 'cases': cases,
     }
+    # Preserve existing resume signatures for already running old matrices.
+    # A simulated-version matrix is always a separate experiment.
+    if simulate_update_barriers:
+        signature['simulate_update_barriers'] = True
     fingerprint = hashlib.sha256(
         json.dumps(signature, sort_keys=True).encode()).hexdigest()
     if output.exists():
@@ -226,7 +251,8 @@ def run_matrix(run, epoch, *, machines, machine_source, strategies,
               flush=True)
         started = time.perf_counter()
         try:
-            metrics = run_case(case, config, selected, checkpoint)
+            metrics = run_case(case, config, selected, checkpoint,
+                               simulate_update_barriers=simulate_update_barriers)
         except Exception as exc:
             metrics = {'status': 'error', 'error': repr(exc)}
         row = {'case_id': case_id, **case, **metrics}
@@ -261,6 +287,10 @@ def main():
     p.add_argument('--repeats', type=int, default=2)
     p.add_argument('--seed', type=int, default=37)
     p.add_argument('--resume', action='store_true')
+    p.add_argument('--simulate-update-barriers', action='store_true',
+                   help='invalidate worker/coordinator feature caches after '
+                        'each barrier as if an optimizer update had occurred; '
+                        'model weights remain frozen for comparison')
     p.add_argument('--max-cases', type=int,
                    help='stop after N completed configurations; --resume later')
     p.add_argument('--out', type=Path, required=True)
@@ -285,7 +315,8 @@ def main():
             workers=worker_counts, barriers=barriers,
             inference_batches=inference_batches, waits=waits,
             repeats=args.repeats, seed=args.seed,
-            output=args.out, resume=args.resume, max_cases=args.max_cases)
+            output=args.out, resume=args.resume, max_cases=args.max_cases,
+            simulate_update_barriers=args.simulate_update_barriers)
     except (OSError, ValueError, KeyError) as exc:
         p.error(str(exc))
     good = [row for row in report['results'] if row['status'] == 'ok']
