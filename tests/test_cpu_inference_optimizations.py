@@ -113,6 +113,49 @@ class CpuInferenceOptimizationTests(unittest.TestCase):
         update=learn_batch(policy,optimizer,[row],20)
         self.assertTrue(update['updated'])
 
+    def test_opt_in_cpu_topology_cache_and_two_pass_cli(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = root / 'data.json'
+            dataset.write_text(json.dumps(build_dataset(2, 1, 8, 777)))
+            output = root / 'train'
+            args = [
+                sys.executable, '-m', 'proofgame.epoch_train',
+                '--dataset', str(dataset), '--out', str(output),
+                '--epochs', '1', '--attempts', '2', '--batch-size', '2',
+                '--workers', '2', '--seed', '33',
+                '--device', 'cpu', '--representation', 'ast',
+                '--group-relative', '--balanced-initial-answers',
+                '--cpu-shared-action-cache', '--cpu-topology-cache-mb', '2',
+                '--gradient-backend', 'two-pass',
+                '--gpu-gradient-batch-size', '2', '--profile',
+            ]
+            completed = subprocess.run(
+                args, capture_output=True, text=True, timeout=180)
+            self.assertEqual(
+                completed.returncode, 0,
+                completed.stdout + '\n' + completed.stderr)
+            config = json.loads((output / 'config.json').read_text())
+            self.assertEqual(config['cpu_topology_cache_mb'], 2)
+            self.assertEqual(config['gradient_execution']['backend'], 'two-pass')
+            self.assertEqual(config['gradient_execution']['context_batch_size'], 2)
+            profile = json.loads(
+                (output / 'profiling' /
+                 'epoch_01_train_batch_0001.json').read_text())
+            self.assertIn('topology_cache_hits', profile['worker_counts'])
+            self.assertIn('topology_cache_misses', profile['worker_counts'])
+            # Performance choices are part of a reproducible run's config.
+            bad = subprocess.run(
+                args + ['--resume', '--cpu-topology-cache-mb', '3'],
+                capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(bad.returncode, 0)
+            self.assertIn('resume configuration changed', bad.stderr)
+            invalid = subprocess.run(
+                args + ['--mps-local-cpu-rollouts'],
+                capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(invalid.returncode, 0)
+            self.assertIn('requires --device mps', invalid.stderr)
+
     def test_central_cpu_cli_runs_and_profiles(self):
         with TemporaryDirectory() as tmp:
             root=Path(tmp)
