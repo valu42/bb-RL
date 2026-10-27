@@ -133,7 +133,8 @@ python -m proofgame.epoch_train \
   --cpu-shared-action-cache --length-penalty 0.3 --profile
 ```
 
-The fixed test machines are excluded from training. The 12,500 train
+The fixed test machines **and the separate parity-trap and Busy Beaver
+benchmark machines** are excluded from training. The 12,500 train
 machines are sampled uniformly without replacement from the complement.
 The dataset generator stores and the trainer revalidates the held-out
 ranks and deterministic sampling seed. This keeps evaluation directly
