@@ -785,7 +785,7 @@ def main():
                           'last_batch_successful_attempts_by_answer':batch_outcomes['successful_attempts_by_answer'],
                           'active_seconds':state['active_seconds']}
                 if central_inference:
-                    progress['central_inference']=pool.inference.stats()
+                    progress['gpu_inference' if args.device=='mps' else 'cpu_inference'] = pool.inference.stats()
                 atomic_json(args.out/'progress.json',progress);print(json.dumps(progress),flush=True)
                 continue
             if args.profile:
