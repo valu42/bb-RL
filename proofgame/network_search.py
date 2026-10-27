@@ -73,15 +73,26 @@ class FrozenSampler:
 
 
 def attempt(sampler, machine, rng, budget=20, exploration_epsilon=0., on_initial_choice=None,
-            forced_initial_answer=None, diagnostic_steps=None):
+            forced_initial_answer=None, diagnostic_steps=None, profile=None):
     game = Game(machine, budget=budget)
     trace = []
     while game.status == "ACTIVE":
+        if profile is not None:
+            t0 = time.perf_counter()
         observation = game.observation()
+        if profile is not None:
+            profile['observation_seconds'] += time.perf_counter() - t0
+            t0 = time.perf_counter()
         try:
             probabilities = sampler.probabilities(observation)
         except ModelLimit:
+            if profile is not None:
+                profile['inference_seconds'] += time.perf_counter() - t0
+                profile['inference_calls'] += 1
             return None, trace, "MODEL_LIMIT"
+        if profile is not None:
+            profile['inference_seconds'] += time.perf_counter() - t0
+            profile['inference_calls'] += 1
         behavior = mix_probabilities(observation, probabilities, exploration_epsilon)
         forced = not trace and forced_initial_answer is not None
         if forced:
@@ -128,14 +139,23 @@ def attempt(sampler, machine, rng, budget=20, exploration_epsilon=0., on_initial
                 'certificate_candidate': observation.get('candidate'),
                 'answer': observation['answer'],
             }
+        if profile is not None:
+            t0 = time.perf_counter()
         game.step(action, observe=False)
+        if profile is not None:
+            profile['step_seconds'] += time.perf_counter() - t0
+            profile['actions'] += 1
         if diagnostic_steps is not None:
             detail['status_after'] = game.status
             detail['error_after'] = game.error
             diagnostic_steps.append(detail)
     if game.status == "SOLVED":
+        if profile is not None:
+            t0 = time.perf_counter()
         certificate = game.certificate()
         check(certificate)
+        if profile is not None:
+            profile['verification_seconds'] += time.perf_counter() - t0
         return certificate, trace, game.status
     return None, trace, game.status
 
