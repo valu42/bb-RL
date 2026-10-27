@@ -147,7 +147,8 @@ def summarize_learning_trials(trials, *, warmups=(), min_steady_trials=3,
         'warmup_trials': len(warmups),
         'timed_trials': len(trials),
         'per_timed_trial_speedups': [
-            float(row['cpu_serial_seconds']) / float(row['two_pass_seconds'])
+            (float(row['cpu_serial_seconds']) / float(row['two_pass_seconds']))
+            if float(row['two_pass_seconds']) > 0 else None
             for row in trials],
         'all_updates_numerically_equivalent': valid,
         'all_updates_applied': updated,
