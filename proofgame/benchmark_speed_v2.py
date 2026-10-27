@@ -19,9 +19,7 @@ Example:
 import argparse
 from collections import defaultdict
 import json
-import math
 from pathlib import Path
-import random
 import statistics
 import time
 
@@ -64,29 +62,6 @@ def _compare_vectors(baseline, candidate):
         'max_absolute_parameter_difference': float(
             (params_new - params_old).abs().max()),
     }
-
-
-def _training_update_trial(snapshot, batch_results, config, budget,
-                           gradient_device, context_batch):
-    model = Policy(**snapshot['config']).to(gradient_device).eval()
-    model.load_state_dict(snapshot['state_dict'])
-    torch.set_num_threads(1)
-    opt = torch.optim.AdamW(
-        model.parameters(), lr=config['lr'], weight_decay=0.)
-    started = time.perf_counter()
-    update = learn_batch(
-        model, opt, batch_results, budget,
-        gpu_gradient_batch_size=context_batch,
-        exploration_epsilon=config.get('train_exploration_epsilon', 0.),
-        balanced_initial_answers=config.get('balanced_initial_answers', False),
-        length_penalty=config.get('length_penalty', 0.),
-        group_relative=config.get('group_relative', False),
-        branch_rounds=config.get('branch_rounds', 0),
-        gradient_backend='serial' if gradient_device == 'cpu-serial' else 'two-pass')
-    if gradient_device == 'mps':
-        torch.mps.synchronize()
-    elapsed = time.perf_counter() - started
-    return model, update, elapsed
 
 
 def _learn_once(snapshot, batch_results, config, budget, *, gpu_device,
