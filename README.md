@@ -82,6 +82,29 @@ These example numbers are illustrative. The trace probabilities are
 action-selection probabilities, **not** probabilities that a proof claim is
 mathematically true. No new CLI flag is required.
 
+## Reset the proof, not the answer
+
+The proof-game `reset` action now **preserves the selected HALT/NONHALT
+answer**. It clears the proof tree, certificate draft, expression draft,
+focus, and failed-submission state, but does not return to the answer
+selection menu. A new attempt (a new `Game` instance) is required to
+choose another answer. The action still consumes one step of the
+attempt's action budget.
+
+This fixes a branch-race bug: an attempt that was scheduled to prove
+HALT could previously reset, switch to NONHALT, and receive a valid
+NONHALT certificate. The branch-race runner would then crash because
+the final proof contradicted its forced initial answer. With this
+change, **all steps in an attempt stay on its scheduled branch**.
+Both branches are still explored independently in the same round.
+
+The trusted proof checker is unchanged. The semantics of the game and
+available actions have changed, so restart the process after pulling
+and start a **fresh training run** rather than resuming a checkpoint
+created under the old reset semantics. In particular, any existing
+baseline results are not directly comparable without accounting for
+this environment change.
+
 ## Branch-race group-relative training: up to 48 attempts per answer
 
 The optional `--branch-rounds 6` mode addresses sparse HALT discoveries
