@@ -696,7 +696,7 @@ def main():
     parser.add_argument('--length-penalty',type=float,default=0.,
                         help='verified reward = 1 - penalty * actions / budget; default 0')
     parser.add_argument('--balanced-initial-answers',action='store_true',
-                        help='alternate balanced HALT/NONHALT first attempts (50/50 over 100 max), stopping immediately after the first verified proof')
+                        help='force half HALT and half NONHALT initial choices; full groups with --group-relative, otherwise stop after first proof')
     parser.add_argument('--train-exploration-epsilon',type=float,default=0.2,
                         help='fraction of initial training decisions sampled uniformly between HALT/NONHALT (default 0.2); evaluation unchanged')
     parser.add_argument('--representation',choices=('bytes','ast'),default='bytes',
@@ -729,7 +729,7 @@ def main():
     if args.balanced_initial_answers:
         if args.attempts % 2:
             parser.error('--balanced-initial-answers requires an even --attempts')
-        # Both flags request the same early-stop behavior in balanced mode.
+        # Forced first choices replace epsilon exploration in both modes.
         if args.train_exploration_epsilon != 0.2:
             parser.error('balanced initial answers replaces epsilon exploration; omit --train-exploration-epsilon')
         args.train_exploration_epsilon=0.
