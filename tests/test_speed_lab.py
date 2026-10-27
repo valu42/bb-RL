@@ -10,6 +10,7 @@ from proofgame.benchmark_real_gradients import (
     attention_elements, gradient_trial, make_samples, probability_disagreement,
     select_machines)
 from proofgame.benchmark_rollout_matrix import build_cases
+from proofgame.experimental_packed_batch import packed_score_many
 from proofgame.experimental_action_replay import (
     replay_unique_action_gradients, two_pass_probability_disagreement)
 from proofgame.experimental_structural_cache import (
@@ -140,6 +141,56 @@ class SpeedLabTests(unittest.TestCase):
                 model, samples, context_batch_size=2, action_batch_size=4,
                 denominator=8, epsilon=0.)
         torch.testing.assert_close(two_pass, cached, rtol=0, atol=0)
+
+    def test_packed_action_encoding_and_deferred_checks_preserve_gradients(self):
+        model, first = self.example()
+        game = Game(from_rank(8), budget=12)
+        game.step('choose:HALT', observe=False)
+        second = game.observation()
+        observations = [first, second]
+        original = model.score_many(observations)
+        packed = packed_score_many(
+            model, observations, max_action_batch_size=2,
+            max_attention_elements=1000000)
+        for a, b in zip(original, packed):
+            torch.testing.assert_close(a, b, atol=1e-5, rtol=1e-5)
+        samples = []
+        for i, obs in enumerate(observations):
+            with torch.no_grad():
+                probs = model(obs)[0].softmax(-1).tolist()
+            counts = [0.] * len(obs['actions'])
+            counts[0] = 1. if i == 0 else -0.8
+            sample = make_samples(
+                {encode_json(obs): (counts, {0: probs[0]})}, model, 0, 91)
+            samples.extend(sample)
+        ref, ref_stats = gradient_trial(
+            model, samples, mode='serial', batch_size=1,
+            bucketed=False, denominator=8, epsilon=0.)
+        ref_deferred, deferred_stats = gradient_trial(
+            model, samples, mode='serial', batch_size=1,
+            bucketed=False, denominator=8, epsilon=0., defer_checks=True)
+        torch.testing.assert_close(ref_deferred, ref, atol=1e-7, rtol=1e-5)
+        self.assertAlmostEqual(ref_stats['loss'], deferred_stats['loss'], places=5)
+        variant, variant_stats = gradient_trial(
+            model, samples, mode='packed-score-many', batch_size=2,
+            bucketed=True, denominator=8, epsilon=0., defer_checks=True,
+            packed_action_batch_size=2, max_attention_elements=1000000)
+        difference = float(torch.linalg.vector_norm(variant-ref) /
+                           torch.linalg.vector_norm(ref).clamp_min(1e-12))
+        self.assertLess(difference, 1e-4)
+        self.assertAlmostEqual(ref_stats['loss'], variant_stats['loss'], places=5)
+        plain, _ = replay_unique_action_gradients(
+            model, samples, context_batch_size=2, action_batch_size=2,
+            denominator=8, epsilon=0.)
+        deferred, _ = replay_unique_action_gradients(
+            model, samples, context_batch_size=2, action_batch_size=2,
+            denominator=8, epsilon=0., defer_checks=True)
+        torch.testing.assert_close(plain, deferred, atol=1e-7, rtol=1e-5)
+        max_error, checked = probability_disagreement(
+            model, samples, 'packed-score-many', 2, True, 0.,
+            packed_action_batch_size=2, max_attention_elements=1000000)
+        self.assertEqual(checked, 2)
+        self.assertLess(max_error, 1e-5)
 
     def test_rollout_matrix_cases_and_selection_are_deterministic(self):
         cases = build_cases(
