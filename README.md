@@ -8,6 +8,48 @@ The proof environment works. The Transformer and training loop run. **This is
 not yet evidence that the model learns to prove machines.** Included example
 proofs are human-written verification fixtures; the trainer never loads them.
 
+## Mixed 2-, 3-, and 4-state training
+
+Create a fixed dataset with 1,000 training machines (334/333/333 by size)
+and 300 held-out machines (100 of each size):
+
+```bash
+python -m proofgame.mixed_dataset \
+  --train 1000 --test 300 --budget 100 --seed 20261028 \
+  --out runs/mixed_234_dataset.json
+
+python -u -m proofgame.epoch_train \
+  --dataset runs/mixed_234_dataset.json \
+  --out runs/ast_234_w64_l2 \
+  --epochs 100 \
+  --attempts 8 --branch-rounds 6 --eval-attempts 100 \
+  --batch-size 8 --workers 8 \
+  --representation ast --device cpu --width 64 --layers 2 \
+  --balanced-initial-answers --group-relative \
+  --cpu-shared-action-cache --length-penalty 0.3 \
+  --log-mode compact
+```
+
+Sampling is uniform over labelled transition tables within each size, without
+replacement and excluding the existing special benchmark tables. There is no
+halting, proof-success, or reachability filter; some tables have unreachable
+states. Train/test tables are disjoint, though equivalent relabellings are not
+deduplicated. Counts are split as evenly as possible, giving remainder entries
+to smaller state counts. Dataset generation refuses to overwrite an existing file.
+The trainer reproduces the seed and validates all tables, identities, and metadata.
+
+Compact progress retains overall counts per batch and adds three per-size
+summaries at the end of each phase, including HALT/NONHALT counts, mean first
+proof actions, and unproved counts. The same breakdown is saved under
+`proof_progress.by_states` in progress and epoch JSON reports.
+
+Start a fresh run when switching datasets. To resume this experiment, reuse
+the training command with `--resume` (do not regenerate the dataset). The
+100-action limit, proof checker limits, and existing two special evaluations
+are unchanged; this does not yet add the larger curated challenge suite.
+Two-layer models use full attention and cost more compute than one-layer
+root-query models. Use a separate run with `--width 64 --layers 1` for the latter.
+
 ## Larger models and compact progress
 
 The epoch trainer accepts `--width`, `--layers`, and `--heads`. Defaults remain
