@@ -1030,11 +1030,17 @@ def main():
     try:lock = acquire_run_lock(args.out/'run.lock')
     except RuntimeError as e:parser.error(str(e))
     dataset_bytes = args.dataset.read_bytes(); dataset = json.loads(dataset_bytes)
+    from .mixed_dataset import DATASET_FORMAT as MIXED_FORMAT, validate_dataset as validate_mixed
     dataset_format = dataset.get('format')
-    if dataset_format not in ('proofgame-epoch-curriculum-1', UNFILTERED_FORMAT):
+    if dataset_format not in ('proofgame-epoch-curriculum-1', UNFILTERED_FORMAT, MIXED_FORMAT):
         parser.error('unsupported dataset')
     if type(dataset.get('action_budget')) is not int or dataset['action_budget'] < 1:
         parser.error('invalid action budget')
+    if dataset_format == MIXED_FORMAT:
+        try:
+            validate_mixed(dataset)
+        except ValueError as exc:
+            parser.error(str(exc))
     ids = []
     for split in ['train','test']:
         if not dataset.get(split): parser.error('empty split')
@@ -1047,7 +1053,7 @@ def main():
             if dataset_format=='proofgame-epoch-curriculum-1':
                 if is_test(machine)!=(split=='test'):
                     parser.error('invalid filtered dataset split')
-            else:
+            elif dataset_format == UNFILTERED_FORMAT:
                 rank=row['rank']
                 if (type(rank) is not int or not 0<=rank<POPULATION
                         or from_rank(rank,states=2).to_json()!=machine.to_json()):
@@ -1107,7 +1113,7 @@ def main():
                 ('training: stop after first verified proof; evaluation: full attempt budget'
                  if args.stop_after_first_train_proof else 'continue to exact attempt budget')),
             'evaluation':('fixed unfiltered test set; fixed sampling seeds; no updates'
-                          if dataset_format==UNFILTERED_FORMAT
+                          if dataset_format in (UNFILTERED_FORMAT, MIXED_FORMAT)
                           else 'fixed filtered test set; fixed sampling seeds; no updates'),
             'selector_proofs_supplied':0,'initial_archive':0}
     if args.cpu_central_inference or args.cpu_shared_action_cache:
@@ -1398,6 +1404,9 @@ def main():
             batch_paths=sorted(folder.glob('batch_*.json'))
             metrics=summarize(batch_paths)
             metrics['proof_progress'] = proof_progress.snapshot()
+            if len(proof_progress.by_states) > 1:
+                for line in proof_progress.state_lines():
+                    print(f'Epoch {epoch} {phase} | {line}',flush=True)
             if training and args.group_relative:
                 metrics['group_relative_stats']=summarize_group_updates(batch_paths)
             if training and args.branch_rounds:

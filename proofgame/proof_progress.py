@@ -7,16 +7,25 @@ class ProofProgress:
         self.completed = 0
         self.counts = dict.fromkeys(('HALT', 'NONHALT'), 0)
         self.actions = dict.fromkeys(('HALT', 'NONHALT'), 0)
+        self.by_states = {}
 
     def add(self, rows):
         for row in rows:
-            self.completed += 1
-            if not row['successes']:
-                continue
-            first = min(row['successes'], key=lambda proof: proof['attempt'])
-            answer = first['certificate']['answer']
-            self.counts[answer] += 1
-            self.actions[answer] += len(first['actions'])
+            self._add_one(row)
+            if 'machine' in row:
+                states = str(len(row['machine']['rows']) // 2)
+                if states not in self.by_states:
+                    self.by_states[states] = ProofProgress()
+                self.by_states[states]._add_one(row)
+
+    def _add_one(self, row):
+        self.completed += 1
+        if not row['successes']:
+            return
+        first = min(row['successes'], key=lambda proof: proof['attempt'])
+        answer = first['certificate']['answer']
+        self.counts[answer] += 1
+        self.actions[answer] += len(first['actions'])
 
     @classmethod
     def restore(cls, folder, completed):
@@ -35,12 +44,15 @@ class ProofProgress:
 
     def snapshot(self):
         return {
+            'machines': self.completed,
             'machines_proved_by_answer': dict(self.counts),
             'machines_unproved': self.completed - sum(self.counts.values()),
             'mean_first_proof_actions_by_answer': {
                 answer: self.actions[answer] / count if count else None
                 for answer, count in self.counts.items()},
             'proof_length_scope': 'first verified proof per solved machine, current phase',
+            **({'by_states': {n: item.snapshot() for n, item in sorted(self.by_states.items())}}
+               if self.by_states else {}),
         }
 
     def text(self):
@@ -51,3 +63,7 @@ class ProofProgress:
             parts.append(f'{answer} {count} (avg {mean} proof actions)')
         parts.append(f'unproved {self.completed - sum(self.counts.values())}')
         return ' | '.join(parts)
+
+    def state_lines(self):
+        return [f'{n}-state ({item.completed} machines): {item.text()}'
+                for n, item in sorted(self.by_states.items())]
