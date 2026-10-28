@@ -86,6 +86,7 @@ def digest_results(results):
         source = {
             'attempts': row['attempts'], 'actions': row['actions'],
             'statuses': row['statuses'],
+            'trajectory_sha256':row.get('trajectory_sha256'),
             'success_actions': [
                 [s['action'] for s in success['actions']]
                 for success in row['successes']],
