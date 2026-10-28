@@ -38,7 +38,7 @@ class EpochProgress:
                 'eta_scope':'current phase, including rollout, learning and checkpoints; excludes later phases',
                 'timing_sample_machines':measured}
 
-    def show(self, completed=None, *, heartbeat=False):
+    def show(self, completed=None, *, heartbeat=False, detail=''):
         if completed is not None:
             if not self.completed <= completed <= self.total:
                 raise ValueError('progress must advance within the phase total')
@@ -56,6 +56,8 @@ class EpochProgress:
                 f'{self.completed}/{self.total} machines | '
                 f'elapsed {duration(data["elapsed_seconds"])} | '
                 f'{self.phase} ETA ~{duration(data["eta_seconds"])}')
+        if detail:
+            line += ' | ' + detail
         # Complete lines keep stderr bars readable beside stdout JSON logs.
         print(line, file=self.stream, flush=True)
         return data

@@ -902,7 +902,12 @@ def main():
     parser.add_argument('--rollout-scheduler',choices=('auto','machine','attempt'),default='auto',
                         help='auto distributes branch-round attempts across local CPU workers')
     parser.add_argument('--encoder-backend',choices=('auto','full','root-query'),default='auto',
-                        help='auto uses root-query for the one-layer AST training model')
+                        help='auto uses root-query for one-layer AST models, full attention otherwise')
+    parser.add_argument('--width',type=int,default=32,help='model embedding width; new runs only')
+    parser.add_argument('--layers',type=int,default=1,help='Transformer depth; new runs only')
+    parser.add_argument('--heads',type=int,default=4,help='attention heads; must divide width')
+    parser.add_argument('--log-mode',choices=('detailed','compact'),default='detailed',
+                        help='compact prints proof counts, mean proof actions and ETA; files remain detailed')
     parser.add_argument('--log-interval',type=float,default=10.,
                         help='seconds between live rollout progress records')
     parser.add_argument('--workers',type=int,default=8)
@@ -945,6 +950,12 @@ def main():
     parser.add_argument('--stop-after-first-train-proof',action='store_true',
                         help='stop each training machine after one verified proof; keep evaluation at the full attempt budget')
     args = parser.parse_args()
+    verbose = args.log_mode == 'detailed'
+    def log(*values, **kwargs):
+        if verbose:
+            print(*values, **kwargs)
+    if min(args.width,args.layers,args.heads) < 1 or args.width % 2 or args.width % args.heads:
+        parser.error('positive model dimensions required; width must be even and divisible by heads')
     if args.eval_batch_size < 0 or not math.isfinite(args.log_interval) or args.log_interval <= 0:
         parser.error('nonnegative evaluation queue and positive log interval required')
     args.eval_batch_size = args.eval_batch_size or max(args.batch_size, 4 * args.workers)
@@ -956,9 +967,9 @@ def main():
         parser.error('attempt scheduler requires branch rounds and local CPU inference')
     if args.encoder_backend == 'auto':
         args.encoder_backend = ('root-query' if args.representation == 'ast'
-                                and not args.cpu_topology_cache_mb else 'full')
-    if args.encoder_backend == 'root-query' and args.representation != 'ast':
-        parser.error('root-query requires --representation ast')
+                                and args.layers == 1 and not args.cpu_topology_cache_mb else 'full')
+    if args.encoder_backend == 'root-query' and (args.representation != 'ast' or args.layers != 1):
+        parser.error('root-query requires --representation ast and --layers 1')
     if args.encoder_backend == 'root-query' and args.cpu_topology_cache_mb:
         parser.error('root-query replaces the full topology cache; omit --cpu-topology-cache-mb')
     if args.eval_attempts is None:
@@ -1013,7 +1024,7 @@ def main():
         args.out = choose_run_directory(args.out, resume=args.resume)
     except (OSError, RuntimeError) as e:
         parser.error(str(e))
-    print(json.dumps({'event':'run_directory',
+    log(json.dumps({'event':'run_directory',
                       'path':str(args.out),
                       'resuming':args.resume}),flush=True)
     try:lock = acquire_run_lock(args.out/'run.lock')
@@ -1068,7 +1079,7 @@ def main():
             if [row['rank'] for row in dataset[split]] != [row['rank'] for row in expected[split]]:
                 parser.error('unfiltered dataset ranks do not match the claimed seed')
     torch.set_num_threads(1);torch.manual_seed(args.seed)
-    policy=Policy(width=32,layers=1,representation=args.representation,
+    policy=Policy(width=args.width,layers=args.layers,heads=args.heads,representation=args.representation,
                   encoder_backend=args.encoder_backend).to(args.device).eval()
     optimizer=torch.optim.AdamW(policy.parameters(),lr=args.lr,weight_decay=0.)
     config={'dataset_sha256':hashlib.sha256(dataset_bytes).hexdigest(),
@@ -1202,7 +1213,7 @@ def main():
                                  inference_batch_size=args.gpu_inference_batch_size,
                                  wait_ms=args.gpu_inference_wait_ms,
                                  max_attention_elements=args.gpu_max_attention_elements)
-        print(json.dumps({'device':args.device,'inference':'centralized-batched',
+        log(json.dumps({'device':args.device,'inference':'centralized-batched',
                           'workers':args.workers,
                           'inference_batch_size':args.gpu_inference_batch_size}),flush=True)
     else:
@@ -1212,7 +1223,7 @@ def main():
             args.workers, initializer=initialize_rollout_worker,
             initargs=(policy.config,args.cpu_shared_action_cache,
                       args.cpu_topology_cache_mb))
-        print(json.dumps({
+        log(json.dumps({
             'device':args.device,
             'inference':'local-cpu-workers',
             'gradient_backend':args.gradient_backend,
@@ -1221,7 +1232,11 @@ def main():
             'eval_batch_size':args.eval_batch_size,
             'cpu_topology_cache_mb':args.cpu_topology_cache_mb,
             'workers':args.workers}),flush=True)
+    if not verbose:
+        print(f'Run: {args.out} | model {args.width} wide, {args.layers} layers, '
+              f'{args.heads} heads | encoder {args.encoder_backend}', flush=True)
     from .epoch_progress import EpochProgress
+    from .proof_progress import ProofProgress
     phase_progress = None
     with runner as pool:
         while state['phase']!='done':
@@ -1233,7 +1248,8 @@ def main():
             start_index=state['next_index']
             if phase_progress is None or (phase_progress.epoch, phase_progress.phase) != (epoch, phase):
                 phase_progress = EpochProgress(epoch, phase, len(rows), start_index)
-                phase_progress.show()
+                proof_progress = ProofProgress.restore(folder, start_index)
+                phase_progress.show(detail=proof_progress.text() if not verbose else '')
             if start_index<len(rows):
                 queue_size = args.batch_size if training else args.eval_batch_size
                 batch=rows[start_index:start_index+queue_size]
@@ -1243,7 +1259,7 @@ def main():
                     profile_stages = {}
                     profile_t = time.perf_counter()
                     gpu_before = pool.inference.stats() if central_inference else None
-                print(json.dumps({'event':'batch_stage','phase':phase,'epoch':epoch,
+                log(json.dumps({'event':'batch_stage','phase':phase,'epoch':epoch,
                                   'batch':batch_number,'stage':'rollout','machines':len(batch),
                                   'scheduler':args.rollout_scheduler if training else 'machine'}),flush=True)
                 if central_inference:
@@ -1278,12 +1294,13 @@ def main():
                         split_attempts=training and args.rollout_scheduler=='attempt',
                         log_interval=args.log_interval,
                         progress_context={'phase':phase,'epoch':epoch,'batch':batch_number},
-                        progress_callback=lambda: phase_progress.show(heartbeat=True))
+                        progress_callback=(lambda: phase_progress.show(heartbeat=True)) if verbose else None,
+                        verbose=verbose)
                 if args.profile:
                     profile_stages['rollout']=time.perf_counter()-profile_t
                     gpu_after = pool.inference.stats() if central_inference else None
                     profile_t=time.perf_counter()
-                print(json.dumps({'event':'batch_stage','phase':phase,'epoch':epoch,
+                log(json.dumps({'event':'batch_stage','phase':phase,'epoch':epoch,
                                   'batch':batch_number,'stage':'learn' if training else 'save'}),flush=True)
                 update=learn_batch(policy,optimizer,results,dataset['action_budget'],
                                    gpu_gradient_batch_size=args.gpu_gradient_batch_size,
@@ -1310,7 +1327,7 @@ def main():
                     trace_report=build_trace_report(results,phase,epoch,batch_number,
                                                      results[0]['policy_version'])
                     trace_path=write_trace_report(args.out,trace_report)
-                    print(json.dumps({'event':'policy_trace_saved',
+                    log(json.dumps({'event':'policy_trace_saved',
                                       'path':str(trace_path)}),flush=True)
                 if args.profile:
                     profile_stages['trace']=time.perf_counter()-profile_t
@@ -1342,7 +1359,7 @@ def main():
                         results=profiled_rows,stages=profile_stages,device=args.device,
                         gpu_before=gpu_before,gpu_after=gpu_after,workers=args.workers,
                         learning=update)
-                    save_batch_profile(args.out,report)
+                    save_batch_profile(args.out,report,verbose=verbose)
                 batch_outcomes=count_proofs_by_answer(results)
                 batch_choices=summarize_initial_choices(results)
                 progress={'phase':phase,'epoch':epoch,'target_epochs':args.epochs,'machines_done':state['next_index'],
@@ -1369,14 +1386,18 @@ def main():
                           'active_seconds':state['active_seconds']}
                 if central_inference:
                     progress['gpu_inference' if args.device=='mps' else 'cpu_inference'] = pool.inference.stats()
-                progress['epoch_progress'] = phase_progress.show(state['next_index'])
-                atomic_json(args.out/'progress.json',progress);print(json.dumps(progress),flush=True)
+                proof_progress.add(results)
+                progress['proof_progress'] = proof_progress.snapshot()
+                progress['epoch_progress'] = phase_progress.show(
+                    state['next_index'], detail=proof_progress.text() if not verbose else '')
+                atomic_json(args.out/'progress.json',progress);log(json.dumps(progress),flush=True)
                 continue
             if args.profile:
                 from .profiling import summarize_epoch_profiles
-                summarize_epoch_profiles(args.out,epoch,phase)
+                summarize_epoch_profiles(args.out,epoch,phase,verbose=verbose)
             batch_paths=sorted(folder.glob('batch_*.json'))
             metrics=summarize(batch_paths)
+            metrics['proof_progress'] = proof_progress.snapshot()
             if training and args.group_relative:
                 metrics['group_relative_stats']=summarize_group_updates(batch_paths)
             if training and args.branch_rounds:
@@ -1386,7 +1407,7 @@ def main():
                     args.branch_rounds)
             metrics.update(epoch=epoch,phase=phase,policy_updates=state['updates'],active_seconds=state['active_seconds'])
             atomic_json(args.out/f'epoch_{epoch:02d}_{"training" if training else "evaluation"}.json',metrics)
-            print(json.dumps({'event':'epoch_summary','phase':phase,'epoch':epoch,
+            log(json.dumps({'event':'epoch_summary','phase':phase,'epoch':epoch,
                               'machines':metrics['machines'],
                               'machines_proved':metrics['machines_proved'],
                               'machines_unproved':metrics['machines_unproved'],
@@ -1414,7 +1435,7 @@ def main():
             behavior=metrics['mean_initial_behavior_probability']
             if training and args.balanced_initial_answers:
                 scheduled=metrics['scheduled_initial_answer_counts']
-                print(f"Balanced initial attempts — epoch {epoch}: "
+                log(f"Balanced initial attempts — epoch {epoch}: "
                       f"HALT={scheduled['choose:HALT']}, "
                       f"NONHALT={scheduled['choose:NONHALT']} "
                       f"({'exactly' if args.group_relative else 'maximum'} "
@@ -1422,7 +1443,7 @@ def main():
                       f"{'full group' if args.group_relative else 'stops after first verified proof'})",
                       flush=True)
             if raw['HALT'] is not None:
-                print(f"Answer exploration — {phase} epoch {epoch}: "
+                log(f"Answer exploration — {phase} epoch {epoch}: "
                       f"first actions HALT={counts['choose:HALT']}, "
                       f"NONHALT={counts['choose:NONHALT']}, reset={counts['reset']}; "
                       f"mean raw P(HALT)={raw['HALT']:.3f}, "
@@ -1435,11 +1456,11 @@ def main():
                     f"round {n}: HALT={round_hist['HALT'][str(n)]}, "
                     f"NONHALT={round_hist['NONHALT'][str(n)]}"
                     for n in range(1,args.branch_rounds+1)]
-                print(f"First verified proof round — train epoch {epoch}: "
+                log(f"First verified proof round — train epoch {epoch}: "
                       + "; ".join(round_lines)
                       + f"; no proof={round_hist['no_proof']}",flush=True)
             if not training:
-                print(evaluation_line(metrics),flush=True)
+                log(evaluation_line(metrics),flush=True)
                 write_evaluation_csv(args.out)
                 # Separate fixed diagnostic machines. No gradients, no extra
                 # training data, and no effect on held-out machine coverage.
@@ -1468,12 +1489,16 @@ def main():
                     challenge_results=run_local_rollouts(
                         pool,challenge_tasks,workers=args.workers,
                         log_interval=args.log_interval,
-                        progress_context={'phase':'challenge','epoch':epoch})
+                        progress_context={'phase':'challenge','epoch':epoch},verbose=verbose)
                 benchmark_report=make_benchmark_report(
                     epoch,challenge_results,args.eval_attempts,dataset['action_budget'],
                     trained_ids=(row['machine_id'] for row in dataset['train'])
                 )
-                write_benchmark_report(args.out,benchmark_report)
+                write_benchmark_report(args.out,benchmark_report,verbose=verbose)
+                if not verbose:
+                    for item in benchmark_report['benchmarks']:
+                        length = f" ({item['proof_actions']} proof actions)" if item['status']=='PROVED' else ''
+                        print(f"Special eval {epoch}: {item['name']}: {item['status']}{length}",flush=True)
             if training:
                 state.update(phase='eval',next_index=0)
             elif phase=='baseline':
@@ -1490,7 +1515,9 @@ def main():
             'special_benchmarks':[json.loads((args.out/f'special_benchmarks_epoch_{i:02d}.json').read_text())
                                   for i in range(state['completed_epochs']+1)
                                   if (args.out/f'special_benchmarks_epoch_{i:02d}.json').exists()]}
-    atomic_json(args.out/'report.json',report);print(json.dumps(report,indent=2),flush=True)
+    atomic_json(args.out/'report.json',report);log(json.dumps(report,indent=2),flush=True)
+    if not verbose:
+        print(f"Completed {state['completed_epochs']} epochs. Report: {args.out/'report.json'}",flush=True)
 
 
 if __name__=='__main__':main()
