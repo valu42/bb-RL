@@ -1,7 +1,8 @@
 # Foundational proof game v2
 
-Status: proposed language specification, not an implemented training mode.
-The v1 checker, action space, checkpoints, and training commands remain v1.
+Status: original design specification. A first implementation is now available;
+see [usage and implementation boundaries](foundation_usage.md) for the actual
+commands and deliberate differences. The v1 runtime remains separately available.
 
 See [the full pretraining-to-RL pipeline](foundational_pipeline_v2.md) for data
 generation, size/split balancing, supervised training, run budgets, and evaluation.
@@ -365,4 +366,4 @@ examples, and replay all compiler output in the standalone kernel.
 
 V2 policy checkpoints are versioned separately: the old action vocabulary and
 proof semantics are not compatible. Do not silently resume a v1 run as v2.
-This specification changes no current training command or default behavior.
+The implementation uses separate v2 commands and leaves v1 defaults unchanged.

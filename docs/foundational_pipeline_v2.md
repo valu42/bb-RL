@@ -1,9 +1,9 @@
 # Random proof pretraining followed by RL
 
 Status: design specification, accompanying [language v2](foundational_language_v2.md).
-None of the proposed commands, schemas, budgets, or training modes below are
-implemented yet. Numerical settings are initial experimental choices, to be
-calibrated by the pilot and then frozen before comparisons.
+An implementation is now available; see [the usage guide](foundation_usage.md)
+for executable commands, actual artifacts, and implementation differences.
+Numerical design settings below remain experimental choices, not measured results.
 
 ## 1. End-to-end contract
 
@@ -362,6 +362,5 @@ Every accepted demonstration must be independently checked and legally replayed.
 Before scaling, measure generation yield, memory/disk use, maximum proof/context
 size, autonomous success, and whole-pipeline timing. Do not invent a training
 duration until those measurements exist. Old v1 runs continue to use their old
-language and cannot silently load into v2. A future orchestrator can expose one
-generate/pretrain/train/resume workflow once these gates pass; there is no such
-command in the repository yet.
+language and cannot silently load into v2. The implemented `python -m proofgame.foundation run` orchestrates the stages;
+see the usage guide for its explicit configuration and resume contract.
