@@ -1221,6 +1221,8 @@ def main():
             'eval_batch_size':args.eval_batch_size,
             'cpu_topology_cache_mb':args.cpu_topology_cache_mb,
             'workers':args.workers}),flush=True)
+    from .epoch_progress import EpochProgress
+    phase_progress = None
     with runner as pool:
         while state['phase']!='done':
             phase=state['phase'];epoch=state['epoch']
@@ -1229,6 +1231,9 @@ def main():
             folder=args.out/f'epoch_{epoch:02d}_{"train" if training else "eval"}'
             folder.mkdir(exist_ok=True)
             start_index=state['next_index']
+            if phase_progress is None or (phase_progress.epoch, phase_progress.phase) != (epoch, phase):
+                phase_progress = EpochProgress(epoch, phase, len(rows), start_index)
+                phase_progress.show()
             if start_index<len(rows):
                 queue_size = args.batch_size if training else args.eval_batch_size
                 batch=rows[start_index:start_index+queue_size]
@@ -1272,7 +1277,8 @@ def main():
                         pool,tasks,workers=args.workers,
                         split_attempts=training and args.rollout_scheduler=='attempt',
                         log_interval=args.log_interval,
-                        progress_context={'phase':phase,'epoch':epoch,'batch':batch_number})
+                        progress_context={'phase':phase,'epoch':epoch,'batch':batch_number},
+                        progress_callback=lambda: phase_progress.show(heartbeat=True))
                 if args.profile:
                     profile_stages['rollout']=time.perf_counter()-profile_t
                     gpu_after = pool.inference.stats() if central_inference else None
@@ -1363,6 +1369,7 @@ def main():
                           'active_seconds':state['active_seconds']}
                 if central_inference:
                     progress['gpu_inference' if args.device=='mps' else 'cpu_inference'] = pool.inference.stats()
+                progress['epoch_progress'] = phase_progress.show(state['next_index'])
                 atomic_json(args.out/'progress.json',progress);print(json.dumps(progress),flush=True)
                 continue
             if args.profile:
