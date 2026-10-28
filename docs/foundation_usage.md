@@ -43,6 +43,38 @@ extending `--updates` or `--epochs`; training configuration and source hashes
 must otherwise match. Once RL has started, changing its pretrained checkpoint
 requires a new RL output, even if the new weights came from extending SFT.
 
+CPU pretraining evaluation and the standalone `evaluate` command use
+`--workers` processes (up to the number of machines), with deterministic
+per-machine seeds and the same first-proof stopping rule as serial evaluation.
+MPS evaluation stays on the requested device in one process; its progress log
+reports the effective worker count. The action and attempt allowances are not
+reduced by parallel execution.
+
+Evaluation prints `evaluation_start` immediately, `evaluation_progress` about
+every five seconds, and `evaluation_complete` at the end. Progress includes
+completed machines, partial-attempt actions, completed attempts, actions/sec,
+HALT/NONHALT counts, elapsed time, attempt exit statuses, and accumulated worker
+inference/game/observation times. ETA is initially `null`, then estimated from
+completed machines; it can change substantially as harder machines finish.
+CPU progress continues even while workers are starting or a model call is slow.
+Serial/MPS progress is emitted between model actions, so a slow single action
+can delay a log. Pending machines are not counted as unproved.
+
+For example, the full command's periodic pretraining check uses 40 dev machines,
+up to 100 attempts each, and up to 512 actions per attempt: at most 2,048,000
+actions. Eight workers distribute that search; they do not guarantee an eightfold
+speedup. For a **new** run, `--eval-attempts 10` makes checks cheaper, but also
+changes RL and final evaluation allowances. Existing runs should retain their
+configuration when resuming.
+
+To apply an evaluation fix to an existing process, interrupt it with Ctrl-C,
+update the repository, and restart the same command with `--resume`. New code
+cannot change an already-running Python process. Older checkpoints resume from
+their last saved update (typically 990 when waiting at the first evaluation).
+New checkpoints save the completed supervised update **before** evaluation;
+interruption then repeats that evaluation without repeating the optimizer
+update. In-flight evaluation search itself is not checkpointed.
+
 ## Small installation check
 
 This validates operation, not learning quality:
@@ -107,7 +139,10 @@ write those stages directly to their respective `--out` paths.
 - `data/progress.json`: proposed/processed jobs, accepted proofs/actions, coverage
   by size/answer/source, errors, and the committed corpus byte offset.
 - `pretrain/metrics.jsonl`: sampled exposures, supervised loss/accuracy, context
-  exclusions, update rejection, timing, and autonomous dev results.
+  exclusions, update rejection, timing, autonomous dev results, and live
+  evaluation events tagged with their update number. `seconds` measures the
+  supervised update; `evaluation_seconds` measures evaluation separately, and
+  `total_seconds` is their sum. `pretrain/progress.json` holds the latest event.
 - `pretrain/checkpoint.pt`: latest saved training state; `best.pt`: first best
   autonomous dev coverage checkpoint. Ties currently retain the earlier model.
 - `rl/epoch_XX_training.json` and `epoch_XX_evaluation.json`: cumulative HALT,

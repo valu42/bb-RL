@@ -92,7 +92,7 @@ def init(args,kind):
     return out,cfg,machines,policy,opt,s
 
 
-def rollout(policy,row,budget,seed,forced=None):
+def rollout(policy,row,budget,seed,forced=None,progress=None):
     rng=random.Random(seed);g=Game(Machine(row['machine']['rows']),budget);actions=[];probs=[]
     stats={'inference_seconds':0.,'game_seconds':0.,'observation_seconds':0.}
     with torch.no_grad():
@@ -108,8 +108,10 @@ def rollout(policy,row,budget,seed,forced=None):
                 i=rng.choices(range(len(ps)),weights=ps)[0];action=obs['actions'][i]['id'];prob=ps[i]
             t=time.monotonic();g.step(action,observe=False);stats['game_seconds']+=time.monotonic()-t
             actions.append(action);probs.append(prob)
+            if progress is not None and len(actions)%32==0:progress(len(actions),stats)
     cert=g.certificate() if g.status=='SOLVED' else None
     if cert:check(cert)
+    if progress is not None:progress(len(actions),stats)
     return {'actions':actions,'probabilities':probs,'status':g.status,'certificate':cert,'forced':forced,'timing':stats}
 
 _worker=None
@@ -147,16 +149,10 @@ def machine_job(task):
     return {**row,'successes':successes,'group':group,'attempts':executed,'actions':actions,'statuses':statuses,'timing':timing}
 
 
-def autonomous(policy,machines,budget,attempts,seed):
-    rows=[];policy.eval()
-    for i,row in enumerate(machines):
-        successes=[]
-        for a in range(attempts):
-            t=rollout(policy,row,budget,seed+i*100000+a)
-            if t['certificate']:
-                successes=[{'attempt':a+1,'actions':t['actions'],'certificate':t['certificate']}];break
-        rows.append({**row,'successes':successes})
-    return summarize(rows)
+def autonomous(policy,machines,budget,attempts,seed,*,workers=1,threads=1,on_progress=None):
+    from .evaluation import evaluate_rows
+    return summarize(evaluate_rows(policy,machines,budget,attempts,seed,
+                                   workers=workers,threads=threads,on_progress=on_progress))
 
 
 def summarize(rows,by_size=True):
@@ -188,6 +184,24 @@ def pretrain(args):
     corpus=Corpus(Path(args.data)/'corpus.jsonl');start_update=s['update'] if s else 0
     if s:rng.setstate(s['rng'])
     verified=set();best=s.get('best',-1) if s else -1
+
+    def finish_evaluation(record):
+        nonlocal best
+        started=time.monotonic()
+        result=autonomous(policy,balanced_prefix(machines['splits']['dev'],args.eval_machines),
+                          budget,args.eval_attempts,args.seed+900000,workers=args.workers,threads=args.threads,
+                          on_progress=lambda row:log(out,{'phase':'pretrain_dev','update':record['update'],**row}))
+        record['dev']=result;record['evaluation_seconds']=time.monotonic()-started
+        record['total_seconds']=record['seconds']+record['evaluation_seconds']
+        score=sum(result['machines_proved_by_answer'].values())
+        state=checkpoint(policy,opt,cfg,update=record['update'],rng=rng.getstate(),best=max(best,score))
+        if score>best:best=score;save(out/'best.pt',state)
+        save(out/'checkpoint.pt',state);log(out,record)
+
+    # New checkpoints preserve the completed supervised update before starting
+    # evaluation. Legacy checkpoints without this field resume as before.
+    if s and s.get('pending_evaluation') is not None:
+        finish_evaluation(s['pending_evaluation'])
     for update in range(start_update,args.updates):
         start=time.monotonic();opt.zero_grad();loss_sum=0.;correct=0;accepted=0;skipped=0;policy.train()
         while accepted<args.batch_size:
@@ -209,13 +223,13 @@ def pretrain(args):
         record={'event':'pretrain','update':update+1,'sampled_targets':(update+1)*args.batch_size,'loss':loss_sum,'accuracy':correct/accepted,
                 'skipped_model_limit':skipped,'update_accepted':healthy,'seconds':time.monotonic()-start}
         if (update+1)%args.eval_every==0 or update+1==args.updates:
-            result=autonomous(policy,balanced_prefix(machines['splits']['dev'],args.eval_machines),budget,args.eval_attempts,args.seed+900000)
-            record['dev']=result;score=sum(result['machines_proved_by_answer'].values())
-        else:score=None
-        state=checkpoint(policy,opt,cfg,update=update+1,rng=rng.getstate(),best=max(best,score if score is not None else -1))
-        if score is not None and score>best:best=score;save(out/'best.pt',state)
-        if (update+1)%args.save_every==0 or score is not None:save(out/'checkpoint.pt',state)
-        log(out,record)
+            save(out/'checkpoint.pt',checkpoint(policy,opt,cfg,update=update+1,rng=rng.getstate(),
+                                               best=best,pending_evaluation=record))
+            finish_evaluation(record)
+        else:
+            if (update+1)%args.save_every==0:
+                save(out/'checkpoint.pt',checkpoint(policy,opt,cfg,update=update+1,rng=rng.getstate(),best=best))
+            log(out,record)
     if args.updates==0:save(out/'checkpoint.pt',checkpoint(policy,opt,cfg,update=0,rng=rng.getstate(),best=best))
 
 
@@ -308,12 +322,13 @@ def train(args):
 
 
 def evaluate(args):
+    if Path(args.out).exists():raise ValueError('evaluation output already exists')
     s=load(args.checkpoint)
     if s.get('language')!=FORMAT:raise ValueError('not a foundation checkpoint')
     manifest,machines=corpus_info(args.data)
     if s['config']['corpus_hash']!=manifest['corpus_sha256'] or s['config']['language_hash']!=language_hash():raise ValueError('evaluation checkpoint/data mismatch')
     torch.set_num_threads(args.threads)
     p=Policy(**s['model']).to(args.device);p.load_state_dict(s['state_dict'])
-    report=autonomous(p,machines['splits'][args.split],s['config']['budget'],args.eval_attempts,args.seed)
-    if Path(args.out).exists():raise ValueError('evaluation output already exists')
+    report=autonomous(p,machines['splits'][args.split],s['config']['budget'],args.eval_attempts,args.seed,
+                      workers=args.workers,threads=args.threads)
     atomic(args.out,report);print(json.dumps(report,indent=2))
