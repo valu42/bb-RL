@@ -47,7 +47,17 @@ python -m proofgame.epoch_train \
   --cpu-shared-action-cache --length-penalty 0.3
 ```
 
-The terminal emits JSON records, suitable for saving with `tee`:
+An epoch progress bar appears on stderr, with completed machines, elapsed
+minutes and an approximate ETA. It updates after each complete batch (including
+learning and checkpoint time); interactive terminals also refresh during rollout
+heartbeats. Training and evaluation have separate bars and ETAs: the training
+ETA does not include the later evaluation/challenge phase. Before the first
+completed batch it shows "calculating". A resumed run keeps its completed count
+but estimates speed from newly completed work, excluding downtime. Variable
+proof difficulty makes the early estimates noisy. The same structured estimate
+is saved as `epoch_progress` in `progress.json` and batch progress JSON.
+
+The terminal also emits JSON records, suitable for saving with `tee`:
 
 - `batch_stage`: identifies rollout, learning, or saving as work begins.
 - `rollout_progress`: every 10 seconds (configurable with `--log-interval`),

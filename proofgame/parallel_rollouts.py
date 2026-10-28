@@ -103,7 +103,7 @@ def reduce_attempts(task, outcomes):
 
 def run_local_rollouts(pool, tasks, *, workers, split_attempts=False,
                        log_interval=10., progress_context=None,
-                       independent_attempt_seeds=False):
+                       independent_attempt_seeds=False, progress_callback=None):
     """Run a bounded machine batch with live heartbeats and ordered results.
 
     Async callbacks only enqueue results. All scheduling and reduction happen
@@ -146,6 +146,8 @@ def run_local_rollouts(pool, tasks, *, workers, split_attempts=False,
             submit(machine, index)
 
     def progress():
+        if progress_callback is not None:
+            progress_callback()
         elapsed = time.perf_counter() - started
         print(json.dumps({'event':'rollout_progress', **(progress_context or {}),
                           'scheduler':'attempt' if split_attempts else 'machine',
