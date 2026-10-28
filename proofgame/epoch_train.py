@@ -1260,7 +1260,7 @@ def main():
             if phase_progress is None or (phase_progress.epoch, phase_progress.phase) != (epoch, phase):
                 phase_progress = EpochProgress(epoch, phase, len(rows), start_index)
                 proof_progress = ProofProgress.restore(folder, start_index)
-                phase_progress.show(detail=proof_progress.text() if not verbose else '')
+                phase_progress.show(detail='cumulative: ' + proof_progress.text() if not verbose else '')
             if start_index<len(rows):
                 queue_size = args.batch_size if training else args.eval_batch_size
                 batch=rows[start_index:start_index+queue_size]
@@ -1400,7 +1400,12 @@ def main():
                 proof_progress.add(results)
                 progress['proof_progress'] = proof_progress.snapshot()
                 progress['epoch_progress'] = phase_progress.show(
-                    state['next_index'], detail=proof_progress.text() if not verbose else '')
+                    state['next_index'], detail='cumulative: ' + proof_progress.text() if not verbose else '')
+                if not verbose:
+                    latest_batch = ProofProgress()
+                    latest_batch.add(results)
+                    print(f'Last batch ({len(results)} machines): {latest_batch.text()}',
+                          file=phase_progress.stream,flush=True)
                 atomic_json(args.out/'progress.json',progress);log(json.dumps(progress),flush=True)
                 continue
             if args.profile:

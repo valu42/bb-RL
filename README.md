@@ -38,7 +38,7 @@ deduplicated. Counts are split as evenly as possible, giving remainder entries
 to smaller state counts. Dataset generation refuses to overwrite an existing file.
 The trainer reproduces the seed and validates all tables, identities, and metadata.
 
-Compact progress retains overall counts per batch and adds three per-size
+Compact progress shows cumulative and latest-batch counts, and adds three per-size
 summaries at the end of each phase, including HALT/NONHALT counts, mean first
 proof actions, and unproved counts. The same breakdown is saved under
 `proof_progress.by_states` in progress and epoch JSON reports.
@@ -75,10 +75,12 @@ guarantee better coverage. For a smaller capacity increase that retains root-que
 use `--width 64 --layers 1` and a separate output directory. Model dimensions
 cannot change when resuming: repeat the original dimensions and add `--resume`.
 
-`--log-mode compact` prints one progress line per completed batch, including
-the existing bar and phase ETA, plus cumulative HALT/NONHALT machine counts,
-mean proof actions for each answer, and the number still unproved among the
-machines processed. Each solved machine contributes its **first verified proof**
+`--log-mode compact` prints two lines per completed batch. The first contains
+the bar, phase ETA, and explicitly labelled cumulative HALT/NONHALT counts,
+mean proof actions for each answer, and unproved count. The second, labelled
+`Last batch (N machines)`, shows those same statistics for only the latest
+batch. N is the actual batch size, including partial batches and evaluation
+queues that may be larger than the training batch size. Each solved machine contributes its **first verified proof**
 once to the mean, regardless of how many later attempts also succeed. These
 are proof-game actions, not simulated Turing-machine transitions; an empty
 category displays `n/a`. Counts reset for each baseline/train/evaluation phase
