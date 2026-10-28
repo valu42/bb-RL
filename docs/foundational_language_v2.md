@@ -3,6 +3,9 @@
 Status: proposed language specification, not an implemented training mode.
 The v1 checker, action space, checkpoints, and training commands remain v1.
 
+See [the full pretraining-to-RL pipeline](foundational_pipeline_v2.md) for data
+generation, size/split balancing, supervised training, run budgets, and evaluation.
+
 ## 1. Objective and experiment
 
 Train a model to construct general mathematical proofs about Turing machines.
