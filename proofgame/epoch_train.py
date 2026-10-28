@@ -178,6 +178,7 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
     first_proof_answer = None
     rounds_completed = 0
     round_groups = {'HALT':[],'NONHALT':[]}
+    checker_errors = Counter()
     first_success_trace = None
     last_failed_trace = None
     profile = ({'observation_seconds':0.,'inference_seconds':0.,
@@ -218,6 +219,7 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
             else:
                 group_trajectories.append(trajectory)
         if trace_diagnostics:
+            checker_errors.update(step['error_after'] for step in detail if step.get('error_after'))
             sample = {'attempt':i+1, 'status':status, 'steps':detail,
                       'certificate':cert if cert else None}
             if cert and first_success_trace is None:
@@ -278,7 +280,8 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
                     'NONHALT':sum(answer=='NONHALT' for _,answer in schedule[:sum(statuses.values())])},
                 'winning_group_attempts':len(group_trajectories)}
                if branch_rounds else {}),
-            **({'diagnostic_traces':{'success':first_success_trace,
+            **({'checker_errors':dict(checker_errors),
+                'diagnostic_traces':{'success':first_success_trace,
                                     'failure':last_failed_trace}}
                if trace_diagnostics else {}),
             **({'profile':profile} if profile_enabled else {}),
@@ -890,6 +893,8 @@ def main():
     parser.add_argument('--epochs',type=int,default=10)
     parser.add_argument('--attempts',type=int,default=100,
                         help='training attempts per machine (8 for group-relative training)')
+    parser.add_argument('--special-benchmarks',choices=('legacy','extended'),default='extended',
+                        help='evaluation-only suite: 12 cases by default, or original 2; may change on resume')
     parser.add_argument('--eval-attempts',type=int,
                         help='held-out and special-benchmark attempts per machine; default --attempts')
     parser.add_argument('--group-relative',action='store_true',
@@ -1332,7 +1337,7 @@ def main():
                     from .trace_report import build_trace_report,write_trace_report
                     trace_report=build_trace_report(results,phase,epoch,batch_number,
                                                      results[0]['policy_version'])
-                    trace_path=write_trace_report(args.out,trace_report)
+                    trace_path=write_trace_report(args.out,trace_report,verbose=verbose)
                     log(json.dumps({'event':'policy_trace_saved',
                                       'path':str(trace_path)}),flush=True)
                 if args.profile:
@@ -1476,11 +1481,14 @@ def main():
                 from .special_benchmarks import (
                     benchmark_rows, make_benchmark_report, write_benchmark_report
                 )
-                challenge_rows = benchmark_rows()
+                challenge_rows = benchmark_rows(args.special_benchmarks)
+                if not verbose:
+                    print(f'Special eval {epoch}: running {len(challenge_rows)} machines '
+                          f'({args.special_benchmarks} suite)',flush=True)
                 if central_inference:
                     challenge_tasks=[
                         (row,task_seed(args.seed,'eval',0,row['machine_id']),
-                         args.eval_attempts,dataset['action_budget'],state['updates'],True,0.,False,False,False)
+                         args.eval_attempts,dataset['action_budget'],state['updates'],True,0.,False,True,False)
                         for row in challenge_rows
                     ]
                     challenge_results=pool.run(challenge_tasks)
@@ -1491,7 +1499,7 @@ def main():
                     challenge_tasks=[
                         (row,task_seed(args.seed,'eval',0,row['machine_id']),
                          args.eval_attempts,dataset['action_budget'],
-                         str(weights_file),state['updates'],True,0.,False,False,False)
+                         str(weights_file),state['updates'],True,0.,False,True,False)
                         for row in challenge_rows
                     ]
                     from .parallel_rollouts import run_local_rollouts
@@ -1501,13 +1509,11 @@ def main():
                         progress_context={'phase':'challenge','epoch':epoch},verbose=verbose)
                 benchmark_report=make_benchmark_report(
                     epoch,challenge_results,args.eval_attempts,dataset['action_budget'],
-                    trained_ids=(row['machine_id'] for row in dataset['train'])
+                    trained_ids=(row['machine_id'] for row in dataset['train']),
+                    suite=args.special_benchmarks,
+                    tested_ids=(row['machine_id'] for row in dataset['test'])
                 )
                 write_benchmark_report(args.out,benchmark_report,verbose=verbose)
-                if not verbose:
-                    for item in benchmark_report['benchmarks']:
-                        length = f" ({item['proof_actions']} proof actions)" if item['status']=='PROVED' else ''
-                        print(f"Special eval {epoch}: {item['name']}: {item['status']}{length}",flush=True)
             if training:
                 state.update(phase='eval',next_index=0)
             elif phase=='baseline':

@@ -99,7 +99,8 @@ class SpecialBenchmarkTests(unittest.TestCase):
                 sys.executable,'-m','proofgame.epoch_train',
                 '--dataset',str(dataset),'--out',str(output),
                 '--epochs','1','--attempts','1','--batch-size','1',
-                '--workers','1','--seed','7','--stop-after-first-train-proof'
+                '--workers','1','--seed','7','--stop-after-first-train-proof',
+                '--special-benchmarks','legacy'
             ]
             finished=subprocess.run(command,capture_output=True,text=True,timeout=120)
             self.assertEqual(finished.returncode,0,
@@ -124,6 +125,14 @@ class SpecialBenchmarkTests(unittest.TestCase):
             finished_report=json.loads((output/'report.json').read_text())
             self.assertTrue(finished_report['complete'])
             self.assertEqual(len(finished_report['special_benchmarks']),2)
+            resumed = subprocess.run(command + ['--resume','--epochs','2',
+                                                '--special-benchmarks','extended','--log-mode','compact'],
+                                     capture_output=True,text=True,timeout=120)
+            self.assertEqual(resumed.returncode,0,resumed.stdout + resumed.stderr)
+            extended=json.loads((output/'special_benchmarks_epoch_02.json').read_text())
+            self.assertEqual(extended['suite'],'extended')
+            self.assertEqual(len(extended['benchmarks']),12)
+            self.assertEqual(len(json.loads((output/'special_benchmarks_epoch_00.json').read_text())['benchmarks']),2)
 
 
 if __name__=='__main__':
