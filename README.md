@@ -45,8 +45,8 @@ proof actions, and unproved counts. The same breakdown is saved under
 
 Start a fresh run when switching datasets. To resume this experiment, reuse
 the training command with `--resume` (do not regenerate the dataset). The
-100-action limit, proof checker limits, and existing two special evaluations
-are unchanged; this does not yet add the larger curated challenge suite.
+100-action limit and proof checker limits are unchanged. The separate special
+evaluation now defaults to the 12-case extended suite described below.
 Two-layer models use full attention and cost more compute than one-layer
 root-query models. Use a separate run with `--width 64 --layers 1` for the latter.
 
@@ -88,7 +88,8 @@ Compact mode hides routine JSON, timing, and trace announcements from the
 terminal. Detailed batch records, profiling (enabled by default), trace files,
 and epoch reports are still saved. `progress.json` and epoch reports include
 the cumulative `proof_progress` statistics. Errors and rejected-update warnings
-remain visible, and special evaluations get short separate result lines.
+remain visible. Successful special evaluations always print their sampled proof
+actions and accepted proof tree, even in compact mode.
 You may add `--log-mode compact` to an existing run's resume command without
 changing its model or training settings. `--log-mode detailed` restores the
 original terminal output.
@@ -777,27 +778,56 @@ To resume a run created before this option existed, pass
 `--train-exploration-epsilon 0` to preserve its original behavior.
 Changing the sampling strategy mid-checkpoint is intentionally rejected.
 
-## Separate two-state diagnostic evaluations after every epoch
+## Separate special evaluations and proof traces
 
-The epoch runner automatically tests two fixed challenge machines at **baseline
-(epoch 0)** and after **every subsequent evaluation epoch**, on both CPU and
-MPS:
+The epoch runner tests **12 fixed cases** at baseline and after every evaluation
+phase, on CPU, hybrid, or centralized MPS. `--special-benchmarks extended` is
+the default; `--special-benchmarks legacy` selects the original two cases.
 
-1. **Parity trap (2-state)** — the correct conclusion is NONHALT, requiring
-   reasoning about an alternating two-phase invariant.
-2. **2-state Busy Beaver** — the correct conclusion is HALT (6 Turing-machine
-   transitions), with a 12-action direct halting proof.
+- Parity trap and 2-state Busy Beaver (original controls).
+- 3-state (21 transitions) and 4-state (107 transitions) Busy Beaver champions.
+- Three guarded exact cycles: 3-state period 6, 4-state periods 8 and 10.
+  Every state is visited, and each machine has a halting transition. Their
+  full configuration recurrences have kernel-checked reference certificates.
+- 3-state growing frontier, 4-state paired-cell frontier, and 3-state erasing
+  drift. These have documented inductive invariants and phase regression tests;
+  no kernel-accepted reference induction proof is supplied.
+- Halting variants of the two frontiers, changing one transition to halt at
+  time 3 or 4. These have kernel-checked direct halting reference proofs.
 
-These tasks **never generate training gradients**, are **not inserted into**
-the training or test dataset, and **do not inflate the main machine-coverage
-metric**. Each diagnostic uses the current policy checkpoint and the configured
-`--attempts` and dataset action budget (100 attempts × 100 proof-game
-actions in the current unfiltered experiment). The action-sampling seeds are
-fixed across epochs, and diagnostic search stops as soon as a proof is found.
-The labels are for reporting only, not supplied to the model.
+The 4-state champion's known 37-action witness `10*10+7` exceeds the current
+symbolic reduction budget. Its report states this reference limitation; no
+checker limits or proof rules are relaxed for evaluation. Observed resource-limit
+errors are reported separately from the overall NOT_PROVED outcome. A failed
+search does not establish that no alternative accepted proof exists.
+
+These tasks never generate gradients and do not enter the main evaluation
+score. They receive only the machine table, never reference explanations or
+labels. Search uses `--eval-attempts` (or `--attempts` when omitted), the dataset
+action budget, fixed per-machine seeds, and stops at the first verified proof.
+New mixed datasets exclude all 12 exact tables. Previously generated datasets
+still validate with their original exclusions; reports flag any overlap with
+training or regular evaluation data rather than silently changing those splits.
+
+Every successful special evaluation prints its actual sampled actions, available
+goal/expression details, and accepted proof tree, in both logging modes. The
+same information is saved in the special JSON/text reports and text history.
+Ordinary batch trace files are still saved but no longer printed in compact mode.
+
+To display a proof already saved by an older run, without repeating evaluation:
+
+```bash
+python -m proofgame.special_benchmarks \
+  --report runs/ast_234_w64_l2_mps_full/special_benchmarks_epoch_00.json
+```
+
+The command rechecks saved certificates before displaying them. Older reports
+still contain the action trace and proof tree, even when detailed goal traces
+were not recorded. Suite selection is evaluation-only and may change on resume;
+existing baseline/epoch reports are not retroactively rerun.
 
 After the regular evaluation summary, the terminal prints human-readable
-results such as:
+results such as (summary excerpt):
 
 ```text
 Special benchmarks — after epoch 3

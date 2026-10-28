@@ -85,7 +85,7 @@ def format_trace_report(report):
     return '\n'.join(lines)+'\n'
 
 
-def write_trace_report(out, report):
+def write_trace_report(out, report, *, verbose=True):
     folder=Path(out)/'policy_traces'
     folder.mkdir(exist_ok=True)
     stem=f"epoch_{report['epoch']:02d}_{report['phase']}_batch_{report['batch_number']:04d}"
@@ -96,5 +96,6 @@ def write_trace_report(out, report):
         tmp=path.with_suffix(path.suffix+'.tmp')
         tmp.write_text(body)
         tmp.replace(path)
-    print(format_trace_report(report),flush=True)
+    if verbose:
+        print(format_trace_report(report),flush=True)
     return txt_path

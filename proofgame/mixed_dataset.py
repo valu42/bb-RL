@@ -10,7 +10,7 @@ import random
 
 from .logic import Machine
 from .population_sample import from_rank
-from .special_benchmarks import BENCHMARKS
+from .special_benchmarks import benchmark_definitions
 from .tasks import key
 
 DATASET_FORMAT = 'proofgame-unfiltered-mixed-states-1'
@@ -26,19 +26,20 @@ def split_counts(total):
             for index, states in enumerate(STATES)}
 
 
-def build_dataset(train_count=1000, test_count=300, action_budget=100, seed=20261028):
+def build_dataset(train_count=1000, test_count=300, action_budget=100, seed=20261028, benchmark_suite='extended'):
     if any(type(v) is not int for v in (train_count, test_count, action_budget, seed)):
         raise ValueError('counts, budget and seed must be integers')
     if min(train_count, test_count) < 3 or action_budget < 1:
         raise ValueError('each split needs at least three machines and a positive budget')
     train_counts, test_counts = split_counts(train_count), split_counts(test_count)
-    excluded = {key(Machine(item['rows'])) for item in BENCHMARKS}
+    definitions = benchmark_definitions(benchmark_suite)
+    excluded = {key(Machine(item['rows'])) for item in definitions}
     rng = random.Random(seed)
     splits = {'train': [], 'test': []}
     for states in STATES:
         n_train, n_test = train_counts[str(states)], test_counts[str(states)]
         size = population(states)
-        excluded_count = sum(len(item['rows']) == 2 * states for item in BENCHMARKS)
+        excluded_count = sum(len(item['rows']) == 2 * states for item in definitions)
         if n_train + n_test > size - excluded_count:
             raise ValueError(f'too many distinct {states}-state machines requested')
         # Sample integer ranks directly; never enumerate the 25.6 billion
@@ -61,6 +62,7 @@ def build_dataset(train_count=1000, test_count=300, action_budget=100, seed=2026
         rng.shuffle(rows)
     return {
         'format': DATASET_FORMAT, 'states': list(STATES),
+        **({'benchmark_suite':benchmark_suite} if benchmark_suite != 'legacy' else {}),
         'sampling': 'uniform_labelled_tables_without_replacement_per_size_excluding_benchmarks',
         'sampling_seed': seed, 'action_budget': action_budget,
         'population_by_states': {str(n): population(n) for n in STATES},
@@ -73,7 +75,8 @@ def validate_dataset(dataset):
     """Reproduce sampling, identities, ranks, split membership and metadata."""
     try:
         expected = build_dataset(len(dataset['train']), len(dataset['test']),
-                                 dataset['action_budget'], dataset['sampling_seed'])
+                                 dataset['action_budget'], dataset['sampling_seed'],
+                                 benchmark_suite=dataset.get('benchmark_suite','legacy'))
     except (KeyError, TypeError) as exc:
         raise ValueError('invalid mixed-state dataset metadata') from exc
     # Machine.to_json() retains tuples in memory; files contain JSON arrays.

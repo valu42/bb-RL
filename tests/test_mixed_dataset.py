@@ -87,6 +87,9 @@ class MixedDatasetTests(unittest.TestCase):
                        '--balanced-initial-answers', '--group-relative', '--branch-rounds', '1']
             result = subprocess.run(command, capture_output=True, text=True, timeout=120)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            special = json.loads((out/'special_benchmarks_epoch_01.json').read_text())
+            self.assertEqual(special['suite'], 'extended')
+            self.assertEqual(len(special['benchmarks']), 12)
             for states in (2, 3, 4):
                 self.assertIn(f'{states}-state (1 machines)', result.stdout)
             for phase in ('training', 'evaluation'):
