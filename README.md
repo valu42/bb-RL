@@ -8,6 +8,11 @@ The proof environment works. The Transformer and training loop run. **This is
 not yet evidence that the model learns to prove machines.** Included example
 proofs are human-written verification fixtures; the trainer never loads them.
 
+The proposed [foundational language v2](docs/foundational_language_v2.md) specifies
+explicit proof steps, offline compilation of teacher proofs for pretraining,
+and subsequent RL without teacher helpers. It is a design specification, not
+an implemented training mode; the commands below still use the current language.
+
 ## Mixed 2-, 3-, and 4-state training
 
 Create a fixed dataset with 1,000 training machines (334/333/333 by size)
