@@ -38,7 +38,7 @@ deduplicated. Counts are split as evenly as possible, giving remainder entries
 to smaller state counts. Dataset generation refuses to overwrite an existing file.
 The trainer reproduces the seed and validates all tables, identities, and metadata.
 
-Compact progress shows the latest batch counts and adds three per-size
+Compact progress retains overall counts per batch and adds three per-size
 summaries at the end of each phase, including HALT/NONHALT counts, mean first
 proof actions, and unproved counts. The same breakdown is saved under
 `proof_progress.by_states` in progress and epoch JSON reports.
@@ -76,16 +76,13 @@ use `--width 64 --layers 1` and a separate output directory. Model dimensions
 cannot change when resuming: repeat the original dimensions and add `--resume`.
 
 `--log-mode compact` prints one progress line per completed batch, including
-the existing bar and phase ETA, plus HALT/NONHALT machine counts, mean proof
-actions for each answer, and unproved counts for the **latest batch only**. The
-line explicitly labels its actual batch size (normally 8 in training; evaluation
-queues or final partial batches can differ). Each solved machine contributes its **first verified proof**
+the existing bar and phase ETA, plus cumulative HALT/NONHALT machine counts,
+mean proof actions for each answer, and the number still unproved among the
+machines processed. Each solved machine contributes its **first verified proof**
 once to the mean, regardless of how many later attempts also succeed. These
 are proof-game actions, not simulated Turing-machine transitions; an empty
-category displays `n/a`. Before the first new batch, including on resume, the
-line says `last batch: waiting`. Epoch progress and ETA still cover the whole
-phase. Cumulative totals are printed at phase completion and saved in reports;
-they recover committed batches when resuming mid-phase.
+category displays `n/a`. Counts reset for each baseline/train/evaluation phase
+and recover committed batches when resuming mid-phase.
 
 Compact mode hides routine JSON, timing, and trace announcements from the
 terminal. Detailed batch records, profiling (enabled by default), trace files,

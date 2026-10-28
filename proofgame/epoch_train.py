@@ -1260,7 +1260,7 @@ def main():
             if phase_progress is None or (phase_progress.epoch, phase_progress.phase) != (epoch, phase):
                 phase_progress = EpochProgress(epoch, phase, len(rows), start_index)
                 proof_progress = ProofProgress.restore(folder, start_index)
-                phase_progress.show(detail='last batch: waiting' if not verbose else '')
+                phase_progress.show(detail=proof_progress.text() if not verbose else '')
             if start_index<len(rows):
                 queue_size = args.batch_size if training else args.eval_batch_size
                 batch=rows[start_index:start_index+queue_size]
@@ -1399,12 +1399,8 @@ def main():
                     progress['gpu_inference' if args.device=='mps' else 'cpu_inference'] = pool.inference.stats()
                 proof_progress.add(results)
                 progress['proof_progress'] = proof_progress.snapshot()
-                latest_batch = ProofProgress()
-                latest_batch.add(results)
                 progress['epoch_progress'] = phase_progress.show(
-                    state['next_index'], detail=(
-                        f'last batch ({len(results)} machines): {latest_batch.text()}'
-                        if not verbose else ''))
+                    state['next_index'], detail=proof_progress.text() if not verbose else '')
                 atomic_json(args.out/'progress.json',progress);log(json.dumps(progress),flush=True)
                 continue
             if args.profile:
@@ -1413,8 +1409,6 @@ def main():
             batch_paths=sorted(folder.glob('batch_*.json'))
             metrics=summarize(batch_paths)
             metrics['proof_progress'] = proof_progress.snapshot()
-            if not verbose:
-                print(f'Epoch {epoch} {phase} total | {proof_progress.text()}',flush=True)
             if len(proof_progress.by_states) > 1:
                 for line in proof_progress.state_lines():
                     print(f'Epoch {epoch} {phase} | {line}',flush=True)
