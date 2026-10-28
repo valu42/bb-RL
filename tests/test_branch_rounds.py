@@ -174,6 +174,13 @@ class BranchRoundTests(unittest.TestCase):
             self.assertEqual(result.returncode,0,result.stdout+'\n'+result.stderr)
             cfg=json.loads((out/'config.json').read_text())
             self.assertEqual(cfg['branch_rounds'],2)
+            self.assertEqual(cfg['model']['encoder_backend'],'root-query')
+            self.assertEqual(cfg['gradient_execution']['backend'],'two-pass')
+            self.assertEqual(cfg['rollout_scheduler'],'attempt')
+            self.assertEqual(cfg['attempt_rng'],'per-attempt-v1')
+            self.assertEqual(cfg['eval_batch_size'],8)
+            self.assertIn('\"event\": \"rollout_progress\"',result.stdout)
+            self.assertIn('\"event\": \"batch_profile\"',result.stdout)
             train=json.loads((out/'epoch_01_training.json').read_text())
             self.assertIn('first_proof_round_by_answer',train)
             hist=train['first_proof_round_by_answer']

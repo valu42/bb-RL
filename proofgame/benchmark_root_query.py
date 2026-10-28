@@ -295,7 +295,7 @@ def main():
     try:
         torch.set_num_threads(args.threads)
         saved = torch.load(checkpoint, map_location='cpu', weights_only=True)
-        base = Policy(**saved['config']).eval()
+        base = Policy(**{**saved['config'], 'encoder_backend':'full'}).eval()
         base.load_state_dict(saved['state_dict'])
         if base.representation != 'ast':
             raise ValueError('requires an AST checkpoint')
@@ -327,7 +327,7 @@ def main():
                 report['devices'][device] = {'status': 'unavailable'}
                 write_json(out, report)
                 continue
-            model = Policy(**saved['config']).to(device).eval()
+            model = Policy(**{**saved['config'], 'encoder_backend':'full'}).to(device).eval()
             model.load_state_dict(saved['state_dict'])
             groups, lengths = chunks_for(samples, 1 if device == 'cpu' else args.mps_batch_size,
                                          saved['config']['heads'], device, args.max_attention_elements)

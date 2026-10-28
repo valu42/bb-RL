@@ -117,11 +117,13 @@ _worker_policy = None
 _worker_policy_version = None
 _worker_action_features = None
 _worker_share_action_cache = False
+_worker_snapshot = None
+_worker_samplers = OrderedDict()
 
 
 def init_worker(model_config, share_action_cache=False, structural_cache_mb=0):
     global _worker_policy, _worker_policy_version, _worker_action_features
-    global _worker_share_action_cache
+    global _worker_share_action_cache, _worker_snapshot, _worker_samplers
     torch.set_num_threads(1)
     _worker_policy = Policy(**model_config).eval()
     if structural_cache_mb:
@@ -130,6 +132,8 @@ def init_worker(model_config, share_action_cache=False, structural_cache_mb=0):
         _worker_policy.structural_encoder.enable_input_cache(
             relation_cache_mb=structural_cache_mb)
     _worker_policy_version = None
+    _worker_snapshot = None
+    _worker_samplers = OrderedDict()
     _worker_action_features = OrderedDict()
     _worker_share_action_cache = share_action_cache
 
@@ -137,7 +141,7 @@ def init_worker(model_config, share_action_cache=False, structural_cache_mb=0):
 def execute_machine(selected, seed, attempts, budget, version, stop_on_success, sampler,
                     exploration_epsilon=0., balanced_initial_answers=False,
                     trace_diagnostics=False, profile_enabled=False, group_relative=False,
-                    branch_rounds=0):
+                    branch_rounds=0, attempt_runner=None, independent_attempt_seeds=False):
     """Execute a machine with either a CPU policy or the central GPU sampler."""
     machine = Machine(selected['machine']['rows']); rng = random.Random(seed)
     successes = []; statuses = Counter(); actions = 0; start = time.monotonic()
@@ -169,6 +173,7 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
         if balanced_initial_answers:
             random.Random(seed ^ 0xA5A5F00D).shuffle(answers)
         schedule = [(None,answer) for answer in answers]
+    trajectory_digest = hashlib.sha256()
     first_proof_round = None
     first_proof_answer = None
     rounds_completed = 0
@@ -189,13 +194,21 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
             for answer in ('HALT','NONHALT'):
                 policy_sums[answer]+=raw[answer]
                 behavior_sums[answer]+=mixed[answer]
+    run_attempt = attempt if attempt_runner is None else attempt_runner
     for i,(round_number,answer) in enumerate(schedule):
         detail = [] if trace_diagnostics else None
-        cert, trace, status = attempt(sampler, machine, rng, budget,
+        if independent_attempt_seeds:
+            from .parallel_rollouts import attempt_seed
+            rng = random.Random(attempt_seed(seed, i))
+        cert, trace, status = run_attempt(sampler, machine, rng, budget,
                                       exploration_epsilon=exploration_epsilon,
                                       on_initial_choice=record_initial,
                                       forced_initial_answer=answer,
                                       diagnostic_steps=detail, profile=profile)
+        trajectory_digest.update(encode_json({
+            'actions':[step['action'] for step in trace],
+            'status':status,'certificate':cert}).encode())
+        trajectory_digest.update(b'\n')
         actions += len(trace); statuses[status] += 1
         if group_relative:
             trajectory = {'attempt':i+1,'actions':trace,
@@ -247,6 +260,7 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
             round_groups = {'HALT':[],'NONHALT':[]}
     return {**selected, 'action_seed':seed, 'policy_version':version,
             'attempts':sum(statuses.values()), 'actions':actions, 'statuses':dict(statuses),
+            'trajectory_sha256':trajectory_digest.hexdigest(),
             'successes':successes, 'seconds':time.monotonic()-start,
             'network_evaluations':sampler.misses, 'cache_hits':sampler.hits,
             'first_action_counts':dict(first_actions),
@@ -271,20 +285,30 @@ def execute_machine(selected, seed, attempts, budget, version, stop_on_success, 
             **({'group_trajectories':group_trajectories} if group_relative else {})}
 
 
-def run_machine(task):
+def load_worker_snapshot(weights_file, version):
+    """Load once per version; no neural cache survives a weight change."""
+    global _worker_policy_version, _worker_snapshot
+    snapshot = (str(weights_file), version)
+    if _worker_snapshot == snapshot:
+        return
+    saved = torch.load(weights_file, map_location='cpu', weights_only=True)
+    if saved['version'] != version:
+        raise RuntimeError('rollout policy version changed')
+    _worker_policy.load_state_dict(saved['state_dict'])
+    _worker_action_features.clear()
+    _worker_samplers.clear()
+    _worker_policy_version = version
+    _worker_snapshot = snapshot
+
+
+def run_machine(task, independent_attempt_seeds=False):
     global _worker_policy_version, _worker_action_features
     if len(task) < 13:
         task = (*task,)+(False,)*(13-len(task))
     selected, seed, attempts, budget, weights_file, version, stop_on_success, epsilon, balanced, diagnostics, profiling, group_relative, branch_rounds = task
     if profiling:
         started = time.perf_counter()
-    saved = torch.load(weights_file, map_location='cpu', weights_only=True)
-    if saved['version'] != version: raise RuntimeError('rollout policy version changed')
-    # Invalidate cached action embeddings on every frozen policy version change.
-    if _worker_share_action_cache and _worker_policy_version != version:
-        _worker_action_features.clear()
-    _worker_policy.load_state_dict(saved['state_dict'])
-    _worker_policy_version = version
+    load_worker_snapshot(weights_file, version)
     sampler = FrozenSampler(
         _worker_policy, capacity=10000,
         shared_action_features=_worker_action_features if _worker_share_action_cache else None,
@@ -296,7 +320,7 @@ def run_machine(task):
         cache_before = (cache.stats() if cache is not None else None)
     result = execute_machine(selected,seed,attempts,budget,version,stop_on_success,sampler,
                              epsilon,balanced,diagnostics,profiling,group_relative,
-                             branch_rounds)
+                             branch_rounds, independent_attempt_seeds=independent_attempt_seeds)
     if profiling:
         result['profile']['worker_model_load_seconds'] = load_seconds
         result['profile']['cache_hits'] = sampler.hits
@@ -483,6 +507,7 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
     attempt succeeds. Grouping identical observations/actions preserves the
     reward-weighted gradient, normalized by all attempts in the batch.
     """
+    learn_started = time.perf_counter()
     if gradient_backend not in ('serial', 'two-pass'):
         raise ValueError('gradient backend must be serial or two-pass')
     if gradient_max_attention_elements < 1 or gpu_gradient_batch_size < 1:
@@ -538,11 +563,15 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
                     group_metrics['mean_verified_proof_reward'],
                 'mean_verified_proof_actions':None if not proof_count else
                     group_metrics['mean_verified_proof_actions'],
-                'length_penalty':length_penalty,**group_metrics}
+                'length_penalty':length_penalty,
+                'timing_prepare_seconds':time.perf_counter()-learn_started,
+                'timing_backward_seconds':0.,'timing_optimizer_seconds':0.,**group_metrics}
     reward_metrics = (group_metrics if group_relative else
                       {'mean_verified_proof_reward':reward_sum/proof_count,
                        'mean_verified_proof_actions':successful_action_sum/proof_count,
                        'length_penalty':length_penalty})
+    preparation_seconds = time.perf_counter() - learn_started
+    backward_started = time.perf_counter()
     optimizer.zero_grad(set_to_none=True)
     # Only the selected winning groups contribute gradients. Unsuccessful
     # exploratory rounds do not dilute the policy-gradient normalization.
@@ -635,6 +664,10 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
             grouped_loss = torch.stack(losses).sum()
             grouped_loss.backward()
             total_loss += float(grouped_loss.detach())
+    gradient_details.update(
+        timing_prepare_seconds=preparation_seconds,
+        timing_backward_seconds=time.perf_counter()-backward_started)
+    optimizer_started = time.perf_counter()
     # A single bad REINFORCE gradient must not poison all future rollouts.
     # Reject the update without changing the policy/optimizer; keep proof logs.
     norm = torch.nn.utils.clip_grad_norm_(policy.parameters(),1.,error_if_nonfinite=False)
@@ -696,6 +729,7 @@ def learn_batch(policy, optimizer, results, budget, gpu_gradient_batch_size=4,
                                     'probe_logits_finite':logits_ok,
                                     'probe_grad_mode_logits_finite':grad_mode_logits_ok},
                 **gradient_details, **reward_metrics}
+    gradient_details['timing_optimizer_seconds'] = time.perf_counter()-optimizer_started
     return {'updated':True, 'proofs':proof_count, 'unique_gradient_observations':len(groups),
             'loss':total_loss, 'gradient_norm':float(norm),
             'inference_gradient_probability_differences':numerical_fallbacks,
@@ -863,6 +897,14 @@ def main():
     parser.add_argument('--branch-rounds',type=int,default=0,
                         help='sample --attempts per branch per round, stop after first proof round')
     parser.add_argument('--batch-size',type=int,default=8)
+    parser.add_argument('--eval-batch-size',type=int,default=0,
+                        help='evaluation queue size; 0 uses max(batch-size, 4 * workers)')
+    parser.add_argument('--rollout-scheduler',choices=('auto','machine','attempt'),default='auto',
+                        help='auto distributes branch-round attempts across local CPU workers')
+    parser.add_argument('--encoder-backend',choices=('auto','full','root-query'),default='auto',
+                        help='auto uses root-query for the one-layer AST training model')
+    parser.add_argument('--log-interval',type=float,default=10.,
+                        help='seconds between live rollout progress records')
     parser.add_argument('--workers',type=int,default=8)
     parser.add_argument('--seed',type=int,default=7)
     parser.add_argument('--lr',type=float,default=3e-4)
@@ -890,19 +932,35 @@ def main():
                              'runs locally in independent CPU workers (not MPS central)')
     parser.add_argument('--gpu-inference-wait-ms',type=float,default=2.)
     parser.add_argument('--gpu-max-attention-elements',type=int,default=8000000)
-    parser.add_argument('--gpu-gradient-batch-size',type=int,default=4,
+    parser.add_argument('--gpu-gradient-batch-size',type=int,default=8,
                         help='MPS gradient microbatch size; also used by two-pass '
                              'gradient backend on CPU or MPS')
-    parser.add_argument('--gradient-backend',choices=('serial','two-pass'),default='serial',
-                        help='opt-in exact two-pass action-gradient replay')
+    parser.add_argument('--gradient-backend',choices=('serial','two-pass'),default='two-pass',
+                        help='exact two-pass action-gradient replay (default), or serial reference')
     parser.add_argument('--gradient-max-attention-elements',type=int,default=12000000,
                         help='attention packing limit for two-pass gradients')
     parser.add_argument('--resume',action='store_true')
-    parser.add_argument('--profile',action='store_true',
+    parser.add_argument('--profile',action=argparse.BooleanOptionalAction,default=True,
                         help='measure rollout, model inference, proof-game, gradient, and checkpoint costs per batch; may be enabled when resuming')
     parser.add_argument('--stop-after-first-train-proof',action='store_true',
                         help='stop each training machine after one verified proof; keep evaluation at the full attempt budget')
     args = parser.parse_args()
+    if args.eval_batch_size < 0 or not math.isfinite(args.log_interval) or args.log_interval <= 0:
+        parser.error('nonnegative evaluation queue and positive log interval required')
+    args.eval_batch_size = args.eval_batch_size or max(args.batch_size, 4 * args.workers)
+    central = ((args.device == 'mps' and not args.mps_local_cpu_rollouts)
+               or args.cpu_central_inference)
+    if args.rollout_scheduler == 'auto':
+        args.rollout_scheduler = 'attempt' if args.branch_rounds and not central else 'machine'
+    if args.rollout_scheduler == 'attempt' and (not args.branch_rounds or central):
+        parser.error('attempt scheduler requires branch rounds and local CPU inference')
+    if args.encoder_backend == 'auto':
+        args.encoder_backend = ('root-query' if args.representation == 'ast'
+                                and not args.cpu_topology_cache_mb else 'full')
+    if args.encoder_backend == 'root-query' and args.representation != 'ast':
+        parser.error('root-query requires --representation ast')
+    if args.encoder_backend == 'root-query' and args.cpu_topology_cache_mb:
+        parser.error('root-query replaces the full topology cache; omit --cpu-topology-cache-mb')
     if args.eval_attempts is None:
         args.eval_attempts=args.attempts
     if min(args.epochs,args.attempts,args.eval_attempts,args.batch_size,args.workers,
@@ -1010,7 +1068,8 @@ def main():
             if [row['rank'] for row in dataset[split]] != [row['rank'] for row in expected[split]]:
                 parser.error('unfiltered dataset ranks do not match the claimed seed')
     torch.set_num_threads(1);torch.manual_seed(args.seed)
-    policy=Policy(width=32,layers=1,representation=args.representation).to(args.device).eval()
+    policy=Policy(width=32,layers=1,representation=args.representation,
+                  encoder_backend=args.encoder_backend).to(args.device).eval()
     optimizer=torch.optim.AdamW(policy.parameters(),lr=args.lr,weight_decay=0.)
     config={'dataset_sha256':hashlib.sha256(dataset_bytes).hexdigest(),
             'train_machines':len(dataset['train']),'test_machines':len(dataset['test']),
@@ -1018,6 +1077,9 @@ def main():
             'eval_attempts_per_machine':args.eval_attempts,
             'group_relative':args.group_relative,
             'branch_rounds':args.branch_rounds,
+            'eval_batch_size':args.eval_batch_size,
+            'rollout_scheduler':args.rollout_scheduler,
+            'attempt_rng':('per-attempt-v1' if args.rollout_scheduler == 'attempt' else 'legacy-machine-stream'),
             'batch_size':args.batch_size,'seed':args.seed,'lr':args.lr,'model':policy.config,
             'parameters':sum(p.numel() for p in policy.parameters()),'epochs_requested':args.epochs,
             'algorithm':('leave-one-out group-relative on-policy REINFORCE'
@@ -1144,14 +1206,19 @@ def main():
                           'workers':args.workers,
                           'inference_batch_size':args.gpu_inference_batch_size}),flush=True)
     else:
+        # Use the canonical module in spawned workers even when launched via -m.
+        from .epoch_train import init_worker as initialize_rollout_worker
         runner=mp.get_context('spawn').Pool(
-            args.workers, initializer=init_worker,
+            args.workers, initializer=initialize_rollout_worker,
             initargs=(policy.config,args.cpu_shared_action_cache,
-                      args.cpu_topology_cache_mb), maxtasksperchild=50)
+                      args.cpu_topology_cache_mb))
         print(json.dumps({
             'device':args.device,
             'inference':'local-cpu-workers',
             'gradient_backend':args.gradient_backend,
+            'encoder_backend':args.encoder_backend,
+            'rollout_scheduler':args.rollout_scheduler,
+            'eval_batch_size':args.eval_batch_size,
             'cpu_topology_cache_mb':args.cpu_topology_cache_mb,
             'workers':args.workers}),flush=True)
     with runner as pool:
@@ -1163,13 +1230,17 @@ def main():
             folder.mkdir(exist_ok=True)
             start_index=state['next_index']
             if start_index<len(rows):
-                batch=rows[start_index:start_index+args.batch_size]
-                batch_number=start_index//args.batch_size+1
+                queue_size = args.batch_size if training else args.eval_batch_size
+                batch=rows[start_index:start_index+queue_size]
+                batch_number=start_index//queue_size+1
                 inspect_batch=(batch_number % 10 == 0)
                 if args.profile:
                     profile_stages = {}
                     profile_t = time.perf_counter()
                     gpu_before = pool.inference.stats() if central_inference else None
+                print(json.dumps({'event':'batch_stage','phase':phase,'epoch':epoch,
+                                  'batch':batch_number,'stage':'rollout','machines':len(batch),
+                                  'scheduler':args.rollout_scheduler if training else 'machine'}),flush=True)
                 if central_inference:
                     tasks=[(r,task_seed(args.seed,'train' if training else 'eval',epoch,r['machine_id']),
                             args.attempts if training else args.eval_attempts,
@@ -1196,11 +1267,18 @@ def main():
                             inspect_batch,args.profile,
                             training and args.group_relative,
                             args.branch_rounds if training else 0) for r in batch]
-                    results=pool.map(run_machine,tasks,chunksize=1)
+                    from .parallel_rollouts import run_local_rollouts
+                    results=run_local_rollouts(
+                        pool,tasks,workers=args.workers,
+                        split_attempts=training and args.rollout_scheduler=='attempt',
+                        log_interval=args.log_interval,
+                        progress_context={'phase':phase,'epoch':epoch,'batch':batch_number})
                 if args.profile:
                     profile_stages['rollout']=time.perf_counter()-profile_t
                     gpu_after = pool.inference.stats() if central_inference else None
                     profile_t=time.perf_counter()
+                print(json.dumps({'event':'batch_stage','phase':phase,'epoch':epoch,
+                                  'batch':batch_number,'stage':'learn' if training else 'save'}),flush=True)
                 update=learn_batch(policy,optimizer,results,dataset['action_budget'],
                                    gpu_gradient_batch_size=args.gpu_gradient_batch_size,
                                    exploration_epsilon=args.train_exploration_epsilon,
@@ -1256,7 +1334,8 @@ def main():
                     report=make_batch_profile(
                         phase=phase,epoch=epoch,batch_number=batch_number,
                         results=profiled_rows,stages=profile_stages,device=args.device,
-                        gpu_before=gpu_before,gpu_after=gpu_after)
+                        gpu_before=gpu_before,gpu_after=gpu_after,workers=args.workers,
+                        learning=update)
                     save_batch_profile(args.out,report)
                 batch_outcomes=count_proofs_by_answer(results)
                 batch_choices=summarize_initial_choices(results)
@@ -1378,7 +1457,11 @@ def main():
                          str(weights_file),state['updates'],True,0.,False,False,False)
                         for row in challenge_rows
                     ]
-                    challenge_results=pool.map(run_machine,challenge_tasks,chunksize=1)
+                    from .parallel_rollouts import run_local_rollouts
+                    challenge_results=run_local_rollouts(
+                        pool,challenge_tasks,workers=args.workers,
+                        log_interval=args.log_interval,
+                        progress_context={'phase':'challenge','epoch':epoch})
                 benchmark_report=make_benchmark_report(
                     epoch,challenge_results,args.eval_attempts,dataset['action_budget'],
                     trained_ids=(row['machine_id'] for row in dataset['train'])

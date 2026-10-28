@@ -9,6 +9,92 @@ not yet evidence that the model learns to prove machines.** Included example
 proofs are human-written verification fixtures; the trainer never loads them.
 
 
+## Training speed and live timing (current defaults)
+
+The epoch trainer now enables the CPU speed path automatically:
+
+- One-layer AST models use **root-query** for both worker inference and
+  gradient replay. This computes only the output token the policy consumes,
+  with the same trainable parameters and checkpoint weights.
+- Gradients use **two-pass action reuse**, with context microbatches up to 8.
+  Signed group-relative coefficients and sampled-probability checks remain.
+- Local CPU branch-race training distributes the **current round's attempts**
+  over the process pool. It still completes both groups, selects the winning
+  eight-attempt group, and updates once per eight-machine training batch.
+  Later rounds are queued only if the current round has no verified proof.
+- Evaluation queues `max(batch-size, 4 * workers)` machines by default, so
+  workers can move on when another machine is slow. Evaluation retains its
+  full attempt budget, fixed per-machine seeds, and frozen weights.
+- Profiling and periodic progress logs are **on by default**. Worker models
+  and neural caches are reused within a frozen version and invalidated when
+  the version changes. Workers remain alive across fine-grained jobs.
+
+Use a **fresh output directory** for these defaults. The attempt scheduler
+uses deterministic `per-attempt-v1` random streams, independent of worker
+completion order and worker count. The distribution and group algorithm are
+preserved, but exact trajectories differ from the historical machine-wide
+random stream. Execution choices are recorded in `config.json`; strict resume
+checks reject mixing incompatible old/new execution settings.
+
+```bash
+python -m proofgame.epoch_train \
+  --dataset runs/unfiltered_1000_100/dataset.json \
+  --out runs/ast_branch_race_fast \
+  --epochs 100 --attempts 8 --branch-rounds 6 --eval-attempts 100 \
+  --batch-size 8 --workers 8 \
+  --representation ast --device cpu \
+  --balanced-initial-answers --group-relative \
+  --cpu-shared-action-cache --length-penalty 0.3
+```
+
+The terminal emits JSON records, suitable for saving with `tee`:
+
+- `batch_stage`: identifies rollout, learning, or saving as work begins.
+- `rollout_progress`: every 10 seconds (configurable with `--log-interval`),
+  plus completion; includes completed attempts/actions/machines, outstanding
+  jobs, elapsed time, and actions per second. This covers local CPU training,
+  evaluation, and separate challenge machines.
+- `batch_profile`: rollout, learning, snapshot, JSON, trace, and checkpoint
+  wall times and percentages; actions per second; cache hit rate; elapsed
+  worker occupancy; worker inference, observation, proof-step, and verification
+  seconds; and gradient preparation/backward/optimizer timings plus action reuse.
+- `epoch_profile_summary`: accumulated stage times and throughput for each
+  training/evaluation phase. Full per-batch records and phase summaries are
+  saved in `<out>/profiling/`.
+
+Worker seconds overlap in parallel: **do not add them to wall time**.
+`elapsed_worker_occupancy` is elapsed task time divided by workers × rollout
+wall time, not a hardware CPU-utilization reading. Startup and queue overhead
+reduce it. Compare steady-state batches with similar workloads, and watch
+both rollout and learning after enabling root-query.
+
+For controlled comparisons, use `--encoder-backend full`,
+`--gradient-backend serial`, `--rollout-scheduler machine`, and
+`--eval-batch-size 8` to select the historical execution paths. Use
+`--no-profile` to disable detailed profiling. An explicitly requested topology
+cache selects the full encoder in auto mode; it cannot be combined with an
+explicit `--encoder-backend root-query`.
+
+A focused read-only A/B also measures rollout **and a full optimizer step**
+from a saved one-layer AST branch-race checkpoint:
+
+```bash
+python -m proofgame.benchmark_training_runtime \
+  --run runs/ast_branch_race_8x6_fixed --epoch 2 \
+  --machines 8 --workers 8 --repeats 3 \
+  --out runs/runtime_ab.json
+```
+
+It compares full-encoder/serial-learning/machine scheduling with
+root-query/two-pass/attempt scheduling. Both use per-attempt seeds so it can
+check action paths, complete gradients, and updated parameters. Warmups and
+worker startup are reported separately, all model updates are temporary, and
+the source run/checkpoint are never changed. A validated factor requires
+matching trajectories/gradients, actual gradient updates, and stable repeated
+measurements. This remains a sampled-batch benchmark, not a full-epoch or
+held-out-quality claim. The older speed-lab sections below document earlier
+opt-in experiments; this section describes the new production defaults.
+
 ## Clone, install, and track evaluation
 
 ```bash

@@ -182,6 +182,7 @@ class StructuralEncoder(nn.Module):
         self.max_tokens = max_tokens
         self.heads = heads
         self._input_cache = None  # input-only runtime optimization; not checkpointed
+        self.use_root_query = False
         self.embedding = nn.Embedding(VOCAB_SIZE, width, padding_idx=0)
         self.relationship = nn.Embedding(NUM_RELATIONS, heads)
         nn.init.zeros_(self.relationship.weight)  # Begin without structural preference.
@@ -204,6 +205,8 @@ class StructuralEncoder(nn.Module):
         if relation_cache_mb == 0:
             self._input_cache = None
             return
+        if self.use_root_query:
+            raise ValueError('root-query does not need the full topology cache; disable it')
         from .experimental_structural_cache import StructuralPreprocessingCache
         self._input_cache = StructuralPreprocessingCache(
             relation_cache_mb=relation_cache_mb,
@@ -211,6 +214,9 @@ class StructuralEncoder(nn.Module):
             topology_keys=True, compact_relations=True)
 
     def forward(self, texts):
+        if self.use_root_query:
+            from .experimental_root_query import root_encoder_forward
+            return root_encoder_forward(self, texts)
         if self._input_cache is not None:
             return self._input_cache.forward(self, texts)
         from .model import ModelLimit

@@ -13,7 +13,7 @@ STAGES = ('worker_snapshot', 'rollout', 'learn', 'trace', 'batch_json', 'checkpo
 
 
 def make_batch_profile(*, phase, epoch, batch_number, results, stages, device,
-                       gpu_before=None, gpu_after=None):
+                       gpu_before=None, gpu_after=None, workers=None, learning=None):
     if not results:
         raise ValueError('profile requires a nonempty batch')
     totals = {}
@@ -23,6 +23,10 @@ def make_batch_profile(*, phase, epoch, batch_number, results, stages, device,
     actions = sum(row['actions'] for row in results)
     attempts = sum(row['attempts'] for row in results)
     elapsed = stages.get('rollout', 0.)
+    wall_total = sum(stages.get(name, 0.) for name in STAGES)
+    task_seconds = sum(row.get('worker_task_seconds', row.get('seconds', 0.))
+                       for row in results)
+    inference_calls = totals.get('cache_hits', 0) + totals.get('cache_misses', 0)
     report = {
         'phase':phase,'epoch':epoch,'batch_number':batch_number,
         'device':device,'machines':len(results),'attempts':attempts,'actions':actions,
@@ -34,6 +38,17 @@ def make_batch_profile(*, phase, epoch, batch_number, results, stages, device,
         'rollout_actions_per_wall_second':round(actions/elapsed,2) if elapsed else None,
         'rollout_attempts_per_wall_second':round(attempts/elapsed,2) if elapsed else None,
         'rollout_machines_per_wall_second':round(len(results)/elapsed,3) if elapsed else None,
+        'stage_wall_percent':{name:round(100 * stages.get(name, 0.) / wall_total, 2)
+                              if wall_total else 0. for name in STAGES},
+        'worker_task_seconds_sum':task_seconds,
+        'elapsed_worker_occupancy':task_seconds / (workers * elapsed)
+                                  if workers and elapsed else None,
+        'occupancy_note':'Elapsed task occupancy, not hardware CPU utilization; worker sums overlap.',
+        'observation_cache_hit_rate':totals.get('cache_hits', 0) / inference_calls
+                                     if inference_calls else None,
+        'learning':{key:value for key,value in (learning or {}).items()
+                    if key.startswith(('timing_', 'two_pass_')) or
+                    key in ('unique_gradient_observations','gradient_backend','numerical_fallbacks')},
     }
     if gpu_before is not None and gpu_after is not None:
         names=('inference_requests','observation_cache_hits',
@@ -60,12 +75,22 @@ def save_batch_profile(directory, report):
         'device':report['device'],'machines':report['machines'],
         'actions':report['actions'],'attempts':report['attempts'],
         'actions_per_second':report['rollout_actions_per_wall_second'],
+        'attempts_per_second':report['rollout_attempts_per_wall_second'],
         'rollout_seconds':stages['rollout'],
         'learn_seconds':stages['learn'],
+        'snapshot_seconds':stages['worker_snapshot'],
+        'batch_json_seconds':stages['batch_json'],
+        'trace_seconds':stages['trace'],
         'checkpoint_seconds':stages['checkpoint'],
+        'worker_model_load_seconds_sum':worker.get('worker_model_load_seconds',0.),
         'worker_inference_seconds_sum':worker.get('inference_seconds',0.),
         'worker_observation_seconds_sum':worker.get('observation_seconds',0.),
         'worker_step_seconds_sum':worker.get('step_seconds',0.),
+        'worker_verification_seconds_sum':worker.get('verification_seconds',0.),
+        'stage_wall_percent':report['stage_wall_percent'],
+        'elapsed_worker_occupancy':report['elapsed_worker_occupancy'],
+        'observation_cache_hit_rate':report['observation_cache_hit_rate'],
+        'learning':report['learning'],
         'profile_path':str(path),
     }),flush=True)
     return path
@@ -91,6 +116,9 @@ def summarize_epoch_profiles(directory, epoch, phase):
             'rollout_actions_per_wall_second':round(actions/stage_sums['rollout'],2)
             if stage_sums['rollout'] else None,
             'note':'Worker sums overlap in parallel; do not add them to wall-clock stage times.'}
+    total=sum(stage_sums.values())
+    report['stage_wall_percent']={name:round(100*value/total,2) if total else 0.
+                                  for name,value in stage_sums.items()}
     path=folder/f'epoch_{epoch:02d}_{phase}_summary.json'
     tmp=path.with_suffix('.json.tmp')
     tmp.write_text(json.dumps(report,indent=2)+'\n')

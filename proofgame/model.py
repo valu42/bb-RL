@@ -14,13 +14,18 @@ class ModelLimit(RuntimeError):
 
 
 class Policy(nn.Module):
-    def __init__(self,width=64,layers=2,heads=4,max_tokens=4096,representation="bytes"):
+    def __init__(self,width=64,layers=2,heads=4,max_tokens=4096,representation="bytes",
+                 encoder_backend='full'):
         super().__init__()
         if width%heads or width%2: raise ValueError("width must be even and divisible by heads")
         if representation not in ('bytes', 'ast'):
             raise ValueError('representation must be bytes or ast')
         self.config=dict(width=width,layers=layers,heads=heads,max_tokens=max_tokens)
         self.representation=representation
+        if encoder_backend not in ('full', 'root-query'):
+            raise ValueError('encoder backend must be full or root-query')
+        if encoder_backend == 'root-query' and (representation != 'ast' or layers != 1):
+            raise ValueError('root-query requires a one-layer AST policy')
         if representation=='bytes':
             self.embedding=nn.Embedding(258,width,padding_idx=0)
             layer=nn.TransformerEncoderLayer(width,heads,4*width,dropout=0.,batch_first=True)
@@ -33,6 +38,9 @@ class Policy(nn.Module):
             from .structural_encoding import StructuralEncoder
             self.structural_encoder=StructuralEncoder(width,layers,heads,max_tokens)
             self.config['representation']='ast'
+            self.structural_encoder.use_root_query = encoder_backend == 'root-query'
+        if encoder_backend != 'full':
+            self.config['encoder_backend'] = encoder_backend
         self.query=nn.Linear(width,width)
         self.key=nn.Linear(width,width)
         self.action_bias=nn.Linear(width,1)
