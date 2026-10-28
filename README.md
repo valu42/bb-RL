@@ -8,6 +8,19 @@ The proof environment works. The Transformer and training loop run. **This is
 not yet evidence that the model learns to prove machines.** Included example
 proofs are human-written verification fixtures; the trainer never loads them.
 
+## Foundational pretraining and RL (v2)
+
+The [v2 pipeline](docs/foundation_usage.md) is available through
+`python -m proofgame.foundation run`. It generates random 2–5-state machines,
+compiles offline teacher successes into explicit checked proofs, pretrains on
+legal proof actions, and runs branch-race/group-relative RL without teacher helpers.
+It has its own language, corpora, and checkpoints; the v1 commands below remain
+available. See the guide for full commands, resume, evaluation, and profiling.
+
+The [language specification](docs/foundational_language_v2.md) and
+[pipeline design](docs/foundational_pipeline_v2.md) document the intended model;
+the usage guide records the implemented choices and limits.
+
 ## Mixed 2-, 3-, and 4-state training
 
 Create a fixed dataset with 1,000 training machines (334/333/333 by size)
