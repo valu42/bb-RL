@@ -125,7 +125,7 @@ def make_benchmark_report(epoch, results, attempts_limit, action_budget, trained
     }
 
 
-def write_benchmark_report(output_dir, report):
+def write_benchmark_report(output_dir, report, *, verbose=True):
     """Checkpoint-safe epoch file, plus a fully regenerated readable history."""
     from .epoch_train import atomic_json
     output_dir = Path(output_dir)
@@ -143,4 +143,5 @@ def write_benchmark_report(output_dir, report):
     tmp = history.with_suffix('.txt.tmp')
     tmp.write_text(''.join(texts))
     tmp.replace(history)
-    print(message, flush=True)
+    if verbose:
+        print(message, flush=True)

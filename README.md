@@ -8,6 +8,49 @@ The proof environment works. The Transformer and training loop run. **This is
 not yet evidence that the model learns to prove machines.** Included example
 proofs are human-written verification fixtures; the trainer never loads them.
 
+## Larger models and compact progress
+
+The epoch trainer accepts `--width`, `--layers`, and `--heads`. Defaults remain
+32, 1, and 4 for compatibility with existing runs. To try a larger model on
+the same two-state dataset, start a fresh run:
+
+```bash
+python -u -m proofgame.epoch_train \
+  --dataset runs/unfiltered_1000_100/dataset.json \
+  --out runs/ast_branch_race_w64_l2 \
+  --epochs 100 \
+  --attempts 8 --branch-rounds 6 --eval-attempts 100 \
+  --batch-size 8 --workers 8 \
+  --representation ast --device cpu --width 64 --layers 2 \
+  --balanced-initial-answers --group-relative \
+  --cpu-shared-action-cache --length-penalty 0.3 \
+  --log-mode compact
+```
+
+Two layers automatically select the full attention encoder; root-query is valid
+only for a one-layer AST model. This experiment increases compute and does not
+guarantee better coverage. For a smaller capacity increase that retains root-query,
+use `--width 64 --layers 1` and a separate output directory. Model dimensions
+cannot change when resuming: repeat the original dimensions and add `--resume`.
+
+`--log-mode compact` prints one progress line per completed batch, including
+the existing bar and phase ETA, plus cumulative HALT/NONHALT machine counts,
+mean proof actions for each answer, and the number still unproved among the
+machines processed. Each solved machine contributes its **first verified proof**
+once to the mean, regardless of how many later attempts also succeed. These
+are proof-game actions, not simulated Turing-machine transitions; an empty
+category displays `n/a`. Counts reset for each baseline/train/evaluation phase
+and recover committed batches when resuming mid-phase.
+
+Compact mode hides routine JSON, timing, and trace announcements from the
+terminal. Detailed batch records, profiling (enabled by default), trace files,
+and epoch reports are still saved. `progress.json` and epoch reports include
+the cumulative `proof_progress` statistics. Errors and rejected-update warnings
+remain visible, and special evaluations get short separate result lines.
+You may add `--log-mode compact` to an existing run's resume command without
+changing its model or training settings. `--log-mode detailed` restores the
+original terminal output.
+
 
 ## Training speed and live timing (current defaults)
 

@@ -59,7 +59,7 @@ def make_batch_profile(*, phase, epoch, batch_number, results, stages, device,
     return report
 
 
-def save_batch_profile(directory, report):
+def save_batch_profile(directory, report, *, verbose=True):
     folder=Path(directory)/'profiling'
     folder.mkdir(parents=True,exist_ok=True)
     filename=f"epoch_{report['epoch']:02d}_{report['phase']}_batch_{report['batch_number']:04d}.json"
@@ -67,6 +67,8 @@ def save_batch_profile(directory, report):
     tmp=path.with_suffix('.json.tmp')
     tmp.write_text(json.dumps(report,indent=2)+'\n')
     tmp.replace(path)
+    if not verbose:
+        return path
     stages=report['stage_wall_seconds']
     worker=report['worker_sum_seconds']
     print(json.dumps({
@@ -96,7 +98,7 @@ def save_batch_profile(directory, report):
     return path
 
 
-def summarize_epoch_profiles(directory, epoch, phase):
+def summarize_epoch_profiles(directory, epoch, phase, *, verbose=True):
     folder=Path(directory)/'profiling'
     rows=[json.loads(p.read_text()) for p in
           sorted(folder.glob(f'epoch_{epoch:02d}_{phase}_batch_*.json'))]
@@ -123,6 +125,8 @@ def summarize_epoch_profiles(directory, epoch, phase):
     tmp=path.with_suffix('.json.tmp')
     tmp.write_text(json.dumps(report,indent=2)+'\n')
     tmp.replace(path)
+    if not verbose:
+        return report
     print(json.dumps({'event':'epoch_profile_summary','path':str(path),
                       'phase':phase,'epoch':epoch,
                       'actions_per_second':report['rollout_actions_per_wall_second'],
