@@ -16,9 +16,11 @@ python -u -m proofgame.foundation run \
   --per-size 10000 --train 1000 --dev 400 --test 400 \
   --budget 512 --simulation 0 \
   --updates 15625 --pretrain-batch-size 64 \
+  --eval-every 2000 --eval-machines 40 --pretrain-eval-attempts 8 \
   --width 64 --layers 2 --max-tokens 4096 \
   --epochs 100 --batch-size 8 --workers 8 \
   --attempts 8 --rounds 6 --eval-attempts 100 \
+  --rl-eval-machines 100 --rl-eval-attempts 8 --full-eval-every 10 \
   --device cpu
 ```
 
@@ -39,9 +41,50 @@ The online model has explicit equations and induction, not a simulate command.
 Run the **same command with `--resume` appended** after interruption. Generation
 recovers its committed byte offset, SFT restores optimizer and RNG state, and RL
 restores its phase/batch and optimizer. Resume permits changing worker count and
-extending `--updates` or `--epochs`; training configuration and source hashes
-must otherwise match. Once RL has started, changing its pretrained checkpoint
+extending `--updates` or `--epochs`, plus the quick-evaluation settings described
+below; learning configuration and source hashes must otherwise match. Once RL has started, changing its pretrained checkpoint
 requires a new RL output, even if the new weights came from extending SFT.
+
+### Evaluation schedule
+
+| Check | Machines | Attempts per machine | When |
+|---|---:|---:|---|
+| Pretraining dev | Fixed balanced subset, up to 40 | 8 | Every 2,000 updates and at the end |
+| RL quick dev | Fixed balanced subset, up to 100 | 8 | Baseline and ordinary epochs |
+| RL full dev | All dev machines (400 in the full command) | 100 | Every tenth completed epoch |
+| Special machines | All 13 | 100 | Alongside full RL dev evaluations |
+| Held-out test | All test machines (400 in the full command) | 100 | Once at the end |
+
+A full dev check replaces that epoch's quick check. The baseline at epoch 0 is
+quick and has no special-machine pass. A run ending before epoch 10 still gets
+its full held-out test, but no scheduled full dev or special pass. Set
+`--full-eval-every 1` to run full dev and special checks after every trained epoch.
+All searches stop at the first verified proof for each machine and retain the
+corpus's action limit (512 above). RL training still uses `--attempts` and
+`--rounds`; these evaluation settings never change its exploration allowance.
+
+The controls are `--eval-every`, `--eval-machines`, and
+`--pretrain-eval-attempts` for pretraining, and `--rl-eval-machines`,
+`--rl-eval-attempts`, and `--full-eval-every` for RL. These six settings can change
+on resume. `--eval-attempts` controls **full, special, final-test, and standalone**
+evaluation only; it remains fixed when resuming training. Model architecture,
+learning settings, proof budgets, and datasets also retain strict resume checks.
+
+Every new result carries an `evaluation` object with kind, panel hash, machine
+count, attempts per machine, and action budget. Compare scores with the same
+profile: quick and full coverage are different measurements. `best.pt` is
+selected by the pretraining dev profile only, with ties retaining the earlier
+checkpoint. Full RL results do not compete against quick scores.
+
+For an existing run, interrupt with Ctrl-C, update the code, and use the full
+command above with `--resume`. The generated corpus, trained weights, optimizer,
+and committed RL training batches are preserved. A pending evaluation restarts
+under the new allowance. If the pretraining panel/attempt budget changes, the
+old `best.pt` is copied to `best_before_eval_change_*.pt`; selection restarts from
+a fresh check of the current weights, without comparing against the old score.
+Even if pretraining was already finished, this check runs before handing off to
+RL. If RL has already started, `run --resume` skips finished pretraining and
+preserves the initial checkpoint already consumed by RL.
 
 CPU pretraining evaluation and the standalone `evaluate` command use
 `--workers` processes (up to the number of machines), with deterministic
@@ -61,11 +104,10 @@ Serial/MPS progress is emitted between model actions, so a slow single action
 can delay a log. Pending machines are not counted as unproved.
 
 For example, the full command's periodic pretraining check uses 40 dev machines,
-up to 100 attempts each, and up to 512 actions per attempt: at most 2,048,000
-actions. Eight workers distribute that search; they do not guarantee an eightfold
-speedup. For a **new** run, `--eval-attempts 10` makes checks cheaper, but also
-changes RL and final evaluation allowances. Existing runs should retain their
-configuration when resuming.
+up to 8 attempts each, and up to 512 actions per attempt: at most 163,840
+actions. Ordinary RL dev checks allow at most 409,600 actions. Eight workers
+distribute that search; they do not guarantee an eightfold speedup. Full checks
+are deliberately more expensive and less frequent.
 
 To apply an evaluation fix to an existing process, interrupt it with Ctrl-C,
 update the repository, and restart the same command with `--resume`. New code
@@ -88,11 +130,12 @@ python -u -m proofgame.foundation run \
   --width 16 --layers 1 --eval-machines 4 \
   --epochs 1 --batch-size 2 --workers 2 \
   --attempts 2 --rounds 1 --eval-attempts 1 \
+  --pretrain-eval-attempts 1 --rl-eval-attempts 1 \
   --skip-special
 ```
 
-Special eval is enabled by default; the smoke command disables its additional
-13 machines to keep the check small. Final held-out test evaluation still runs.
+Special eval is enabled at full-check epochs by default; the smoke command also
+disables it explicitly. Final held-out test evaluation still runs.
 `--skip-final-test` explicitly disables that end-of-run test when desired.
 
 ## Run stages separately
@@ -146,10 +189,14 @@ write those stages directly to their respective `--out` paths.
 - `pretrain/checkpoint.pt`: latest saved training state; `best.pt`: first best
   autonomous dev coverage checkpoint. Ties currently retain the earlier model.
 - `rl/epoch_XX_training.json` and `epoch_XX_evaluation.json`: cumulative HALT,
-  NONHALT, unproved, first-proof action means, and state-size breakdowns.
+  NONHALT, unproved, first-proof action means, and state-size breakdowns. Dev
+  summaries include the evaluation profile and also have a
+  `epoch_XX_evaluation_KIND_PROFILE.json` copy for separate quick/full histories.
 - `rl/metrics.jsonl`: batch rollout/learning/checkpoint/snapshot times, summed
   worker inference/observation/game times, actions/sec, and informative groups.
 - `rl/batches/`: committed machine results and successful proof action traces.
+  Evaluation batches are isolated by profile so resuming after a setting change
+  cannot combine results from different search budgets.
 - `rl/special_benchmarks_epoch_XX.json`: the original extended suite plus BB(5).
   Successful special proofs are also printed. BB(5) is an aspirational challenge.
 - `rl/final_test_epoch_XX.json`: separate held-out test results after training.

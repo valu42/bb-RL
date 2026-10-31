@@ -23,7 +23,7 @@ def parser():
         if name in ('pretrain','train','evaluate'):s.add_argument('--data',required=True)
         if name in ('pretrain','train','run','evaluate'):
             s.add_argument('--device',choices=('cpu','mps'),default='cpu',help='learning/evaluation device; parallel RL inference stays on CPU')
-            s.add_argument('--eval-attempts',type=int,default=100)
+            s.add_argument('--eval-attempts',type=int,default=100,help='attempts per machine for full, special, final-test and standalone evaluations')
         if name in ('pretrain','train','run'):
             s.add_argument('--width',type=int,default=64);s.add_argument('--layers',type=int,default=2)
             s.add_argument('--max-tokens',type=int,default=4096);s.add_argument('--lr',type=float,default=3e-4)
@@ -31,12 +31,16 @@ def parser():
             s.add_argument('--save-every',type=int,default=10)
         if name=='run':s.add_argument('--pretrain-batch-size',type=int,default=64)
         if name in ('pretrain','run'):
-            s.add_argument('--curriculum-updates',type=int,default=1000);s.add_argument('--updates',type=int,default=15625);s.add_argument('--eval-every',type=int,default=1000)
+            s.add_argument('--curriculum-updates',type=int,default=1000);s.add_argument('--updates',type=int,default=15625);s.add_argument('--eval-every',type=int,default=2000)
             s.add_argument('--eval-machines',type=int,default=40)
+            s.add_argument('--pretrain-eval-attempts',type=int,default=8)
         if name in ('train','run'):
             s.add_argument('--epochs',type=int,default=100);s.add_argument('--attempts',type=int,default=8)
             s.add_argument('--rounds',type=int,default=6);s.add_argument('--length-penalty',type=float,default=.3)
             s.add_argument('--init',default=None);s.add_argument('--skip-special',action='store_true');s.add_argument('--skip-final-test',action='store_true')
+            s.add_argument('--rl-eval-machines',type=int,default=100)
+            s.add_argument('--rl-eval-attempts',type=int,default=8)
+            s.add_argument('--full-eval-every',type=int,default=10,help='run full dev and special evaluation every N completed RL epochs')
         if name=='evaluate':
             s.add_argument('--checkpoint',required=True);s.add_argument('--split',choices=('dev','test','special'),default='test')
     return p
@@ -44,7 +48,7 @@ def parser():
 
 def main():
     p=parser();a=p.parse_args()
-    for k in ('workers','threads','per_size','train','dev','test','budget','compiler_steps','pretrain_batch_size','width','layers','max_tokens','batch_size','save_every','eval_every','eval_machines','eval_attempts','attempts','rounds'):
+    for k in ('workers','threads','per_size','train','dev','test','budget','compiler_steps','pretrain_batch_size','width','layers','max_tokens','batch_size','save_every','eval_every','eval_machines','eval_attempts','pretrain_eval_attempts','rl_eval_machines','rl_eval_attempts','full_eval_every','attempts','rounds'):
         if hasattr(a,k) and getattr(a,k)<1:p.error(k+' must be positive')
     for k in ('epochs','updates','simulation','curriculum_updates'):
         if hasattr(a,k) and getattr(a,k)<0:p.error(k+' must be nonnegative')
@@ -62,10 +66,17 @@ def main():
             generate(a)
         elif a.command=='run':
             from .data import generate
-            from .training import pretrain,train
+            from .training import pretrain,train,load
             base=Path(a.out);base.mkdir(parents=True,exist_ok=True)
             g=copy.copy(a);g.out=str(base/'data');g.resume=a.resume and (Path(g.out)/'config.json').exists();generate(g)
-            s=copy.copy(a);s.command='pretrain';s.batch_size=a.pretrain_batch_size;s.data=g.out;s.out=str(base/'pretrain');s.resume=a.resume and (Path(s.out)/'checkpoint.pt').exists();pretrain(s)
+            s=copy.copy(a);s.command='pretrain';s.batch_size=a.pretrain_batch_size;s.data=g.out;s.out=str(base/'pretrain');s.resume=a.resume and (Path(s.out)/'checkpoint.pt').exists()
+            if a.resume and (base/'rl/checkpoint.pt').exists():
+                # Once RL consumes best.pt, do not rewrite that initialization
+                # while changing evaluation settings for an existing RL run.
+                if load(Path(s.out)/'checkpoint.pt')['update'] < a.updates:
+                    raise ValueError('cannot extend pretraining after RL has started; use a new RL output')
+                print(json.dumps({'event':'pretraining_already_complete','reason':'resuming existing RL checkpoint'}),flush=True)
+            else:pretrain(s)
             r=copy.copy(a);r.command='train';r.data=g.out;r.out=str(base/'rl');r.init=str(Path(s.out)/'best.pt' if (Path(s.out)/'best.pt').exists() else Path(s.out)/'checkpoint.pt');r.resume=a.resume and (Path(r.out)/'checkpoint.pt').exists();train(r)
         else:
             from . import training
