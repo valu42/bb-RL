@@ -324,7 +324,7 @@ def train(args):
             for n,part in sorted(summary['by_states'].items()):print(f'Epoch {epoch} {phase} | {n}-state: '+proof_text(part),flush=True)
             if not training:
                 save(out/f'model_epoch_{epoch:02d}.pt',checkpoint(policy,opt,cfg,phase_index=pi+1,next_index=0,updates=updates))
-                if evaluation['kind']=='full' and not args.skip_special:
+                if epoch>0 and not args.skip_special:
                     special_profile=profile(cfg,'special',machines['splits']['special'],args.eval_attempts)
                     log(out,{'event':'special_evaluation_start','epoch':epoch,'evaluation':special_profile})
                     save(snapshot,{'model':policy.config,'state_dict':{k:v.detach().cpu() for k,v in policy.state_dict().items()}})

@@ -52,13 +52,14 @@ requires a new RL output, even if the new weights came from extending SFT.
 | Pretraining dev | Fixed balanced subset, up to 40 | 8 | Every 2,000 updates and at the end |
 | RL quick dev | Fixed balanced subset, up to 100 | 8 | Baseline and ordinary epochs |
 | RL full dev | All dev machines (400 in the full command) | 100 | Every tenth completed epoch |
-| Special machines | All 13 | 100 | Alongside full RL dev evaluations |
+| Special machines | All 13 | 100 | After every completed RL epoch |
 | Held-out test | All test machines (400 in the full command) | 100 | Once at the end |
 
 A full dev check replaces that epoch's quick check. The baseline at epoch 0 is
-quick and has no special-machine pass. A run ending before epoch 10 still gets
-its full held-out test, but no scheduled full dev or special pass. Set
-`--full-eval-every 1` to run full dev and special checks after every trained epoch.
+quick and has no special-machine pass. Special machines run after every trained
+epoch, independently of the quick/full dev schedule. A run ending before epoch
+10 still gets its per-epoch special checks and full held-out test. Set
+`--full-eval-every 1` to also run full dev checks after every trained epoch.
 All searches stop at the first verified proof for each machine and retain the
 corpus's action limit (512 above). RL training still uses `--attempts` and
 `--rounds`; these evaluation settings never change its exploration allowance.
@@ -134,8 +135,8 @@ python -u -m proofgame.foundation run \
   --skip-special
 ```
 
-Special eval is enabled at full-check epochs by default; the smoke command also
-disables it explicitly. Final held-out test evaluation still runs.
+Special eval is enabled after every completed RL epoch by default; the smoke
+command disables it explicitly. Final held-out test evaluation still runs.
 `--skip-final-test` explicitly disables that end-of-run test when desired.
 
 ## Run stages separately
