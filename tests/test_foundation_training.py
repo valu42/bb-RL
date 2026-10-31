@@ -47,7 +47,7 @@ class FoundationTrainingTests(unittest.TestCase):
             atomic(data/'machines.json',machines)
             atomic(data/'manifest.json',{'version':VERSION,'source_hash':digest(machines),'config':{'budget':64,'language_hash':language_hash()},'corpus_sha256':hash_file(data/'corpus.jsonl')})
             def args(out,updates,resume=False):
-                argv=['pretrain','--data',str(data),'--out',str(root/out),'--updates',str(updates),'--batch-size','1','--width','16','--layers','1','--eval-every','1','--eval-machines','1','--eval-attempts','1','--curriculum-updates','0']
+                argv=['pretrain','--data',str(data),'--out',str(root/out),'--updates',str(updates),'--batch-size','1','--width','16','--layers','1','--eval-every','1','--eval-machines','1','--eval-attempts','1','--pretrain-eval-attempts','1','--curriculum-updates','0']
                 if resume:argv+=['--resume']
                 return parser().parse_args(argv)
             pretrain(args('full',2));pretrain(args('split',1));pretrain(args('split',2,True))

@@ -10,6 +10,7 @@ import multiprocessing
 import os
 from pathlib import Path
 import random
+import shutil
 import time
 import torch
 from ..model import Policy,ModelLimit
@@ -17,6 +18,7 @@ from .environment import Game
 from .kernel import FORMAT,check
 from .logic import Machine
 from .data import atomic,digest,hash_file,Corpus,VERSION,language_hash
+from .schedule import training_config,evaluation_changes,balanced_prefix,pretrain_panel,rl_panel,profile
 
 
 def save(path,obj):
@@ -70,7 +72,7 @@ def init(args,kind):
     torch.set_num_threads(args.threads);torch.manual_seed(args.seed)
     if args.resume:
         s=load(out/'checkpoint.pt')
-        if s['language']!=FORMAT or s['config']!=cfg:raise ValueError('resume configuration mismatch')
+        if s['language']!=FORMAT or training_config(s['config'])!=training_config(cfg):raise ValueError('resume configuration mismatch')
         policy=Policy(**s['model']).to(args.device);policy.load_state_dict(s['state_dict'])
     else:
         if any(out.iterdir()):raise ValueError('run output must be empty or use --resume')
@@ -86,7 +88,7 @@ def init(args,kind):
     # Reconstruct the source hash on resume, rather than accepting changed weights.
     if kind=='rl' and args.init:
         cfg['initial_sha256']=hash_file(args.init)
-        if s and s['config']!=cfg:raise ValueError('initial checkpoint changed')
+        if s and s['config'].get('initial_sha256')!=cfg['initial_sha256']:raise ValueError('initial checkpoint changed')
     opt=torch.optim.AdamW(policy.parameters(),lr=args.lr,weight_decay=0.)
     if s:opt.load_state_dict(s['optimizer']);restore_rng(s)
     return out,cfg,machines,policy,opt,s
@@ -167,30 +169,33 @@ def summarize(rows,by_size=True):
             'by_states':{n:summarize(rs,False) for n,rs in by_states.items()} if by_size else {}}
 
 
-def balanced_prefix(rows,count):
-    buckets={}
-    for r in rows:buckets.setdefault(r['states'],[]).append(r)
-    result=[]
-    while buckets and len(result)<count:
-        for n in list(sorted(buckets)):
-            result.append(buckets[n].pop(0))
-            if not buckets[n]:del buckets[n]
-            if len(result)==count:break
-    return result
-
-
 def pretrain(args):
     out,cfg,machines,policy,opt,s=init(args,'pretrain');budget=cfg['budget'];rng=random.Random(args.seed)
     corpus=Corpus(Path(args.data)/'corpus.jsonl');start_update=s['update'] if s else 0
     if s:rng.setstate(s['rng'])
     verified=set();best=s.get('best',-1) if s else -1
+    dev,evaluation=pretrain_panel(cfg,machines['splits']['dev'])
+    changes=evaluation_changes(s['config'],cfg) if s else {}
+    reset_best=bool(s and pretrain_panel(s['config'],machines['splits']['dev'])[1]!=evaluation)
+    if reset_best:
+        best=-1
+        previous=out/'best.pt'
+        archived=out/f"best_before_eval_change_{start_update:08d}_{digest(pretrain_panel(s['config'],machines['splits']['dev'])[1])[:16]}.pt"
+        if previous.exists() and not archived.exists():shutil.copy2(previous,archived)
+    if changes:
+        log(out,{'event':'evaluation_schedule_changed','changes':changes,'best_score_reset':reset_best})
+        atomic(out/'config.json',cfg)
 
     def finish_evaluation(record):
         nonlocal best
+        record={**record,'evaluation':evaluation}
         started=time.monotonic()
-        result=autonomous(policy,balanced_prefix(machines['splits']['dev'],args.eval_machines),
-                          budget,args.eval_attempts,args.seed+900000,workers=args.workers,threads=args.threads,
-                          on_progress=lambda row:log(out,{'phase':'pretrain_dev','update':record['update'],**row}))
+        # Commit both the new allowance and reset comparison score before search.
+        save(out/'checkpoint.pt',checkpoint(policy,opt,cfg,update=record['update'],rng=rng.getstate(),
+                                           best=best,pending_evaluation=record))
+        result=autonomous(policy,dev,budget,evaluation['attempts_per_machine'],args.seed+900000,
+                          workers=args.workers,threads=args.threads,
+                          on_progress=lambda row:log(out,{'phase':'pretrain_dev','update':record['update'],'evaluation':evaluation,**row}))
         record['dev']=result;record['evaluation_seconds']=time.monotonic()-started
         record['total_seconds']=record['seconds']+record['evaluation_seconds']
         score=sum(result['machines_proved_by_answer'].values())
@@ -202,6 +207,9 @@ def pretrain(args):
     # evaluation. Legacy checkpoints without this field resume as before.
     if s and s.get('pending_evaluation') is not None:
         finish_evaluation(s['pending_evaluation'])
+    elif reset_best:
+        finish_evaluation({'event':'pretrain_evaluation','update':start_update,'seconds':0.,
+                           'reason':'evaluation_budget_or_panel_changed'})
     for update in range(start_update,args.updates):
         start=time.monotonic();opt.zero_grad();loss_sum=0.;correct=0;accepted=0;skipped=0;policy.train()
         while accepted<args.batch_size:
@@ -223,14 +231,12 @@ def pretrain(args):
         record={'event':'pretrain','update':update+1,'sampled_targets':(update+1)*args.batch_size,'loss':loss_sum,'accuracy':correct/accepted,
                 'skipped_model_limit':skipped,'update_accepted':healthy,'seconds':time.monotonic()-start}
         if (update+1)%args.eval_every==0 or update+1==args.updates:
-            save(out/'checkpoint.pt',checkpoint(policy,opt,cfg,update=update+1,rng=rng.getstate(),
-                                               best=best,pending_evaluation=record))
             finish_evaluation(record)
         else:
             if (update+1)%args.save_every==0:
                 save(out/'checkpoint.pt',checkpoint(policy,opt,cfg,update=update+1,rng=rng.getstate(),best=best))
             log(out,record)
-    if args.updates==0:save(out/'checkpoint.pt',checkpoint(policy,opt,cfg,update=0,rng=rng.getstate(),best=best))
+    if args.updates==0 and not s:save(out/'checkpoint.pt',checkpoint(policy,opt,cfg,update=0,rng=rng.getstate(),best=best))
 
 
 def learn(policy,opt,results,budget,penalty):
@@ -266,59 +272,81 @@ def train(args):
     phase_index=s['phase_index'] if s else 0;next_index=s['next_index'] if s else 0;updates=s['updates'] if s else 0
     phases=[(0,'evaluation')]+[(e,p) for e in range(1,args.epochs+1) for p in ('training','evaluation')]
     batch_dir=out/'batches';batch_dir.mkdir(exist_ok=True)
+    changes=evaluation_changes(s['config'],cfg) if s else {}
+    if changes:
+        restarted=phase_index<len(phases) and phases[phase_index][1]=='evaluation'
+        if restarted:next_index=0
+        log(out,{'event':'evaluation_schedule_changed','changes':changes,'current_evaluation_restarted':restarted})
+        atomic(out/'config.json',cfg)
+        save(out/'checkpoint.pt',checkpoint(policy,opt,cfg,phase_index=phase_index,next_index=next_index,updates=updates))
     with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers,initializer=worker_init,initargs=(1,),mp_context=multiprocessing.get_context('spawn')) as pool:
         for pi in range(phase_index,len(phases)):
-            epoch,phase=phases[pi];training=phase=='training';rows=list(machines['splits']['train' if training else 'dev'])
-            if training:random.Random(args.seed+epoch).shuffle(rows)
+            epoch,phase=phases[pi];training=phase=='training';evaluation=None
+            if training:
+                rows=list(machines['splits']['train']);random.Random(args.seed+epoch).shuffle(rows)
+                phase_batches=batch_dir
+            else:
+                rows,evaluation=rl_panel(cfg,machines['splits']['dev'],epoch)
+                # Different panels/budgets never share resumable batch results.
+                phase_batches=batch_dir/('eval_'+digest(evaluation)[:16]);phase_batches.mkdir(exist_ok=True)
+                log(out,{'event':'rl_evaluation_start','epoch':epoch,'evaluation':evaluation})
             start_index=next_index if pi==phase_index else 0;results=[]
-            for i in range(0,start_index,args.batch_size):results.extend(json.loads((batch_dir/f'{pi}_{i}.json').read_text())['results'])
+            for i in range(0,start_index,args.batch_size):results.extend(json.loads((phase_batches/f'{pi}_{i}.json').read_text())['results'])
             began=time.monotonic()
             for i in range(start_index,len(rows),args.batch_size):
                 t0=time.monotonic();save(snapshot,{'model':policy.config,'state_dict':{k:v.detach().cpu() for k,v in policy.state_dict().items()}})
                 snapshot_seconds=time.monotonic()-t0;batch=rows[i:i+args.batch_size]
                 tasks=[(str(snapshot.resolve()),(pi,i),row,budget,args.seed+pi*1000000+(i+j)*10000,
-                        args.attempts if training else args.eval_attempts,args.rounds,training) for j,row in enumerate(batch)]
+                        args.attempts if training else evaluation['attempts_per_machine'],args.rounds,training) for j,row in enumerate(batch)]
                 t=time.monotonic();batch_results=list(pool.map(machine_job,tasks));rollout_seconds=time.monotonic()-t
                 t=time.monotonic();learning=learn(policy,opt,batch_results,budget,args.length_penalty) if training else {};learn_seconds=time.monotonic()-t
                 updates+=int(learning.get('update_accepted',False))
                 for r in batch_results:r.pop('group',None)
-                atomic(batch_dir/f'{pi}_{i}.json',{'results':batch_results});results.extend(batch_results)
+                atomic(phase_batches/f'{pi}_{i}.json',{'results':batch_results,'evaluation':evaluation});results.extend(batch_results)
                 t=time.monotonic();save(out/'checkpoint.pt',checkpoint(policy,opt,cfg,phase_index=pi,next_index=i+len(batch),updates=updates));checkpoint_seconds=time.monotonic()-t
                 elapsed=time.monotonic()-began;done=i+len(batch);eta=elapsed*(len(rows)-done)/max(1,done-start_index)
                 summary=summarize(results);latest=summarize(batch_results)
                 record={'event':'batch_profile','epoch':epoch,'phase':phase,'machines_done':done,'machines_total':len(rows),'eta_seconds':eta,
+                        'evaluation':evaluation,
                         'snapshot_seconds':snapshot_seconds,'rollout_seconds':rollout_seconds,'learn_seconds':learn_seconds,'checkpoint_seconds':checkpoint_seconds,
                         'worker_seconds_sum':{k:sum(r['timing'][k] for r in batch_results) for k in batch_results[0]['timing']},
                         'actions_per_second':sum(r['actions'] for r in batch_results)/max(rollout_seconds,1e-9),'learning':learning,'proof_progress':summary,'last_batch':latest}
                 with (out/'metrics.jsonl').open('a') as f:f.write(json.dumps(record)+'\n')
                 atomic(out/'progress.json',record)
                 bar='█'*int(24*done/len(rows))+'░'*(24-int(24*done/len(rows)))
-                print(f'Epoch {epoch} {phase} [{bar}] {done}/{len(rows)} | ETA ~{eta/60:.1f}m | cumulative '+proof_text(summary),flush=True)
+                label=phase if training else f"{evaluation['kind']} evaluation ({evaluation['attempts_per_machine']} attempts)"
+                print(f'Epoch {epoch} {label} [{bar}] {done}/{len(rows)} | ETA ~{eta/60:.1f}m | cumulative '+proof_text(summary),flush=True)
                 print(f'Last batch ({len(batch)} machines): '+proof_text(latest),flush=True)
-            summary=summarize(results);summary.update(epoch=epoch,phase=phase)
+            summary=summarize(results);summary.update(epoch=epoch,phase=phase,evaluation=evaluation)
             atomic(out/f'epoch_{epoch:02d}_{phase}.json',summary)
+            if evaluation:
+                atomic(out/f"epoch_{epoch:02d}_evaluation_{evaluation['kind']}_{digest(evaluation)[:16]}.json",summary)
             for n,part in sorted(summary['by_states'].items()):print(f'Epoch {epoch} {phase} | {n}-state: '+proof_text(part),flush=True)
             if not training:
                 save(out/f'model_epoch_{epoch:02d}.pt',checkpoint(policy,opt,cfg,phase_index=pi+1,next_index=0,updates=updates))
-                if not args.skip_special:
+                if evaluation['kind']=='full' and not args.skip_special:
+                    special_profile=profile(cfg,'special',machines['splits']['special'],args.eval_attempts)
+                    log(out,{'event':'special_evaluation_start','epoch':epoch,'evaluation':special_profile})
                     save(snapshot,{'model':policy.config,'state_dict':{k:v.detach().cpu() for k,v in policy.state_dict().items()}})
                     special=list(pool.map(machine_job,[(str(snapshot.resolve()),('special',epoch),r,budget,args.seed+epoch*100000+j,args.eval_attempts,1,False) for j,r in enumerate(machines['splits']['special'])]))
                     for r in special:
                         r.pop('group',None)
                         print('Special eval '+str(epoch)+': '+r.get('name','special')+': '+('PROVED' if r['successes'] else 'NOT_PROVED'),flush=True)
                         for proof in r['successes']:print(json.dumps(proof,indent=2),flush=True)
-                    atomic(out/f'special_benchmarks_epoch_{epoch:02d}.json',{'epoch':epoch,'results':special,'summary':summarize(special)})
+                    atomic(out/f'special_benchmarks_epoch_{epoch:02d}.json',{'epoch':epoch,'evaluation':special_profile,'results':special,'summary':summarize(special)})
             save(out/'checkpoint.pt',checkpoint(policy,opt,cfg,phase_index=pi+1,next_index=0,updates=updates))
             next_index=0
 
 
         final_path=out/f'final_test_epoch_{args.epochs:02d}.json'
         if not args.skip_final_test and not final_path.exists():
+            final_profile=profile(cfg,'test',machines['splits']['test'],args.eval_attempts)
+            log(out,{'event':'final_test_start','epoch':args.epochs,'evaluation':final_profile})
             save(snapshot,{'model':policy.config,'state_dict':{k:v.detach().cpu() for k,v in policy.state_dict().items()}})
             tested=list(pool.map(machine_job,[(str(snapshot.resolve()),('test',args.epochs),r,budget,args.seed+70000000+j,args.eval_attempts,1,False) for j,r in enumerate(machines['splits']['test'])]))
             for r in tested:r.pop('group',None)
-            atomic(final_path,{'epoch':args.epochs,'summary':summarize(tested),'results':tested})
-            print(json.dumps({'event':'final_test',**summarize(tested)}),flush=True)
+            atomic(final_path,{'epoch':args.epochs,'evaluation':final_profile,'summary':summarize(tested),'results':tested})
+            print(json.dumps({'event':'final_test','evaluation':final_profile,**summarize(tested)}),flush=True)
 
 
 def evaluate(args):
@@ -331,4 +359,5 @@ def evaluate(args):
     p=Policy(**s['model']).to(args.device);p.load_state_dict(s['state_dict'])
     report=autonomous(p,machines['splits'][args.split],s['config']['budget'],args.eval_attempts,args.seed,
                       workers=args.workers,threads=args.threads)
+    report['evaluation']=profile(s['config'],args.split,machines['splits'][args.split],args.eval_attempts)
     atomic(args.out,report);print(json.dumps(report,indent=2))
