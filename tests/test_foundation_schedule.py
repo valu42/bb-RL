@@ -168,16 +168,19 @@ class ScheduleResumeTests(unittest.TestCase):
             report = json.loads((root/f'epoch_{epoch:02d}_evaluation.json').read_text())
             self.assertEqual((report['evaluation']['kind'], report['machines'], report['evaluation']['attempts_per_machine']), (kind, count, attempts))
         self.assertFalse((root/'special_benchmarks_epoch_00.json').exists())
-        self.assertFalse((root/'special_benchmarks_epoch_01.json').exists())
-        self.assertTrue((root/'special_benchmarks_epoch_02.json').exists())
+        for epoch in (1, 2):
+            special = json.loads((root/f'special_benchmarks_epoch_{epoch:02d}.json').read_text())
+            self.assertEqual(special['evaluation']['attempts_per_machine'], 3)
         final = json.loads((root/'final_test_epoch_02.json').read_text())
         self.assertEqual(final['evaluation']['attempts_per_machine'], 3)
         self.assertEqual(final['summary']['machines'], 4)
-        self.assertEqual([c[0] for c in self.calls if c[0][0]=='special'], [('special', 2)])
+        self.assertEqual([c[0] for c in self.calls if c[0][0]=='special'], [('special', 1), ('special', 2)])
         self.assertEqual(len([c for c in self.calls if c[3]]), 4)
         self.assertTrue(all(c[2]==2 for c in self.calls if c[3]))
         self.calls = []; args.resume = True; self.run_rl(args)
         self.assertEqual(self.calls, [])
+        self.run_rl(self.rl_args('skip', '--skip-special', '--skip-final-test'))
+        self.assertFalse(list((self.root/'skip').glob('special_benchmarks_epoch_*.json')))
 
     def test_legacy_inflight_eval_restarts_and_training_progress_survives(self):
         from proofgame.foundation.training import init, checkpoint, save, load

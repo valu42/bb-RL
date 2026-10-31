@@ -40,7 +40,7 @@ def parser():
             s.add_argument('--init',default=None);s.add_argument('--skip-special',action='store_true');s.add_argument('--skip-final-test',action='store_true')
             s.add_argument('--rl-eval-machines',type=int,default=100)
             s.add_argument('--rl-eval-attempts',type=int,default=8)
-            s.add_argument('--full-eval-every',type=int,default=10,help='run full dev and special evaluation every N completed RL epochs')
+            s.add_argument('--full-eval-every',type=int,default=10,help='run full dev evaluation every N completed RL epochs; special machines run after every epoch')
         if name=='evaluate':
             s.add_argument('--checkpoint',required=True);s.add_argument('--split',choices=('dev','test','special'),default='test')
     return p
