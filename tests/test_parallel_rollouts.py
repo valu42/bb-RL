@@ -1,6 +1,7 @@
 """Production defaults, schedule-independent sampling, and complete round groups."""
 import hashlib
 import json
+import math
 import subprocess
 import sys
 import multiprocessing as mp
@@ -75,12 +76,25 @@ class ParallelRolloutTests(unittest.TestCase):
                                                 initargs=(model.config,True)) as pool:
                     actual=run_local_rollouts(pool,[task],workers=workers,split_attempts=True)[0]
                 # Caches/timings are schedule-dependent; action streams,
-                # probabilities, certificates and groups must be identical.
+                # certificates and groups must be identical. Diagnostic model
+                # scores can differ by CPU floating-point roundoff across
+                # processes even when all sampled trajectories match exactly.
                 for name in ('successes','group_trajectories','statuses','actions','attempts',
                              'first_proof_round','first_proof_answer','rounds_completed',
-                             'attempts_by_branch','first_action_counts','diagnostic_traces',
+                             'attempts_by_branch','first_action_counts',
                              'trajectory_sha256'):
                     self.assertEqual(actual[name],serial[name],name)
+                def compare_trace(left, right):
+                    if isinstance(right, float):
+                        self.assertTrue(math.isclose(left,right,rel_tol=1e-6,abs_tol=1e-8),(left,right))
+                    elif isinstance(right, dict):
+                        self.assertEqual(left.keys(),right.keys())
+                        for key in right:compare_trace(left[key],right[key])
+                    elif isinstance(right, list):
+                        self.assertEqual(len(left),len(right))
+                        for a,b in zip(left,right):compare_trace(a,b)
+                    else:self.assertEqual(left,right)
+                compare_trace(actual['diagnostic_traces'],serial['diagnostic_traces'])
 
     def test_snapshot_version_invalidates_all_neural_caches(self):
         model=Policy(width=32,layers=1,representation='ast',encoder_backend='root-query')
